@@ -128,8 +128,10 @@ Run `dart setup.dart --help` for the remaining options, such as `--targets` to b
 ## Web panel
 
 The optional Web build is ported from [FlClash-web](https://github.com/libzonda/FlClash-web).
-It runs separately from the native app, with a Flutter Web interface and a Go server. A configured username and
-password are required; the page, file APIs and Core WebSocket share the same login session.
+It runs separately from the native app, with a Flutter Web interface and a Go server. Bootstrap credentials are
+required for the first start; the page, file APIs and Core WebSocket share the same login session. Manage the
+persistent username and password, or sign out, in **Tools → Settings → Web account**. These controls and their
+translations are included only in the isolated Web build, not in native desktop or mobile builds.
 
 See [WEBPANEL.md](WEBPANEL.md) for the isolated build, credentials, HTTPS deployment and Web-specific limitations.
 

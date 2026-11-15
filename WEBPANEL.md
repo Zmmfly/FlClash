@@ -25,6 +25,8 @@ The build uses an isolated copy of the current checkout. It does not patch and r
 
 当前适配针对本仓库的 `0.9.3` 基线，升级应用或插件时需要同步核对适配锚点；版本或锚点不匹配会拒绝构建，而不是悄悄漏掉补丁。`bash tool/build_web.sh --check` 仅检查前置依赖；`--safe-mode` 构建供本机界面验证使用的安全模式版本，不用于正常代理运行。
 
+Web 构建显式设置 `WEB_PANEL=true`，并只在隔离副本中加入账户页面和 Web 专属本地化文案。原生桌面、手机构建的入口、设置页和 ARB 文件不增加这些内容；Go 登录与账户接口也只编译在 `webpanel && !android` 条件下。
+
 ## Docker 与 Compose
 
 `Dockerfile` 从当前源码构建 Web 界面和 Go 服务，不使用宿主机的 `dist/` 旧产物。构建阶段固定 Flutter 3.47.6 及其源码提交、Go 1.27.3；运行阶段只带可执行文件、CA 证书、时区数据和健康检查工具。本地构建需要 Docker BuildKit，构建上下文中须有已初始化的两个子模块：
@@ -38,17 +40,17 @@ python3 tool/test_container.py --image flclash-web:local
 
 ```bash
 cp -n .env.example .env
-mkdir -p data secrets
-chmod 700 data secrets
+mkdir -p data auth secrets
+chmod 700 data auth secrets
 (umask 077; python3 -c "import pathlib,secrets; pathlib.Path('secrets/web_password').open('x').write(secrets.token_urlsafe(32))")
 docker compose up -d --wait --wait-timeout 60
 ```
 
-密码文件使用排他创建，已存在时不会覆盖；重新部署时不要删除 `data` 或 `secrets`。`.env.example` 中的用户名为 `admin`，没有默认密码。需要查看首次生成的密码时，在部署目录执行 `cat secrets/web_password`，不要把它粘贴进日志或提交到 Git。
+密码文件使用排他创建，已存在时不会覆盖；首次引导密码须是有效 Unicode，长度为 1–256 个字符且不能包含换行（文件末尾单个换行会被去掉）。重新部署时不要删除 `data`、`auth` 或 `secrets`。`.env.example` 中的用户名为 `admin`，没有默认密码。需要查看首次生成的引导密码时，在部署目录执行 `cat secrets/web_password`，不要把它粘贴进日志或提交到 Git。网页修改密码后，该文件不再代表当前密码；新密码只以带盐派生值保存在 `auth/credentials.json` 中。
 
 - 默认地址为 **`http://127.0.0.1:18080`**，可通过 `.env` 的 `FLCLASH_WEB_BIND`、`FLCLASH_WEB_PORT` 修改。
-- 数据使用相对路径 **`./data:/data`**；密码使用独立的 **`./secrets/web_password`**，只读挂载到 `/run/secrets/web_password`。相对路径以 Compose 文件所在目录为准，不依赖源码目录。
-- 容器以非 root 身份运行。`FLCLASH_UID`、`FLCLASH_GID` 默认均为 `1000`；若部署用户不是这个 ID，在 `.env` 中改为 `id -u`、`id -g` 的结果，确保数据目录和密码文件属于该用户。
+- 数据使用相对路径 **`./data:/data`**；持久账户使用 **`./auth:/auth`**；首次引导密码使用独立的 **`./secrets/web_password`**，只读挂载到 `/run/secrets/web_password`。相对路径以 Compose 文件所在目录为准，不依赖源码目录。
+- 容器以非 root 身份运行。`FLCLASH_UID`、`FLCLASH_GID` 默认均为 `1000`；若部署用户不是这个 ID，在 `.env` 中改为 `id -u`、`id -g` 的结果，确保 `data`、`auth` 目录和密码文件属于该用户。
 - 默认代理端口映射为 `127.0.0.1:17890` → 容器 `7890`，包含 TCP/UDP。导入配置后，还需在面板启动代理，并开启“局域网代理”，容器端口才可经桥接网络访问。面板密码不等于代理认证。
 - 默认无 `privileged`、host 网络或 TUN 设备授权，移除全部 Linux capabilities，根文件系统只读，临时写入限定在 tmpfs `/tmp`。这个模板面向 Web 面板和普通端口代理，不是透明网关部署方案。
 - 健康检查访问容器内 `8080/login`，不读取或记录凭据；`healthy` 只说明面板 HTTP 服务就绪，不表示代理、订阅或出站网络已经配置。
@@ -56,11 +58,11 @@ docker compose up -d --wait --wait-timeout 60
 
 停止服务用 `docker compose down`，再运行 `docker compose up -d --wait` 会继续使用同一份相对目录数据。更新镜像后用 `docker compose up -d --force-recreate --wait`；不要执行删除数据目录的清理操作。
 
-The Compose template keeps data in `./data` and the password in a separate `./secrets/web_password` file. It uses a locally built image, loopback-only published ports and a non-root, read-only container by default. `tool/test_container.py` checks the real image, authentication, restart persistence and the deployment defaults described here.
+The Compose template keeps data in `./data`, persistent account credentials in `./auth`, and the bootstrap password in a separate `./secrets/web_password` file. It uses a locally built image, loopback-only published ports and a non-root, read-only container by default. `tool/test_container.py` checks the real image, authentication, restart persistence and the deployment defaults described here.
 
 ## 设置用户名和密码
 
-**没有默认账号或默认密码。缺少用户名或密码时服务拒绝启动。**
+**服务没有默认账号或默认密码。首次初始化且没有持久账户文件时，缺少用户名或密码会拒绝启动。** 后续启动优先读取持久账户文件，不会用环境变量中的旧账号覆盖网页修改后的账号。损坏的账户文件会导致启动失败，而不是恢复到旧密码。
 
 推荐通过密码文件提供密码，放在数据目录和静态资源目录之外。下面示例在 Bash 中交互输入密码，避免把密码写入命令历史或进程参数：
 
@@ -76,21 +78,34 @@ FLCLASH_WEB_PASSWORD_FILE="$HOME/.config/flclash-web/password" \
   ./dist/FlClash-web --data-dir "$HOME/.local/share/flclash-web"
 ```
 
-然后访问 `http://127.0.0.1:8080`，输入所配置的用户名、密码。右上角的“退出登录 / Log out”结束当前会话。
+然后访问 `http://127.0.0.1:8080`，输入所配置的用户名、密码。在“工具 → 设置 → Web 账户”中修改用户名、密码或退出登录，不会有悬浮控件遮挡界面。
 
-也可由服务管理器注入 `FLCLASH_WEB_PASSWORD`；它与 `FLCLASH_WEB_PASSWORD_FILE` 二选一，不要同时设置。不要把真实凭据提交进仓库。更改账号或密码后重启服务，旧会话将失效。
+也可由服务管理器注入 `FLCLASH_WEB_PASSWORD`；首次引导时它与 `FLCLASH_WEB_PASSWORD_FILE` 二选一，不要同时设置。不要把真实凭据提交进仓库。账户文件已创建后，环境变量和引导密码文件不再是当前账户的权威来源。
 
 | 配置 | 用途 |
 | --- | --- |
-| `FLCLASH_WEB_USERNAME` / `--username` | 必填用户名 |
-| `FLCLASH_WEB_PASSWORD` | 通过环境提供密码 |
-| `FLCLASH_WEB_PASSWORD_FILE` / `--password-file` | 从受保护文件读取密码 |
+| `FLCLASH_WEB_USERNAME` / `--username` | 没有持久账户时必填的引导用户名 |
+| `FLCLASH_WEB_PASSWORD` | 通过环境提供首次引导密码 |
+| `FLCLASH_WEB_PASSWORD_FILE` / `--password-file` | 从受保护文件读取首次引导密码 |
+| `FLCLASH_WEB_AUTH_FILE` / `--auth-file` | 持久账户文件，默认位于数据目录旁的 `<数据目录>.auth.json`；必须在数据/静态资源目录之外 |
 | `FLCLASH_WEB_LISTEN` / `--listen` | HTTP / WebSocket 监听地址，默认 `127.0.0.1:8080` |
 | `FLCLASH_DATA_DIR` / `--data-dir` | 服务端数据目录；请使用独立目录，不与正在运行的原生客户端共享 |
 | `FLCLASH_WEB_DIR` / `--web-dir` | 可选，使用已编译的 Web 资源目录替代内嵌资源 |
 | `FLCLASH_WEB_SECURE_COOKIE` / `--secure-cookie` | HTTPS 反代部署时启用 Secure Cookie |
 
-Credentials are mandatory. Use either `FLCLASH_WEB_PASSWORD` or a password file outside both the data and static directories. Sessions are held in memory and are invalidated by logout, expiry or server restart. Credentials are not stored in browser local storage.
+Bootstrap credentials are mandatory when no account store exists. An existing valid account store takes precedence over the environment or bootstrap password file. Sessions are invalidated by logout, account changes, expiry or server restart. Passwords are not stored in browser local storage.
+
+### 修改 Web 账户
+
+打开“工具 → 设置 → Web 账户”，输入当前密码后修改用户名或设置新密码。用户名不允许为空，最多 64 个 Unicode 字符；新密码留空表示保持原密码，否则需要 8–256 个字符且不能全为空白。用户名和密码都不允许换行。这里只修改 Web 面板登录，不改变代理端口认证。
+
+修改成功后立即撤销所有已登录会话和 WebSocket 连接，包括当前页面，随后使用新凭据重新登录。不需要重启核心；账户变更在容器/进程重启后仍然保留。错误的当前密码或发布前保存失败不会让旧凭据失效。如果文件已经原子替换、但目录同步失败，新凭据仍然生效并撤销旧会话，登录页会明确提示“持久化确认失败”；应检查服务器存储，不能假定旧密码仍然有效。
+
+Compose 的账户文件为 `./auth/credentials.json`，采用带随机盐的密码派生值存储，权限为 `0600`。备份时应一起保存独立的 `auth` 目录，不能把它移入可由面板浏览的数据目录。
+
+从旧版本 Compose 更新时，先在原部署目录创建 `auth` 并赋予部署用户写权限（`mkdir -p auth && chmod 700 auth`），再更新模板和镜像。首次启动会以原引导账号初始化账户文件，不会主动更换原密码。
+
+若忘记网页设置的新密码，应先停止服务，把账户文件备份到同一个私有 `auth` 目录中的另一个文件名，再用明确设置的引导账号启动。只有账户文件不存在时才会重新初始化；不要删除数据目录来重置登录。回退到不支持账户文件的旧镜像会重新使用引导凭据，因此回退前应同步检查账号安全。
 
 ## 远程访问与安全边界
 
