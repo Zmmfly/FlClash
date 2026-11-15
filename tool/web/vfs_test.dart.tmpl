@@ -1,0 +1,71 @@
+import 'dart:js_interop';
+
+import 'package:rust_api/dart_io.dart' as io;
+import 'package:rust_api/vfs.dart';
+
+// WEBPANEL.md: host integration probes remain unavailable; virtual I/O errors fail loudly.
+@JS('window.__webTestRequests')
+external int get requestCount;
+
+@JS('window.__webTestMode')
+external set testMode(JSString value);
+
+void expect(bool condition, String message) {
+  if (!condition) throw StateError(message);
+}
+
+void expectFailure(void Function() operation, String message) {
+  var failed = false;
+  try {
+    operation();
+  } catch (_) {
+    failed = true;
+  }
+  expect(failed, message);
+}
+
+void main() {
+  final fs = WebFileSystem.instance;
+  expect(!io.Directory('/run/systemd/system').existsSync(), 'The browser must not advertise the native Linux helper');
+  for (final path in ['/usr/bin/pkexec', '/proc/self/status', '/etc/ssl/certs',
+                      '/sys/class/net', '/data/../../run/systemd/system',
+                      '/database', '/tmp-other', '/downloads-other']) {
+    expect(!fs.exists(path), 'Native host probes must be absent: $path');
+  }
+  expect(requestCount == 0, 'Host probes must not issue any backend or snapshot request');
+  testMode = 'snapshot-failure'.toJS;
+  expectFailure(fs.ensureInitialized, 'Snapshot failures must not become an empty successful filesystem');
+  testMode = 'success'.toJS;
+  fs.ensureInitialized();
+  expect(fs.readBytes('/data/existing')[0] == 1, 'Snapshot retry must load server data');
+  testMode = 'stat-failure'.toJS;
+  for (final path in ['/data/missing', '/tmp/missing']) {
+    expectFailure(() => fs.stat(path), 'Real virtual-path I/O errors must not become missing files: $path');
+  }
+
+  for (final mode in ['failure', 'unauthorized', 'malformed']) {
+    testMode = mode.toJS;
+    expectFailure(() => fs.writeBytes('/data/existing', [9]), 'Write must fail: $mode');
+    expect(fs.readBytes('/data/existing')[0] == 1, 'Failed write must preserve cached bytes: $mode');
+    expectFailure(() => fs.writeBytes('/data/existing', [9], append: true), 'Append must fail: $mode');
+    expect(fs.readBytes('/data/existing').length == 1, 'Failed append must preserve cached length: $mode');
+    expectFailure(() => fs.mkdir('/data/new-dir'), 'Mkdir must fail: $mode');
+    expectFailure(() => fs.delete('/data/existing'), 'Delete must fail: $mode');
+    expect(fs.exists('/data/existing'), 'Failed delete must preserve cache: $mode');
+    expectFailure(() => fs.rename('/data/existing', '/data/renamed'), 'Rename must fail: $mode');
+    expect(fs.exists('/data/existing'), 'Failed rename must preserve source: $mode');
+    expectFailure(() => fs.copy('/data/remote', '/data/copied'), 'Copy must fail: $mode');
+  }
+  testMode = 'success'.toJS;
+  expect(!fs.exists('/data/new-dir'), 'Failed mkdir must not populate cache');
+  expect(!fs.exists('/data/renamed'), 'Failed rename must not populate target cache');
+  expect(!fs.exists('/data/copied'), 'Failed copy must not populate target cache');
+  fs.writeBytes('/data/saved', [4, 5]);
+  expect(fs.readBytes('/data/saved')[1] == 5, 'Acknowledged writes must populate cache');
+  fs.mkdir('/data/created');
+  expect(fs.isDirectory('/data/created'), 'Acknowledged mkdir must populate cache');
+  fs.rename('/data/existing', '/data/moved');
+  expect(fs.readBytes('/data/moved')[0] == 1, 'Acknowledged rename must preserve contents');
+  fs.delete('/data/moved');
+  expect(!fs.exists('/data/moved'), 'Acknowledged deletion must clear cache');
+}

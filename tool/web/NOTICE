@@ -1,0 +1,26 @@
+FlClash Web adaptation provenance
+
+The Dart compatibility templates under overlay/, the original browser helper
+functions and Web assets, and the import-rewrite/font/hook definitions in
+adaptations.py are derived from:
+
+  FlClash-web by libzonda and contributors
+  https://github.com/libzonda/FlClash-web
+  revision a36e2d8185119102c2cc2f563a062ca9b322b249
+
+The source project's GNU General Public License version 3 is retained verbatim
+as LICENSE.FlClash-web beside this notice. FlClash itself and its application
+icons retain their existing upstream attribution and repository LICENSE.
+
+The staging/build implementation and authentication integration were adapted
+for this repository's v0.9.3 application and protocol. No upstream Git checkout,
+submodule deletion, in-place apply/revert, controller-address widening, or
+generated-code edits from the source build scripts are retained.
+
+web/sqlite3.wasm is the sqlite3.dart 3.7.0 WebAssembly release asset, copied
+unchanged from the source overlay:
+  https://github.com/simolus3/sqlite3.dart/releases/download/sqlite3-3.7.0/sqlite3.wasm
+  SHA-256: fbcd2e8214f9231ea961e1b7706a22dd1194cfbfe6f26f13841b5aa7a0be1a1f
+SQLite is in the public domain (https://sqlite.org/copyright.html).
+The sqlite3.dart Dart package is MIT-licensed; its dependency license remains
+in the package and in Flutter's generated third-party notices.

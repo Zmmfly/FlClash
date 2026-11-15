@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="FlClash-web - Multi-platform proxy client based on ClashMeta, compiled to native Flutter Web">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="FlClash-web">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <link rel="manifest" href="manifest.json" crossorigin="use-credentials">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+  <title>FlClash-web</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #121212;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+    #flclash-logout {
+      position: fixed;
+      right: 12px;
+      top: 8px;
+      z-index: 10000;
+      background: #252525;
+      color: #e0e0e0;
+      border: 1px solid #666;
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    #flclash-auth-status { position: fixed; right: 12px; top: 48px; z-index: 10000; }
+    #flclash-loader {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #121212;
+      z-index: 9999;
+      transition: opacity 0.25s ease;
+    }
+    .spinner {
+      width: 42px;
+      height: 42px;
+      border: 3px solid rgba(255, 255, 255, 0.15);
+      border-top-color: #64b5f6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 16px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+  <script src="bridge.js"></script>
+</head>
+<body oncontextmenu="return false;">
+  <div id="flclash-loader">
+    <div class="spinner"></div>
+    <div>Loading FlClash-web...</div>
+  </div>
+  <button id="flclash-logout" type="button">Log out</button>
+  <div id="flclash-auth-status" role="alert"></div>
+  <script>
+    window.__flclashWeb.mountShell();
+    window.__flclashWeb.prepareSession().then(ready => {
+      if (!ready) throw new Error('Session unavailable');
+      const script = document.createElement('script');
+      script.src = 'flutter_bootstrap.js';
+      document.body.appendChild(script);
+    }).catch(() => {
+      document.getElementById('flclash-auth-status').textContent =
+        navigator.language.startsWith('zh') ? '连接失败，请刷新重试' : 'Connection failed. Please reload.';
+    });
+  </script>
+</body>
+</html>
