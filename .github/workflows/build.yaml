@@ -74,6 +74,47 @@ jobs:
       - name: Check coverage
         run: dart run tool/check_coverage.dart coverage/lcov.info 75
 
+  webpanel:
+    name: Web panel
+    if: *checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: ${{ env.BRANCH_CACHE }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Test Web staging and browser bridges
+        run: bash tool/web/test.sh
+
+      - name: Test Web authentication and RPC boundaries
+        working-directory: core
+        run: |
+          CGO_ENABLED=0 go test -tags webpanel,with_gvisor . ./cmd/flclash-web
+          go test -race -tags webpanel,with_gvisor -run '^TestWeb' . ./cmd/flclash-web
+          CGO_ENABLED=0 go vet -tags webpanel,with_gvisor . ./cmd/flclash-web
+
+      - name: Build embedded Web panel
+        run: bash tool/build_web.sh
+
   plugins:
     name: Plugins
     if: *checks
