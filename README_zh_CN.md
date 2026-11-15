@@ -118,6 +118,13 @@ dart setup.dart android   # 或 windows、macos、linux
 
 其余选项可以运行 `dart setup.dart --help` 查看，例如用 `--targets` 只构建部分安装包格式。
 
+## Web 控制面板
+
+可选的 Web 构建移植自 [FlClash-web](https://github.com/libzonda/FlClash-web)，由 Flutter Web 界面与 Go 服务组成，
+独立于原生客户端运行。必须配置用户名、密码；页面、文件 API 与核心 WebSocket 共用登录会话。
+
+隔离构建、账号配置、HTTPS 部署和 Web 版限制见 [WEBPANEL.md](WEBPANEL.md)。
+
 ## 支持
 
 给仓库点一个 Star 是支持项目最简单的方式。问题讨论和更新通知请关注 [Telegram 频道](https://t.me/FlClash)，

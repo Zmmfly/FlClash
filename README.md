@@ -125,6 +125,14 @@ Packages land in `dist/`. The Go core and the Rust libraries are compiled as par
 
 Run `dart setup.dart --help` for the remaining options, such as `--targets` to build only some package formats.
 
+## Web panel
+
+The optional Web build is ported from [FlClash-web](https://github.com/libzonda/FlClash-web).
+It runs separately from the native app, with a Flutter Web interface and a Go server. A configured username and
+password are required; the page, file APIs and Core WebSocket share the same login session.
+
+See [WEBPANEL.md](WEBPANEL.md) for the isolated build, credentials, HTTPS deployment and Web-specific limitations.
+
 ## Support
 
 Starring the repository is the easiest way to support the project. Questions and announcements go to the
