@@ -105,6 +105,9 @@ jobs:
       - name: Test Web staging and browser bridges
         run: bash tool/web/test.sh
 
+      - name: Check container deployment template
+        run: python3 tool/test_container.py --skip-image
+
       - name: Test Web authentication and RPC boundaries
         working-directory: core
         run: |

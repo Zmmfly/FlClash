@@ -1,0 +1,45 @@
+name: flclash
+
+services:
+  flclash:
+    image: ${FLCLASH_IMAGE:-flclash-web:local}
+    pull_policy: never
+    user: "${FLCLASH_UID:-1000}:${FLCLASH_GID:-1000}"
+    init: true
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      FLCLASH_WEB_LISTEN: 0.0.0.0:8080
+      FLCLASH_DATA_DIR: /data
+      FLCLASH_WEB_USERNAME: ${FLCLASH_WEB_USERNAME:?Set FLCLASH_WEB_USERNAME in .env}
+      FLCLASH_WEB_PASSWORD_FILE: /run/secrets/web_password
+      FLCLASH_WEB_SECURE_COOKIE: "${FLCLASH_WEB_SECURE_COOKIE:-false}"
+    ports:
+      - "${FLCLASH_WEB_BIND:-127.0.0.1}:${FLCLASH_WEB_PORT:-18080}:8080/tcp"
+      - "${FLCLASH_PROXY_BIND:-127.0.0.1}:${FLCLASH_PROXY_PORT:-17890}:7890/tcp"
+      - "${FLCLASH_PROXY_BIND:-127.0.0.1}:${FLCLASH_PROXY_PORT:-17890}:7890/udp"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+    secrets:
+      - web_password
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  web_password:
+    file: ./secrets/web_password
