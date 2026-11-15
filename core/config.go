@@ -18,7 +18,6 @@ import (
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub"
-	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
 	authStore "github.com/metacubex/mihomo/listener/auth"
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -81,7 +80,11 @@ func handleGetProxyDefinition(params NameParams) (map[string]any, error) {
 }
 
 func handleValidateConfig(params PathParams) *string {
-	if _, err := readRawConfig(params.Path); err != nil {
+	raw, err := readRawConfig(params.Path)
+	if err == nil {
+		err = ValidateProxyDependencies(raw)
+	}
+	if err != nil {
 		message := err.Error()
 		return &message
 	}
@@ -105,15 +108,11 @@ func handleDecryptConfig(params DecryptConfigParams) (string, error) {
 var systemTimeWritable = runtime.GOOS != "android"
 
 func loadConfig(path string) (*config.Config, error) {
-	buf, err := os.ReadFile(path)
+	candidate, err := prepareExistingConfig(path)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := executor.ParseWithBytes(buf)
-	if err != nil {
-		return nil, err
-	}
-	return withPlatformLimits(cfg), nil
+	return candidate.load()
 }
 
 func withPlatformLimits(cfg *config.Config) *config.Config {
@@ -129,11 +128,11 @@ func runningConfigPath() string {
 }
 
 func loadSetupConfig(params *SetupParams) (*config.Config, error) {
-	path := runningConfigPath()
-	if params.Base != nil {
-		return loadConfigWithBase(params.Base, path)
+	candidate, err := prepareSetupConfig(params)
+	if err != nil {
+		return nil, err
 	}
-	return loadConfig(path)
+	return candidate.load()
 }
 
 func applyConfig(params *SetupParams) error {
@@ -141,8 +140,18 @@ func applyConfig(params *SetupParams) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 
+	candidate, err := prepareSetupConfig(params)
+	if isDependencyPolicyError(err) {
+		return err
+	}
+	if params.startListeners {
+		setRunning(true)
+	}
 	applyOptions(params.Options)
-	cfg, err := loadSetupConfig(params)
+	var cfg *config.Config
+	if err == nil {
+		cfg, err = candidate.load()
+	}
 	if err != nil {
 		// The fallback is what keeps the listeners serving while the host
 		// reports the error, but it applies a config with no proxies in it.

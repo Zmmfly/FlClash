@@ -643,44 +643,35 @@ void main() {
       expect(proxyGroupIssues(plain, data), isNot(contains(issue)));
     });
 
-    test('the payload declares the named proxies with the profile dialers only '
-        'and drops a looping one', () {
+    test('the payload rejects loops instead of silently removing a dialer', () {
       const work = CustomProxy(
         id: 10,
         definition: {'name': 'Work', 'type': 'ss', 'dialer-proxy': 'Node'},
       );
-      const unnamed = CustomProxy(
-        id: 12,
-        definition: {'name': 'Unnamed', 'type': 'ss'},
-      );
-      final payload = appProxiesPayload(
-        [home, work, unnamed],
-        dialers: {9: 'Landing'},
-        groups: [
-          landing.copyWith(proxies: ['Home', 'Work']),
-          relay,
-        ],
-      );
-      expect(payload, [
-        home.definition,
-        {'name': 'Work', 'type': 'ss'},
-      ]);
       expect(
-        appProxiesPayload(
+        () => appProxiesPayload(
+          [home, work],
+          dialers: {9: 'Landing'},
+          groups: [
+            landing.copyWith(proxies: ['Home', 'Work']),
+            relay,
+          ],
+        ),
+        throwsA(isA<OutboundPolicyException>()),
+      );
+      expect(
+        () => appProxiesPayload(
           [home, work],
           dialers: {9: 'Work', 10: 'Home'},
           groups: [
             landing.copyWith(proxies: ['Home', 'Work']),
           ],
         ),
-        [
-          home.definition,
-          {'name': 'Work', 'type': 'ss'},
-        ],
+        throwsA(isA<OutboundPolicyException>()),
       );
       expect(
         appProxiesPayload(
-          [home],
+          [home, work],
           dialers: {9: 'Relay'},
           groups: const [landing, relay],
         ),
@@ -690,8 +681,7 @@ void main() {
       );
     });
 
-    test('include-all-proxies declares no app proxy of its own and drops a '
-        'dialer it loops back through', () {
+    test('include-all-proxies rejects a dialer it loops back through', () {
       const unnamed = CustomProxy(
         id: 12,
         definition: {'name': 'Unnamed', 'type': 'ss'},
@@ -703,12 +693,12 @@ void main() {
         includeAllProxies: true,
       );
       expect(
-        appProxiesPayload(
+        () => appProxiesPayload(
           [home, unnamed],
           dialers: {9: 'All', 12: 'Relay'},
           groups: const [all, landing],
         ),
-        [home.definition],
+        throwsA(isA<OutboundPolicyException>()),
       );
       expect(
         const CustomProfileData(

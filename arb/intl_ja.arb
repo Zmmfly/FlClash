@@ -1076,5 +1076,10 @@
   "fakeipFilterDesc": "これらのドメインには Fake-IP ではなく実際の IP を返します。whitelist モードでは、これらだけが Fake-IP を使います。",
   "fallbackFilterGeositeDesc": "これらの GeoSite カテゴリのドメインは、直接 Fallback で解決します。",
   "fallbackFilterIpcidrDesc": "Nameserver がこれらの範囲の IP を返したときは、Fallback の結果を使います。",
-  "fallbackFilterDomainDesc": "これらのドメインは、直接 Fallback で解決します。"
+  "fallbackFilterDomainDesc": "これらのドメインは、直接 Fallback で解決します。",
+  "profileDialersDescription": "A → B、B → C の接続順は、クライアント → C → B → A → 宛先です。「プロファイルに従う」は元の前段プロキシを維持します。コアはノードとグループの依存関係を検証し、判定できないプロバイダー依存を拒否します。",
+  "profileDialersUnreadable": "保存された前段プロキシ設定を読み取れません。明示的にリセットするまで適用できません。",
+  "profileDialersResetTip": "保存された前段プロキシ設定をリセットしますか？上書き設定全体が読み取れない場合、このプロファイルの上書き設定をすべてリセットします。この操作は取り消せません。",
+  "profileDialerSourceMissing": "接続元 {name} が見つからないか、名前が重複しています。「プロファイルに従う」を選ぶと、この上書きを削除できます。",
+  "profileDialerOriginal": "プロファイルに従う：{target}"
 }

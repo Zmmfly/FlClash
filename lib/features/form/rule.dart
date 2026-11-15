@@ -7,6 +7,10 @@ import 'package:fl_clash/state.dart';
 import 'package:fl_clash/ui/icons/icons.dart';
 import 'package:fl_clash/widgets/widgets.dart';
 import 'package:flutter/widgets.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fl_clash/providers/providers.dart';
+
+import 'profile_target.dart';
 
 import 'form_page.dart';
 import 'form_row.dart';
@@ -245,16 +249,17 @@ class RuleStatusItem extends StatelessWidget {
 
 enum _RuleField { content, target }
 
-class RuleForm extends StatefulWidget {
+class RuleForm extends ConsumerStatefulWidget {
   final Rule? rule;
+  final int? profileId;
 
-  const RuleForm({super.key, this.rule});
+  const RuleForm({super.key, this.rule, this.profileId});
 
   @override
-  State<RuleForm> createState() => _RuleFormState();
+  ConsumerState<RuleForm> createState() => _RuleFormState();
 }
 
-class _RuleFormState extends State<RuleForm> {
+class _RuleFormState extends ConsumerState<RuleForm> {
   late RuleAction _ruleAction;
   late String _ruleTarget;
   late final TextEditingController _contentController;
@@ -279,7 +284,7 @@ class _RuleFormState extends State<RuleForm> {
     super.dispose();
   }
 
-  ({_RuleField field, String message})? _issue() {
+  ({_RuleField field, String message})? _issue(ClashConfig? config) {
     final appLocalizations = context.appLocalizations;
     final content = _contentController.text;
     if (content.isEmpty) {
@@ -298,17 +303,24 @@ class _RuleFormState extends State<RuleForm> {
         message: payloadError.getMessage(context),
       );
     }
-    if (_ruleTarget.isEmpty) {
-      return (
-        field: _RuleField.target,
-        message: appLocalizations.splitStrategyNotEmpty,
-      );
+    final targetError = addedRuleTargetError(
+      context,
+      Rule(ruleTarget: _ruleTarget),
+      config,
+    );
+    if (targetError != null) {
+      return (field: _RuleField.target, message: targetError);
     }
     return null;
   }
 
   void _handleSubmit() {
-    if (_issue() != null) {
+    final id = widget.profileId;
+    final state = id == null ? null : ref.read(clashConfigProvider(id));
+    final config = state != null && !state.isLoading && !state.hasError
+        ? state.value
+        : null;
+    if (_issue(config) != null) {
       setState(() {
         _attempted = true;
       });
@@ -341,11 +353,38 @@ class _RuleFormState extends State<RuleForm> {
     );
   }
 
+  Future<void> _selectTarget() async {
+    final value = await Navigator.of(context).push<String>(
+      PagedSheetRoute(
+        builder: (context) => ProfileTargetSheet(
+          profileId: widget.profileId,
+          title: context.appLocalizations.splitStrategy,
+          selected: _ruleTarget,
+          fixedTargets: [...RuleTarget.ruleTargetNames, RuleAction.MATCH.value],
+          acceptsTarget: (name) =>
+              isRuleTargetName(name) &&
+              (name == RuleAction.MATCH.value ||
+                  name.toUpperCase() != RuleAction.MATCH.value),
+          labelBuilder: _targetLabel,
+          onSelected: (target) => Navigator.of(context).pop(target),
+        ),
+      ),
+    );
+    if (value != null && mounted) setState(() => _ruleTarget = value);
+  }
+
   @override
   Widget build(BuildContext context) {
     final appLocalizations = context.appLocalizations;
-    final issue = _attempted ? _issue() : null;
-    final targets = [...RuleTarget.ruleTargetNames, RuleAction.MATCH.value];
+    final id = widget.profileId;
+    final state = id == null ? null : ref.watch(clashConfigProvider(id));
+    final config = state != null && !state.isLoading && !state.hasError
+        ? state.value
+        : null;
+    final issue = _attempted ? _issue(config) : null;
+    final invalid =
+        addedRuleTargetError(context, Rule(ruleTarget: _ruleTarget), config) !=
+        null;
     return FormPage(
       title: widget.rule != null
           ? appLocalizations.editRule
@@ -383,19 +422,11 @@ class _RuleFormState extends State<RuleForm> {
                 onFieldSubmitted: (_) => _handleSubmit(),
               ),
             ),
-            ListItem<String>.options(
-              title: Text(appLocalizations.splitStrategy),
-              options: [
-                if (!targets.contains(_ruleTarget)) _ruleTarget,
-                ...targets,
-              ],
-              value: _ruleTarget,
-              textBuilder: _targetLabel,
-              onChanged: (target) {
-                setState(() {
-                  _ruleTarget = target;
-                });
-              },
+            FormRow(
+              title: appLocalizations.splitStrategy,
+              invalid: invalid,
+              onPressed: _selectTarget,
+              trailing: Text(_targetLabel(_ruleTarget)),
             ),
           ],
         ),

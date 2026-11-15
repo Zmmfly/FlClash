@@ -54,6 +54,23 @@ class _MessageFailureSetupAction extends SetupAction {
   }
 }
 
+class _CandidateCleanupSetupAction extends SetupAction {
+  bool failCleanup = false;
+  final List<File> candidates = [];
+
+  @override
+  Future<void> deleteSetupCandidate(File candidate) async {
+    candidates.add(candidate);
+    if (failCleanup) {
+      throw const FileSystemException(
+        'synthetic credential that must not be logged',
+        '/private/candidate',
+      );
+    }
+    await super.deleteSetupCandidate(candidate);
+  }
+}
+
 class _UnflooredDebounceSetupAction extends SetupAction {
   @override
   Duration get minApplyDebounce => Duration.zero;
@@ -1106,6 +1123,228 @@ void main() {
       overrides: ProfileOverrides(),
     );
 
+    (ProviderContainer, _CandidateCleanupSetupAction) cleanupHarness(
+      _MockCoreHandlerInterface core,
+    ) {
+      final profile = Profile.custom(label: 'cleanup').copyWith(id: 58);
+      final setupAction = _CandidateCleanupSetupAction();
+      when(
+        () => core.getProxies(),
+      ).thenAnswer((_) async => const ProxiesData(all: [], proxies: {}));
+      when(() => core.getExternalProviders()).thenAnswer((_) async => []);
+      final scoped = ProviderContainer(
+        overrides: [
+          profilesProvider.overrideWith(() => TestProfiles([profile])),
+          currentProfileIdProvider.overrideWithBuild((_, _) => profile.id),
+          setupStateProvider.overrideWith(
+            (_, _) => nullProfileSetupState.copyWith(
+              profileId: profile.id,
+              profileType: ProfileType.custom,
+              appProxies: const [
+                CustomProxy(
+                  id: 59,
+                  definition: {'name': 'mine', 'type': 'direct'},
+                ),
+              ],
+            ),
+          ),
+          coreHandlerProvider.overrideWithValue(CoreController.scoped(core)),
+          setupActionProvider.overrideWith(() => setupAction),
+          commonActionProvider.overrideWith(TestCommonAction.new),
+        ],
+      );
+      addTearDown(scoped.dispose);
+      globalState.container = scoped;
+      scoped.listen(patchClashConfigProvider, (_, _) {});
+      scoped.read(setupActionProvider.notifier);
+      return (scoped, setupAction);
+    }
+
+    for (final preload in [false, true]) {
+      test('post-commit cleanup failure keeps applied identity and succeeds '
+          '(preload: $preload)', () async {
+        final core = _MockCoreHandlerInterface();
+        when(() => core.setupConfig(any())).thenAnswer((_) async {});
+        final (scoped, setupAction) = cleanupHarness(core);
+        setupAction.failCleanup = true;
+        globalState.lastConfigMd5 = 'previous';
+        globalState.lastConfigCounts = (groups: 9, proxies: 9, rules: 9);
+        addTearDown(() => globalState.lastConfigCounts = null);
+        final built = await setupAction.getProfile(
+          setupState: await scoped.read(setupStateProvider(58).future),
+          patchConfig: scoped.read(patchClashConfigProvider),
+        );
+        final configFile = File(await appPath.configFilePath);
+        await configFile.writeAsString('previous config');
+        final messages = <String>[];
+        final originalDebugPrint = debugPrint;
+        debugPrint = (message, {wrapWidth}) {
+          if (message != null) messages.add(message);
+        };
+        addTearDown(() => debugPrint = originalDebugPrint);
+        var preloadCalls = 0;
+
+        expect(
+          await setupAction.applyProfile(
+            force: true,
+            preloadInvoke: preload
+                ? () async {
+                    preloadCalls++;
+                  }
+                : null,
+          ),
+          isTrue,
+        );
+
+        expect(preloadCalls, preload ? 1 : 0);
+        expect(globalState.lastConfigMd5, built.md5);
+        expect(globalState.lastConfigCounts, built.counts);
+        expect(await setupAction.inputsApplied(), isTrue);
+        verify(() => core.getProxies()).called(greaterThanOrEqualTo(1));
+        verify(
+          () => core.getExternalProviders(),
+        ).called(greaterThanOrEqualTo(1));
+        final candidate = setupAction.candidates.single;
+        expect(candidate.path, isNot(configFile.path));
+        expect(candidate.existsSync(), isTrue);
+        expect(await configFile.readAsString(), 'previous config');
+        expect(messages.where((message) => message.contains('cleanup failed')), [
+          '[APP] setup candidate cleanup failed (Core commit confirmed: true)',
+        ]);
+        expect(messages.join(), isNot(contains('synthetic credential')));
+        expect(messages.join(), isNot(contains('/private/candidate')));
+
+        expect(await setupAction.applyProfile(), isTrue);
+        verify(() => core.setupConfig(any())).called(1);
+        expect(setupAction.candidates, hasLength(1));
+      });
+    }
+
+    test(
+      'initialize stays running after a committed config cleanup failure',
+      () async {
+        final core = _MockCoreHandlerInterface();
+        when(() => core.setupConfig(any())).thenAnswer((_) async {});
+        when(() => core.startListener()).thenAnswer((_) async {});
+        when(() => core.stopListener()).thenAnswer((_) async {});
+        when(() => core.resetTraffic()).thenAnswer((_) async {});
+        final (scoped, setupAction) = cleanupHarness(core);
+        addTearDown(() => globalState.lastConfigCounts = null);
+        setupAction.failCleanup = true;
+
+        expect(await setupAction.setRunning(true, initialize: true), isTrue);
+
+        expect(scoped.read(isStartProvider), isTrue);
+        expect(await setupAction.inputsApplied(), isTrue);
+        verify(() => core.startListener()).called(1);
+        verifyNever(() => core.stopListener());
+        await setupAction.setRunning(false);
+      },
+    );
+
+    test('policy rejection plus cleanup failure preserves the primary typed '
+        'error and previous applied identity', () async {
+      final core = _MockCoreHandlerInterface();
+      when(() => core.setupConfig(any())).thenAnswer((_) async {});
+      final (scoped, setupAction) = cleanupHarness(core);
+      addTearDown(() => globalState.lastConfigCounts = null);
+      expect(await setupAction.applyProfile(force: true), isTrue);
+      final previousMd5 = globalState.lastConfigMd5;
+      final previousCounts = globalState.lastConfigCounts;
+      final previousPatch = scoped.read(patchClashConfigProvider);
+      scoped.read(patchClashConfigProvider.notifier).value = previousPatch
+          .copyWith(mode: Mode.direct);
+      setupAction.failCleanup = true;
+      const primary = CoreMethodException(
+        code: 'outbound_policy_invalid',
+        message: 'policy rejected',
+      );
+      when(() => core.setupConfig(any())).thenThrow(primary);
+
+      await expectLater(
+        setupAction.applyProfile(
+          force: true,
+          preloadInvoke: () async =>
+              throw StateError('secondary preload failure'),
+        ),
+        throwsA(same(primary)),
+      );
+
+      expect(globalState.lastConfigMd5, previousMd5);
+      expect(globalState.lastConfigCounts, previousCounts);
+      expect(await setupAction.applyProfile(force: true), isFalse);
+      expect(globalState.lastConfigMd5, previousMd5);
+      expect(globalState.lastConfigCounts, previousCounts);
+      expect(await setupAction.inputsApplied(), isFalse);
+      scoped.read(patchClashConfigProvider.notifier).value = previousPatch;
+      expect(await setupAction.inputsApplied(), isTrue);
+      expect(setupAction.candidates.last.existsSync(), isTrue);
+      verify(() => core.getProxies()).called(greaterThanOrEqualTo(1));
+      verify(() => core.getExternalProviders()).called(greaterThanOrEqualTo(1));
+    });
+
+    for (final preload in [false, true]) {
+      test('transport failure plus cleanup failure remains a failed setup '
+          '(preload: $preload)', () async {
+        final core = _MockCoreHandlerInterface();
+        when(() => core.setupConfig(any())).thenAnswer((_) async {});
+        final (scoped, setupAction) = cleanupHarness(core);
+        addTearDown(() => globalState.lastConfigCounts = null);
+        expect(await setupAction.applyProfile(force: true), isTrue);
+        setupAction.failCleanup = true;
+        const primary = CoreMethodException(
+          code: 'no_response',
+          message: 'setup unanswered',
+        );
+        when(() => core.setupConfig(any())).thenThrow(primary);
+
+        if (preload) {
+          await expectLater(
+            setupAction.applyProfile(force: true, preloadInvoke: () async {}),
+            throwsA(same(primary)),
+          );
+        } else {
+          expect(await setupAction.applyProfile(force: true), isFalse);
+        }
+
+        expect(globalState.lastConfigMd5, isNull);
+        expect(globalState.lastConfigCounts, isNull);
+        expect(await setupAction.inputsApplied(), isFalse);
+        verify(() => core.getProxies()).called(greaterThanOrEqualTo(1));
+        verify(
+          () => core.getExternalProviders(),
+        ).called(greaterThanOrEqualTo(1));
+      });
+    }
+
+    test(
+      'a committed config keeps its identity when preload and cleanup fail',
+      () async {
+        final core = _MockCoreHandlerInterface();
+        when(() => core.setupConfig(any())).thenAnswer((_) async {});
+        final (scoped, setupAction) = cleanupHarness(core);
+        addTearDown(() => globalState.lastConfigCounts = null);
+        setupAction.failCleanup = true;
+        final built = await setupAction.getProfile(
+          setupState: await scoped.read(setupStateProvider(58).future),
+          patchConfig: scoped.read(patchClashConfigProvider),
+        );
+        final primary = StateError('preload failed');
+
+        await expectLater(
+          setupAction.applyProfile(
+            force: true,
+            preloadInvoke: () async => throw primary,
+          ),
+          throwsA(same(primary)),
+        );
+
+        expect(globalState.lastConfigMd5, built.md5);
+        expect(globalState.lastConfigCounts, built.counts);
+        expect(await setupAction.inputsApplied(), isTrue);
+      },
+    );
+
     test(
       'a refresh failure still runs core.setupConfig and preloadInvoke',
       () async {
@@ -1181,10 +1420,9 @@ void main() {
           () => core.getProfileBase(any()),
         ).thenThrow(Exception('broken yaml'));
         String? pushedConfig;
-        when(() => core.setupConfig(any())).thenAnswer((_) async {
-          pushedConfig = await File(
-            await appPath.configFilePath,
-          ).readAsString();
+        when(() => core.setupConfig(any())).thenAnswer((invocation) async {
+          final params = invocation.positionalArguments.single as SetupParams;
+          pushedConfig = await File(params.configPath!).readAsString();
         });
         final scoped = ProviderContainer(
           overrides: [
@@ -1213,13 +1451,10 @@ void main() {
     test(
       'a config write failure reports setup as failed without calling core',
       () async {
-        final configPath = await appPath.configFilePath;
-        final configFile = File(configPath);
-        if (await configFile.exists()) {
-          await configFile.delete();
-        }
-        final configAsDirectory = Directory(configPath);
-        await configAsDirectory.create(recursive: true);
+        final blocker = File(join(tempDir.path, 'candidate-blocker'));
+        await blocker.writeAsString('not a directory');
+        AppPath.temporaryDirectory = () async => Directory(blocker.path);
+        await appPath.rebind();
 
         final core = _MockCoreHandlerInterface();
         when(() => core.setupConfig(any())).thenAnswer((_) async {});
@@ -1241,7 +1476,8 @@ void main() {
           expect(succeeded, isFalse);
           verifyNever(() => core.setupConfig(any()));
         } finally {
-          await configAsDirectory.delete(recursive: true);
+          await useAppPaths(tempDir);
+          await blocker.delete();
         }
       },
     );
@@ -1616,8 +1852,12 @@ void main() {
         overrides: [
           profilesProvider.overrideWith(() => TestProfiles([profile])),
           setupStateProvider.overrideWith(
-            (_, profileId) =>
-                nullProfileSetupState.copyWith(profileId: profileId),
+            (_, profileId) => nullProfileSetupState.copyWith(
+              profileId: profileId,
+              overrides: ProfileOverrides(
+                dialerProxies: DialerProxyOverrides.values({'A': 'B', 'B': ''}),
+              ),
+            ),
           ),
           coreHandlerProvider.overrideWithValue(CoreController.scoped(core)),
           setupActionProvider.overrideWith(SetupAction.new),
@@ -1631,6 +1871,10 @@ void main() {
 
       verifyNever(() => core.readConfig(any()));
       expect(yaml, 'proxies: []\n');
+      final base =
+          verify(() => core.buildProfile(captureAny())).captured.single
+              as SetupBase;
+      expect(base.dialerProxies, {'A': 'B', 'B': ''});
       expect(built.existsSync(), isFalse);
     });
 

@@ -281,19 +281,7 @@ func QuickSetup(initParamsString, setupParamsString string, answer func(string))
 				answer(fmt.Sprintf("internal panic: %v", r))
 			}
 		}()
-		initParams := InitParams{}
-		if err := json.Unmarshal([]byte(initParamsString), &initParams); err != nil {
-			answer("init failed")
-			return
-		}
-		_ = handleInit(&initParams)
-		setupParams := &SetupParams{}
-		if err := json.Unmarshal([]byte(setupParamsString), setupParams); err != nil {
-			answer(err.Error())
-			return
-		}
-		setRunning(true)
-		if err := handleSetupConfig(setupParams); err != nil {
+		if err := quickSetupConfig(initParamsString, setupParamsString); err != nil {
 			answer(err.Error())
 			return
 		}

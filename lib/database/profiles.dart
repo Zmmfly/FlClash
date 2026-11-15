@@ -52,16 +52,32 @@ class ProfileOverridesConverter
   @override
   ProfileOverrides? fromSql(String? fromDb) {
     if (fromDb == null) return null;
-    return decodeOrRestoreDefault(
-      'profile overrides',
-      () => ProfileOverrides.safeFromJson(json.decode(fromDb)),
-      () => null,
-    );
+    try {
+      final document = json.decode(fromDb);
+      if (document is! Map<String, dynamic>) {
+        throw const FormatException('Expected profile overrides object');
+      }
+      return ProfileOverrides.safeFromJson(document);
+    } on FormatException {
+      return ProfileOverrides(
+        dialerProxies: DialerProxyOverrides.invalidDocument(fromDb),
+      );
+    }
   }
 
   @override
   String? toSql(ProfileOverrides? value) {
     if (value == null || value == const ProfileOverrides()) return null;
+    final dialers = value.dialerProxies;
+    if (dialers.isUnreadable) {
+      if (value != ProfileOverrides(dialerProxies: dialers)) {
+        throw const OutboundPolicyException(
+          'profile.overrides',
+          'repair the unreadable document before editing other overrides',
+        );
+      }
+      return dialers.rawDocument;
+    }
     return json.encode(value.toJson());
   }
 }

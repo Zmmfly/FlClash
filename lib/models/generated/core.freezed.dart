@@ -16,7 +16,7 @@ T _$identity<T>(T value) => value;
 /// @nodoc
 mixin _$SetupParams {
 
-@JsonKey(includeIfNull: false) SetupBase? get base;@JsonKey(name: 'selected-map') Map<String, String> get selectedMap; CoreOptions get options;
+@JsonKey(includeIfNull: false) SetupBase? get base;@JsonKey(name: 'config-path', includeIfNull: false) String? get configPath;@JsonKey(name: 'selected-map') Map<String, String> get selectedMap; CoreOptions get options;
 /// Create a copy of SetupParams
 /// with the given fields replaced by the non-null parameter values.
 @JsonKey(includeFromJson: false, includeToJson: false)
@@ -30,20 +30,20 @@ $SetupParamsCopyWith<SetupParams> get copyWith => _$SetupParamsCopyWithImpl<Setu
 @override
 bool operator ==(Object other) {
   final _this = this as SetupParams;
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SetupParams&&(identical(other.base, _this.base) || other.base == _this.base)&&const DeepCollectionEquality().equals(other.selectedMap, _this.selectedMap)&&(identical(other.options, _this.options) || other.options == _this.options));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SetupParams&&(identical(other.base, _this.base) || other.base == _this.base)&&(identical(other.configPath, _this.configPath) || other.configPath == _this.configPath)&&const DeepCollectionEquality().equals(other.selectedMap, _this.selectedMap)&&(identical(other.options, _this.options) || other.options == _this.options));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
   final _this = this as SetupParams;
-  return Object.hash(runtimeType,_this.base,const DeepCollectionEquality().hash(_this.selectedMap),_this.options);
+  return Object.hash(runtimeType,_this.base,_this.configPath,const DeepCollectionEquality().hash(_this.selectedMap),_this.options);
 }
 
 @override
 String toString() {
   final _this = this as SetupParams;
-  return 'SetupParams(base: ${_this.base}, selectedMap: ${_this.selectedMap}, options: ${_this.options})';
+  return 'SetupParams(base: ${_this.base}, configPath: ${_this.configPath}, selectedMap: ${_this.selectedMap}, options: ${_this.options})';
 }
 
 
@@ -54,7 +54,7 @@ abstract mixin class $SetupParamsCopyWith<$Res>  {
   factory $SetupParamsCopyWith(SetupParams value, $Res Function(SetupParams) _then) = _$SetupParamsCopyWithImpl;
 @useResult
 $Res call({
-@JsonKey(includeIfNull: false) SetupBase? base,@JsonKey(name: 'selected-map') Map<String, String> selectedMap, CoreOptions options
+@JsonKey(includeIfNull: false) SetupBase? base,@JsonKey(name: 'config-path', includeIfNull: false) String? configPath,@JsonKey(name: 'selected-map') Map<String, String> selectedMap, CoreOptions options
 });
 
 
@@ -71,10 +71,11 @@ class _$SetupParamsCopyWithImpl<$Res>
 
 /// Create a copy of SetupParams
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? base = freezed,Object? selectedMap = null,Object? options = null,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? base = freezed,Object? configPath = freezed,Object? selectedMap = null,Object? options = null,}) {
   return _then(SetupParams(
 base: freezed == base ? _self.base : base // ignore: cast_nullable_to_non_nullable
-as SetupBase?,selectedMap: null == selectedMap ? _self.selectedMap : selectedMap // ignore: cast_nullable_to_non_nullable
+as SetupBase?,configPath: freezed == configPath ? _self.configPath : configPath // ignore: cast_nullable_to_non_nullable
+as String?,selectedMap: null == selectedMap ? _self.selectedMap : selectedMap // ignore: cast_nullable_to_non_nullable
 as Map<String, String>,options: null == options ? _self.options : options // ignore: cast_nullable_to_non_nullable
 as CoreOptions,
   ));
@@ -182,10 +183,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function(@JsonKey(includeIfNull: false)  SetupBase? base, @JsonKey(name: 'selected-map')  Map<String, String> selectedMap,  CoreOptions options)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function(@JsonKey(includeIfNull: false)  SetupBase? base, @JsonKey(name: 'config-path', includeIfNull: false)  String? configPath, @JsonKey(name: 'selected-map')  Map<String, String> selectedMap,  CoreOptions options)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _SetupParams() when $default != null:
-return $default(_that.base,_that.selectedMap,_that.options);case _:
+return $default(_that.base,_that.configPath,_that.selectedMap,_that.options);case _:
   return orElse();
 
 }
@@ -203,10 +204,10 @@ return $default(_that.base,_that.selectedMap,_that.options);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function(@JsonKey(includeIfNull: false)  SetupBase? base, @JsonKey(name: 'selected-map')  Map<String, String> selectedMap,  CoreOptions options)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function(@JsonKey(includeIfNull: false)  SetupBase? base, @JsonKey(name: 'config-path', includeIfNull: false)  String? configPath, @JsonKey(name: 'selected-map')  Map<String, String> selectedMap,  CoreOptions options)  $default,) {final _that = this;
 switch (_that) {
 case _SetupParams():
-return $default(_that.base,_that.selectedMap,_that.options);case _:
+return $default(_that.base,_that.configPath,_that.selectedMap,_that.options);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -223,10 +224,10 @@ return $default(_that.base,_that.selectedMap,_that.options);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function(@JsonKey(includeIfNull: false)  SetupBase? base, @JsonKey(name: 'selected-map')  Map<String, String> selectedMap,  CoreOptions options)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function(@JsonKey(includeIfNull: false)  SetupBase? base, @JsonKey(name: 'config-path', includeIfNull: false)  String? configPath, @JsonKey(name: 'selected-map')  Map<String, String> selectedMap,  CoreOptions options)?  $default,) {final _that = this;
 switch (_that) {
 case _SetupParams() when $default != null:
-return $default(_that.base,_that.selectedMap,_that.options);case _:
+return $default(_that.base,_that.configPath,_that.selectedMap,_that.options);case _:
   return null;
 
 }
@@ -238,10 +239,11 @@ return $default(_that.base,_that.selectedMap,_that.options);case _:
 @JsonSerializable()
 
 class _SetupParams implements SetupParams {
-  const _SetupParams({@JsonKey(includeIfNull: false) this.base, @JsonKey(name: 'selected-map') required  Map<String, String> selectedMap, required this.options}): _selectedMap = selectedMap;
+  const _SetupParams({@JsonKey(includeIfNull: false) this.base, @JsonKey(name: 'config-path', includeIfNull: false) this.configPath, @JsonKey(name: 'selected-map') required  Map<String, String> selectedMap, required this.options}): _selectedMap = selectedMap;
   factory _SetupParams.fromJson(Map<String, dynamic> json) => _$SetupParamsFromJson(json);
 
 @override@JsonKey(includeIfNull: false) final  SetupBase? base;
+@override@JsonKey(name: 'config-path', includeIfNull: false) final  String? configPath;
  final  Map<String, String> _selectedMap;
 @override@JsonKey(name: 'selected-map') Map<String, String> get selectedMap {
   if (_selectedMap is EqualUnmodifiableMapView) return _selectedMap;
@@ -264,18 +266,18 @@ Map<String, dynamic> toJson() {
 
 @override
 bool operator ==(Object other) {
-    return identical(this, other) || (other.runtimeType == runtimeType&&other is _SetupParams&&(identical(other.base, base) || other.base == base)&&const DeepCollectionEquality().equals(other.selectedMap, _selectedMap)&&(identical(other.options, options) || other.options == options));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is _SetupParams&&(identical(other.base, base) || other.base == base)&&(identical(other.configPath, configPath) || other.configPath == configPath)&&const DeepCollectionEquality().equals(other.selectedMap, _selectedMap)&&(identical(other.options, options) || other.options == options));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
-    return Object.hash(runtimeType,base,const DeepCollectionEquality().hash(_selectedMap),options);
+    return Object.hash(runtimeType,base,configPath,const DeepCollectionEquality().hash(_selectedMap),options);
 }
 
 @override
 String toString() {
-    return 'SetupParams(base: $base, selectedMap: $selectedMap, options: $options)';
+    return 'SetupParams(base: $base, configPath: $configPath, selectedMap: $selectedMap, options: $options)';
 }
 
 
@@ -286,7 +288,7 @@ abstract mixin class _$SetupParamsCopyWith<$Res> implements $SetupParamsCopyWith
   factory _$SetupParamsCopyWith(_SetupParams value, $Res Function(_SetupParams) _then) = __$SetupParamsCopyWithImpl;
 @override @useResult
 $Res call({
-@JsonKey(includeIfNull: false) SetupBase? base,@JsonKey(name: 'selected-map') Map<String, String> selectedMap, CoreOptions options
+@JsonKey(includeIfNull: false) SetupBase? base,@JsonKey(name: 'config-path', includeIfNull: false) String? configPath,@JsonKey(name: 'selected-map') Map<String, String> selectedMap, CoreOptions options
 });
 
 
@@ -303,10 +305,11 @@ class __$SetupParamsCopyWithImpl<$Res>
 
 /// Create a copy of SetupParams
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? base = freezed,Object? selectedMap = null,Object? options = null,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? base = freezed,Object? configPath = freezed,Object? selectedMap = null,Object? options = null,}) {
   return _then(_SetupParams(
 base: freezed == base ? _self.base : base // ignore: cast_nullable_to_non_nullable
-as SetupBase?,selectedMap: null == selectedMap ? _self._selectedMap : selectedMap // ignore: cast_nullable_to_non_nullable
+as SetupBase?,configPath: freezed == configPath ? _self.configPath : configPath // ignore: cast_nullable_to_non_nullable
+as String?,selectedMap: null == selectedMap ? _self._selectedMap : selectedMap // ignore: cast_nullable_to_non_nullable
 as Map<String, String>,options: null == options ? _self.options : options // ignore: cast_nullable_to_non_nullable
 as CoreOptions,
   ));
@@ -619,7 +622,7 @@ as bool,
 /// @nodoc
 mixin _$SetupBase {
 
- String get path; String get overlay;
+ String get path; String get overlay;@JsonKey(name: 'dialer-proxies', includeIfNull: false) Map<String, String>? get dialerProxies;
 /// Create a copy of SetupBase
 /// with the given fields replaced by the non-null parameter values.
 @JsonKey(includeFromJson: false, includeToJson: false)
@@ -633,20 +636,20 @@ $SetupBaseCopyWith<SetupBase> get copyWith => _$SetupBaseCopyWithImpl<SetupBase>
 @override
 bool operator ==(Object other) {
   final _this = this as SetupBase;
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SetupBase&&(identical(other.path, _this.path) || other.path == _this.path)&&(identical(other.overlay, _this.overlay) || other.overlay == _this.overlay));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SetupBase&&(identical(other.path, _this.path) || other.path == _this.path)&&(identical(other.overlay, _this.overlay) || other.overlay == _this.overlay)&&const DeepCollectionEquality().equals(other.dialerProxies, _this.dialerProxies));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
   final _this = this as SetupBase;
-  return Object.hash(runtimeType,_this.path,_this.overlay);
+  return Object.hash(runtimeType,_this.path,_this.overlay,const DeepCollectionEquality().hash(_this.dialerProxies));
 }
 
 @override
 String toString() {
   final _this = this as SetupBase;
-  return 'SetupBase(path: ${_this.path}, overlay: ${_this.overlay})';
+  return 'SetupBase(path: ${_this.path}, overlay: ${_this.overlay}, dialerProxies: ${_this.dialerProxies})';
 }
 
 
@@ -657,7 +660,7 @@ abstract mixin class $SetupBaseCopyWith<$Res>  {
   factory $SetupBaseCopyWith(SetupBase value, $Res Function(SetupBase) _then) = _$SetupBaseCopyWithImpl;
 @useResult
 $Res call({
- String path, String overlay
+ String path, String overlay,@JsonKey(name: 'dialer-proxies', includeIfNull: false) Map<String, String>? dialerProxies
 });
 
 
@@ -674,11 +677,12 @@ class _$SetupBaseCopyWithImpl<$Res>
 
 /// Create a copy of SetupBase
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? path = null,Object? overlay = null,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? path = null,Object? overlay = null,Object? dialerProxies = freezed,}) {
   return _then(SetupBase(
 path: null == path ? _self.path : path // ignore: cast_nullable_to_non_nullable
 as String,overlay: null == overlay ? _self.overlay : overlay // ignore: cast_nullable_to_non_nullable
-as String,
+as String,dialerProxies: freezed == dialerProxies ? _self.dialerProxies : dialerProxies // ignore: cast_nullable_to_non_nullable
+as Map<String, String>?,
   ));
 }
 
@@ -763,10 +767,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String path,  String overlay)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String path,  String overlay, @JsonKey(name: 'dialer-proxies', includeIfNull: false)  Map<String, String>? dialerProxies)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _SetupBase() when $default != null:
-return $default(_that.path,_that.overlay);case _:
+return $default(_that.path,_that.overlay,_that.dialerProxies);case _:
   return orElse();
 
 }
@@ -784,10 +788,10 @@ return $default(_that.path,_that.overlay);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String path,  String overlay)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String path,  String overlay, @JsonKey(name: 'dialer-proxies', includeIfNull: false)  Map<String, String>? dialerProxies)  $default,) {final _that = this;
 switch (_that) {
 case _SetupBase():
-return $default(_that.path,_that.overlay);case _:
+return $default(_that.path,_that.overlay,_that.dialerProxies);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -804,10 +808,10 @@ return $default(_that.path,_that.overlay);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String path,  String overlay)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String path,  String overlay, @JsonKey(name: 'dialer-proxies', includeIfNull: false)  Map<String, String>? dialerProxies)?  $default,) {final _that = this;
 switch (_that) {
 case _SetupBase() when $default != null:
-return $default(_that.path,_that.overlay);case _:
+return $default(_that.path,_that.overlay,_that.dialerProxies);case _:
   return null;
 
 }
@@ -819,11 +823,20 @@ return $default(_that.path,_that.overlay);case _:
 @JsonSerializable()
 
 class _SetupBase implements SetupBase {
-  const _SetupBase({required this.path, required this.overlay});
+  const _SetupBase({required this.path, required this.overlay, @JsonKey(name: 'dialer-proxies', includeIfNull: false)  Map<String, String>? dialerProxies}): _dialerProxies = dialerProxies;
   factory _SetupBase.fromJson(Map<String, dynamic> json) => _$SetupBaseFromJson(json);
 
 @override final  String path;
 @override final  String overlay;
+ final  Map<String, String>? _dialerProxies;
+@override@JsonKey(name: 'dialer-proxies', includeIfNull: false) Map<String, String>? get dialerProxies {
+  final value = _dialerProxies;
+  if (value == null) return null;
+  if (_dialerProxies is EqualUnmodifiableMapView) return _dialerProxies;
+  // ignore: implicit_dynamic_type
+  return EqualUnmodifiableMapView(value);
+}
+
 
 /// Create a copy of SetupBase
 /// with the given fields replaced by the non-null parameter values.
@@ -838,18 +851,18 @@ Map<String, dynamic> toJson() {
 
 @override
 bool operator ==(Object other) {
-    return identical(this, other) || (other.runtimeType == runtimeType&&other is _SetupBase&&(identical(other.path, path) || other.path == path)&&(identical(other.overlay, overlay) || other.overlay == overlay));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is _SetupBase&&(identical(other.path, path) || other.path == path)&&(identical(other.overlay, overlay) || other.overlay == overlay)&&const DeepCollectionEquality().equals(other.dialerProxies, _dialerProxies));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
 int get hashCode {
-    return Object.hash(runtimeType,path,overlay);
+    return Object.hash(runtimeType,path,overlay,const DeepCollectionEquality().hash(_dialerProxies));
 }
 
 @override
 String toString() {
-    return 'SetupBase(path: $path, overlay: $overlay)';
+    return 'SetupBase(path: $path, overlay: $overlay, dialerProxies: $dialerProxies)';
 }
 
 
@@ -860,7 +873,7 @@ abstract mixin class _$SetupBaseCopyWith<$Res> implements $SetupBaseCopyWith<$Re
   factory _$SetupBaseCopyWith(_SetupBase value, $Res Function(_SetupBase) _then) = __$SetupBaseCopyWithImpl;
 @override @useResult
 $Res call({
- String path, String overlay
+ String path, String overlay,@JsonKey(name: 'dialer-proxies', includeIfNull: false) Map<String, String>? dialerProxies
 });
 
 
@@ -877,11 +890,12 @@ class __$SetupBaseCopyWithImpl<$Res>
 
 /// Create a copy of SetupBase
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? path = null,Object? overlay = null,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? path = null,Object? overlay = null,Object? dialerProxies = freezed,}) {
   return _then(_SetupBase(
 path: null == path ? _self.path : path // ignore: cast_nullable_to_non_nullable
 as String,overlay: null == overlay ? _self.overlay : overlay // ignore: cast_nullable_to_non_nullable
-as String,
+as String,dialerProxies: freezed == dialerProxies ? _self._dialerProxies : dialerProxies // ignore: cast_nullable_to_non_nullable
+as Map<String, String>?,
   ));
 }
 

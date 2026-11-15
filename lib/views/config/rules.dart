@@ -8,7 +8,9 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 class AddedRulesView extends ConsumerStatefulWidget {
-  const AddedRulesView({super.key});
+  final int? profileId;
+
+  const AddedRulesView({super.key, this.profileId});
 
   @override
   ConsumerState<AddedRulesView> createState() => _AddedRulesViewState();
@@ -34,7 +36,10 @@ class _AddedRulesViewState extends ConsumerState<AddedRulesView> {
   Future<void> _handleAddOrUpdate([Rule? rule]) async {
     final res = await showFormSheet<Rule>(
       context: context,
-      builder: (_) => RuleForm(rule: rule),
+      builder: (_) => RuleForm(
+        rule: rule,
+        profileId: widget.profileId ?? ref.read(currentProfileIdProvider),
+      ),
     );
     if (res == null || !mounted) {
       return;
@@ -99,6 +104,11 @@ class _AddedRulesViewState extends ConsumerState<AddedRulesView> {
     final isSearching = _query.isNotEmpty;
     final selectedRules = ref.watch(itemsProvider(_key));
     final isSelecting = selectedRules.isNotEmpty;
+    final id = widget.profileId ?? ref.watch(currentProfileIdProvider);
+    final state = id == null ? null : ref.watch(clashConfigProvider(id));
+    final config = state != null && !state.isLoading && !state.hasError
+        ? state.value
+        : null;
     final selectionActions = [
       IconButtonData(
         glyph: AppGlyphs.delete,
@@ -151,7 +161,7 @@ class _AddedRulesViewState extends ConsumerState<AddedRulesView> {
                 ? PrismListView(
                     padding: _listPadding(context),
                     itemBuilder: (_, index) =>
-                        _buildRuleItem(rules, index, selectedRules),
+                        _buildRuleItem(rules, index, selectedRules, config),
                     itemExtent: ruleItemHeight,
                     itemCount: rules.length,
                   )
@@ -160,11 +170,16 @@ class _AddedRulesViewState extends ConsumerState<AddedRulesView> {
                     itemBuilder: (_, index) => ReorderDragStartListener(
                       key: ObjectKey(rules[index]),
                       index: index,
-                      child: _buildRuleItem(rules, index, selectedRules),
+                      child: _buildRuleItem(
+                        rules,
+                        index,
+                        selectedRules,
+                        config,
+                      ),
                     ),
                     proxyDecorator: (child, index, animation) =>
                         commonProxyDecorator(
-                          _buildRuleItem(rules, index, selectedRules),
+                          _buildRuleItem(rules, index, selectedRules, config),
                           index,
                           animation,
                         ),
@@ -187,13 +202,19 @@ class _AddedRulesViewState extends ConsumerState<AddedRulesView> {
     16 + context.bottomInset,
   );
 
-  Widget _buildRuleItem(List<Rule> rules, int index, Set<dynamic> selected) {
+  Widget _buildRuleItem(
+    List<Rule> rules,
+    int index,
+    Set<dynamic> selected,
+    ClashConfig? config,
+  ) {
     final rule = rules[index];
     return ItemPositionProvider(
       key: ObjectKey(rule),
       position: ItemPosition.get(index, rules.length),
       child: RuleItem(
         hasMatch: true,
+        invalidMessageOf: (rule) => addedRuleTargetError(context, rule, config),
         isEditing: selected.isNotEmpty,
         rule: rule,
         isSelected: selected.contains(rule.id),

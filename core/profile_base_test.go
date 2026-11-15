@@ -111,7 +111,7 @@ func TestHandleGetProfileBaseLeavesTheBulkSectionsInTheCore(t *testing.T) {
 	}
 }
 
-func TestHandleGetProfileOutboundsListsOnlyNamesAndTypes(t *testing.T) {
+func TestHandleGetProfileOutboundsListsOnlyDependencyMetadata(t *testing.T) {
 	path := writeBaseProfile(t, baseProfile)
 
 	outbounds, err := handleGetProfileOutbounds(PathParams{Path: path})
@@ -121,7 +121,8 @@ func TestHandleGetProfileOutboundsListsOnlyNamesAndTypes(t *testing.T) {
 	}
 	want := &ProfileOutbounds{
 		Proxies:     []ProfileOutbound{{Name: "a", Type: "socks5"}, {Name: "b", Type: "vless"}},
-		ProxyGroups: []ProfileOutbound{{Name: "g", Type: "select"}},
+		ProxyGroups: []ProfileOutbound{{Name: "g", Type: "select", Proxies: []string{"a", "b"}}},
+		SubRules:    map[string]any{"sub": nil},
 	}
 	if !reflect.DeepEqual(outbounds, want) {
 		t.Errorf("outbounds = %+v, want %+v", outbounds, want)

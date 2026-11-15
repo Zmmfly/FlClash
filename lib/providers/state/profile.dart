@@ -46,6 +46,9 @@ Future<ClashConfig> clashConfig(Ref ref, int profileId) async {
 @riverpod
 Future<SetupState> setupState(Ref ref, int? profileId) async {
   final profile = ref.watch(profileProvider(profileId));
+  if (profile?.overrides.dialerProxies.isUnreadable == true) {
+    profile!.overrides.dialerProxies.validated;
+  }
   final scriptId = profile?.scriptId;
   final profileLastUpdateDate = profile?.lastUpdateDate?.millisecondsSinceEpoch;
   final profileType = profile?.type ?? ProfileType.file;
@@ -66,6 +69,10 @@ Future<SetupState> setupState(Ref ref, int? profileId) async {
               ),
               tun: state.tunOverride,
               tunOverrideKeys: state.tunOverrideKeys,
+              dialerProxies: extendType == ExtendType.standard
+                  ? profile?.overrides.dialerProxies ??
+                        const DialerProxyOverrides()
+                  : const DialerProxyOverrides(),
             ),
           ),
         );

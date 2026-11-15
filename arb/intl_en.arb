@@ -1076,5 +1076,10 @@
   "fakeipFilterDesc": "These domains get real IPs instead of Fake-IPs. In whitelist mode, only they get Fake-IPs.",
   "fallbackFilterGeositeDesc": "Domains in these GeoSite categories are resolved by Fallback directly.",
   "fallbackFilterIpcidrDesc": "When Nameserver returns an IP in these ranges, the Fallback answer is used.",
-  "fallbackFilterDomainDesc": "These domains are resolved by Fallback directly."
+  "fallbackFilterDomainDesc": "These domains are resolved by Fallback directly.",
+  "profileDialersDescription": "A → B and B → C dial through client → C → B → A → destination. Follow profile preserves its original dialer. The core validates the combined proxy/group graph; unresolved provider dependencies are rejected.",
+  "profileDialersUnreadable": "Stored dialer overrides cannot be read. Applying is blocked until you explicitly reset them.",
+  "profileDialersResetTip": "Reset the stored dialer overrides? If the entire overrides document is unreadable, all profile overrides will be reset. This cannot be undone.",
+  "profileDialerSourceMissing": "Source {name} is missing or ambiguous. Choose Follow profile to remove this override.",
+  "profileDialerOriginal": "Follow profile: {target}"
 }

@@ -200,10 +200,36 @@ class Profiles extends _$Profiles {
 
   Profile labeled(Profile profile) => state.optimizeLabel(profile);
 
+  void _guardUnreadable(Profile? previous, Profile next) {
+    if (previous?.overrides.dialerProxies.isUnreadable == true &&
+        previous != next) {
+      throw const OutboundPolicyException(
+        'profile.overrides',
+        'repair the unreadable document before editing this profile',
+      );
+    }
+  }
+
+  void resetDialerOverrides(int profileId) {
+    final previous = state.getProfile(profileId);
+    if (previous == null) return;
+    final overrides = previous.overrides.dialerProxies.isUnreadable
+        ? const ProfileOverrides()
+        : previous.overrides.copyWith(
+            dialerProxies: const DialerProxyOverrides(),
+          );
+    final next = previous.copyWith(overrides: overrides);
+    _optimistic(
+      state.copyAndPut(next, (item) => item.id == profileId),
+      () => _serial(() => _putLatest([profileId])),
+    );
+  }
+
   /// A new provider label follows into custom profiles whatever path set it.
   void put(Profile profile) {
     final newProfile = labeled(profile);
     final previous = state.getProfile(profile.id);
+    _guardUnreadable(previous, newProfile);
     final previousLabel = previous?.realLabel;
     // A new profile goes where the query sorts it, so the read-back after the
     // write does not move it.
@@ -304,6 +330,7 @@ class Profiles extends _$Profiles {
     final index = state.indexWhere((element) => element.id == profileId);
     if (index == -1) return;
     final newProfile = builder(state[index]);
+    _guardUnreadable(state[index], newProfile);
     if (newProfile == state[index]) return;
     final next = List<Profile>.from(state);
     next[index] = newProfile;

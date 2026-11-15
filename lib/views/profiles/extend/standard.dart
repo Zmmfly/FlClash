@@ -9,6 +9,8 @@ import 'package:fl_clash/widgets/widgets.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'dialers.dart';
+
 class StandardContent extends ConsumerStatefulWidget {
   const StandardContent({super.key});
 
@@ -23,7 +25,7 @@ class _StandardContentState extends ConsumerState<StandardContent> {
   Future<void> _handleAddOrUpdate([Rule? rule]) async {
     final res = await showFormSheet<Rule>(
       context: context,
-      builder: (_) => RuleForm(rule: rule),
+      builder: (_) => RuleForm(rule: rule, profileId: _profileId),
     );
     if (res == null) {
       return;
@@ -91,7 +93,12 @@ class _StandardContentState extends ConsumerState<StandardContent> {
     BaseNavigator.push(context, _EditGlobalAddedRules(_profileId));
   }
 
-  Widget _buildRuleItem(List<Rule> rules, int index, Set<dynamic> selected) {
+  Widget _buildRuleItem(
+    List<Rule> rules,
+    int index,
+    Set<dynamic> selected,
+    ClashConfig? config,
+  ) {
     final rule = rules[index];
     return ReorderDragStartListener(
       key: ObjectKey(rule),
@@ -102,6 +109,8 @@ class _StandardContentState extends ConsumerState<StandardContent> {
           margin: const EdgeInsets.symmetric(horizontal: 16),
           child: RuleItem(
             hasMatch: true,
+            invalidMessageOf: (rule) =>
+                addedRuleTargetError(context, rule, config),
             isEditing: selected.isNotEmpty,
             isSelected: selected.contains(rule.id),
             rule: rule,
@@ -123,6 +132,8 @@ class _StandardContentState extends ConsumerState<StandardContent> {
     _profileId = ProfileIdProvider.of(context)!.profileId;
     final addedRules = ref.watch(profileRulesProvider(_profileId)).value ?? [];
     final selectedRules = ref.watch(itemsProvider(_key));
+    final state = ref.watch(clashConfigProvider(_profileId));
+    final config = !state.isLoading && !state.hasError ? state.value : null;
     return PopGuard(
       onPop: selectedRules.isEmpty
           ? null
@@ -168,9 +179,9 @@ class _StandardContentState extends ConsumerState<StandardContent> {
           SliverPrismReorderableList(
             itemCount: addedRules.length,
             itemBuilder: (_, index) =>
-                _buildRuleItem(addedRules, index, selectedRules),
+                _buildRuleItem(addedRules, index, selectedRules, config),
             proxyDecorator: (child, index, animation) => commonProxyDecorator(
-              _buildRuleItem(addedRules, index, selectedRules),
+              _buildRuleItem(addedRules, index, selectedRules, config),
               index,
               animation,
             ),
@@ -181,6 +192,13 @@ class _StandardContentState extends ConsumerState<StandardContent> {
           ),
           const SliverToBoxAdapter(child: SizedBox(height: 16)),
           SliverToBoxAdapter(child: _MatchTargetItem(_profileId)),
+          SliverToBoxAdapter(
+            child: MoreActionButton(
+              label: appLocalizations.dialerProxy,
+              onPressed: () =>
+                  BaseNavigator.push(context, ProfileDialersView(_profileId)),
+            ),
+          ),
           SliverToBoxAdapter(
             child: MoreActionButton(
               label: appLocalizations.controlGlobalAddedRules,
@@ -317,7 +335,10 @@ class _EditGlobalAddedRulesState extends ConsumerState<_EditGlobalAddedRules> {
   }
 
   void _handleToAddedRules() {
-    showInSheet<void>(context, builder: (_) => const AddedRulesView());
+    showInSheet<void>(
+      context,
+      builder: (_) => AddedRulesView(profileId: profileId),
+    );
   }
 
   @override

@@ -10,6 +10,7 @@ import 'package:fl_clash/views/profiles/add.dart';
 import 'package:fl_clash/views/profiles/custom/custom.dart';
 import 'package:fl_clash/views/profiles/custom/providers.dart';
 import 'package:fl_clash/views/profiles/extend/extend.dart';
+import 'package:fl_clash/views/profiles/extend/dialers.dart';
 import 'package:fl_clash/widgets/widgets.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -167,7 +168,7 @@ void main() {
           clashConfigProvider(profile.id).overrideWithValue(
             const AsyncData(
               ClashConfig(
-                proxies: [Proxy(name: 'DIRECT', type: 'Direct')],
+                proxies: [Proxy(name: 'A', type: 'ss')],
               ),
             ),
           ),
@@ -233,6 +234,47 @@ void main() {
         findsOneWidget,
       );
     });
+
+    for (final current in [true, false]) {
+      testWidgets(
+        'dialer edit offers apply only for current profile: $current',
+        (tester) async {
+          final setupAction = await pumpExtendView(tester, current: current);
+          expect(applyNowButton(), findsNothing);
+          await tester.tap(find.text(currentAppLocalizations.dialerProxy));
+          await tester.pumpAndSettle();
+          expect(find.byType(ProfileDialersView), findsOneWidget);
+          await tester.tap(find.text('A'));
+          await tester.pumpAndSettle();
+          await tester.tap(
+            find.text(currentAppLocalizations.none).hitTestable(),
+          );
+          await tester.pumpAndSettle();
+          final profileId = tester
+              .widget<ProfileDialersView>(find.byType(ProfileDialersView))
+              .profileId;
+          expect(
+            globalState.container
+                .read(profileProvider(profileId))!
+                .overrides
+                .dialerProxies
+                .validated,
+            {'A': ''},
+          );
+          await tester.binding.handlePopRoute();
+          await tester.pumpAndSettle();
+          expect(applyNowButton(), current ? findsOneWidget : findsNothing);
+          if (current) {
+            await tester.tap(applyNowButton());
+            await tester.pumpAndSettle();
+            expect(setupAction.applyCalls, 1);
+            expect(applyNowButton(), findsNothing);
+          } else {
+            expect(setupAction.applyCalls, 0);
+          }
+        },
+      );
+    }
 
     testWidgets('offers applying at once only after a change', (tester) async {
       final setupAction = await pumpExtendView(tester);

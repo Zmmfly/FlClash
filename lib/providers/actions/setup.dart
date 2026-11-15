@@ -427,10 +427,6 @@ class SetupAction extends _$SetupAction {
         );
   }
 
-  // False means building the profile, the config write, or the Core setup
-  // step failed; a profile that fails to build is still pushed to the Core
-  // as the empty config so it never keeps serving the previous one.
-  // authorizeCore failures still throw.
   Future<bool> applyProfile({
     bool silence = false,
     bool force = false,
@@ -484,6 +480,14 @@ class SetupAction extends _$SetupAction {
     required PatchClashConfig patchConfig,
   }) async {
     final profileId = setupState.profileId;
+    final dialerProxies =
+        setupState.profileType != ProfileType.custom &&
+            setupState.extendType == ExtendType.standard
+        ? setupState.overrides.dialerProxies.validated
+        : const <String, String>{};
+    if (setupState.overrides.dialerProxies.isUnreadable) {
+      setupState.overrides.dialerProxies.validated;
+    }
     if (profileId == null) {
       return (yaml: '', md5: '', counts: configCountsOf(const {}), base: null);
     }
@@ -559,13 +563,19 @@ class SetupAction extends _$SetupAction {
     final (:base, :path) = profileBase;
     return (
       yaml: res.yaml,
-      md5: '${res.md5}${base.digest}'.toMd5(),
+      md5:
+          '${res.md5}${base.digest}${dialerProxies.isEmpty ? '' : jsonEncode(dialerProxies)}'
+              .toMd5(),
       counts: (
         groups: res.counts.groups + base.proxyGroups,
         proxies: res.counts.proxies + base.proxies,
         rules: res.counts.rules + base.rules,
       ),
-      base: SetupBase(path: path, overlay: res.yaml),
+      base: SetupBase(
+        path: path,
+        overlay: res.yaml,
+        dialerProxies: dialerProxies.isEmpty ? null : dialerProxies,
+      ),
     );
   }
 
@@ -716,6 +726,9 @@ class SetupAction extends _$SetupAction {
     return fallback;
   }
 
+  @protected
+  Future<void> deleteSetupCandidate(File candidate) => candidate.safeDelete();
+
   Future<_SetupTaskResult> _setupConfig({
     bool force = false,
     bool silence = false,
@@ -723,6 +736,16 @@ class SetupAction extends _$SetupAction {
     FutureOr Function()? onUpdated,
   }) async {
     var profile = ref.read(currentProfileProvider) ?? recoverMissingProfile();
+    final policyReadable = await globalState.safeRun(() {
+      final dialers = profile?.overrides.dialerProxies;
+      if (dialers?.isUnreadable == true ||
+          profile?.type != ProfileType.custom &&
+              profile?.extendType == ExtendType.standard) {
+        dialers?.validated;
+      }
+      return true;
+    });
+    if (policyReadable != true) return _SetupTaskResult.failed;
     // A refresh failure is surfaced by safeRun; setup keeps the old profile.
     final nextProfile = await globalState.safeRun(
       () => profile?.checkAndUpdateAndCopy(
@@ -743,11 +766,24 @@ class SetupAction extends _$SetupAction {
     final realPatchConfig = _effectivePatchConfig(patchConfig);
     final networkSetting = ref.read(networkSettingProvider);
     SetupState? setupState;
+    var policyFailed = false;
     final realProfile = await globalState.safeRun(() async {
-      final state = await ref.read(setupStateProvider(profile?.id).future);
-      setupState = state;
-      return getProfile(setupState: state, patchConfig: realPatchConfig);
+      try {
+        final state = await ref.read(setupStateProvider(profile?.id).future);
+        setupState = state;
+        return await getProfile(
+          setupState: state,
+          patchConfig: realPatchConfig,
+        );
+      } catch (error) {
+        policyFailed =
+            error is OutboundPolicyException ||
+            error is CoreMethodException &&
+                error.code == 'outbound_policy_invalid';
+        rethrow;
+      }
     }, title: 'build profile');
+    if (policyFailed) return _SetupTaskResult.failed;
     final profileFailed = realProfile == null;
     final setupParams = _setupParams.copyWith(base: realProfile?.base);
     final inputs = switch (setupState) {
@@ -767,8 +803,9 @@ class SetupAction extends _$SetupAction {
       await preloadInvoke?.call();
       return _SetupTaskResult.completed;
     }
-    // Go answers a config it rejects by running its built-in default, which
-    // has no proxies, so until this push succeeds no applied config is known.
+    final previousInputs = _appliedInputs;
+    final previousMd5 = globalState.lastConfigMd5;
+    final previousCounts = globalState.lastConfigCounts;
     _appliedInputs = null;
     globalState.lastConfigMd5 = null;
     globalState.lastConfigCounts = null;
@@ -780,12 +817,16 @@ class SetupAction extends _$SetupAction {
     // Recaptured so _start's catch can roll back after safeRun swallows it.
     (Object, StackTrace)? handoffFailure;
     var setupFailed = false;
+    var coreCommitted = false;
     await globalState.loadingRun(
       () async {
+        File? candidate;
         try {
+          var params = setupParams;
           if (setupParams.base == null) {
-            final configFilePath = await appPath.configFilePath;
-            await File(configFilePath).writeAsStringAtomically(yamlString);
+            candidate = File(await appPath.tempFilePath);
+            await candidate.writeAsString(yamlString, flush: true);
+            params = setupParams.copyWith(configPath: candidate.path);
           }
           final profileId = profile?.id;
           if (profileId != null) {
@@ -801,12 +842,37 @@ class SetupAction extends _$SetupAction {
             }
           }
           try {
-            await _core.setupConfig(
-              params: setupParams,
-              preloadInvoke: preloadInvoke,
-            );
+            (Object, StackTrace)? commitFailure;
+            (Object, StackTrace)? preloadFailure;
+            final commit = _core
+                .setupConfig(params: params)
+                .then<void>((_) async {
+                  coreCommitted = true;
+                  globalState.lastConfigMd5 = yamlMd5;
+                  globalState.lastConfigCounts =
+                      realProfile?.counts ?? configCountsOf(const {});
+                  _appliedInputs = inputs;
+                  if (system.isAndroid) {
+                    await preferences.saveAppliedConfigMd5(yamlMd5);
+                  }
+                })
+                .onError<Object>((error, stackTrace) {
+                  commitFailure = (error, stackTrace);
+                });
+            try {
+              await preloadInvoke?.call();
+            } catch (error, stackTrace) {
+              preloadFailure = (error, stackTrace);
+            }
+            await commit;
+            if (commitFailure ?? preloadFailure case (
+              final error,
+              final stackTrace,
+            )) {
+              Error.throwWithStackTrace(error, stackTrace);
+            }
           } on CoreMethodException catch (error) {
-            if (error.code != 'config_rejected') {
+            if (coreCommitted || error.code != 'config_rejected') {
               rethrow;
             }
             globalState.lastConfigCounts = configCountsOf(const {});
@@ -815,17 +881,32 @@ class SetupAction extends _$SetupAction {
           }
         } catch (e, s) {
           setupFailed = true;
+          if (!coreCommitted &&
+              e is CoreMethodException &&
+              e.code == 'outbound_policy_invalid') {
+            _appliedInputs = previousInputs;
+            globalState.lastConfigMd5 = previousMd5;
+            globalState.lastConfigCounts = previousCounts;
+            if (system.isAndroid) {
+              await preferences.saveAppliedConfigMd5(previousMd5);
+            }
+          }
           if (preloadInvoke != null) {
             handoffFailure = (e, s);
           }
           rethrow;
-        }
-        globalState.lastConfigMd5 = yamlMd5;
-        globalState.lastConfigCounts =
-            realProfile?.counts ?? configCountsOf(const {});
-        _appliedInputs = inputs;
-        if (system.isAndroid) {
-          await preferences.saveAppliedConfigMd5(yamlMd5);
+        } finally {
+          if (candidate != null) {
+            try {
+              await deleteSetupCandidate(candidate);
+            } catch (_) {
+              commonPrint.log(
+                'setup candidate cleanup failed '
+                '(Core commit confirmed: $coreCommitted)',
+                logLevel: LogLevel.warning,
+              );
+            }
+          }
         }
         await onUpdated?.call();
       },

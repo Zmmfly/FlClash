@@ -10,6 +10,7 @@ part 'generated/core.g.dart';
 abstract class SetupParams with _$SetupParams {
   const factory SetupParams({
     @JsonKey(includeIfNull: false) SetupBase? base,
+    @JsonKey(name: 'config-path', includeIfNull: false) String? configPath,
     @JsonKey(name: 'selected-map') required Map<String, String> selectedMap,
     required CoreOptions options,
   }) = _SetupParams;
@@ -35,8 +36,12 @@ abstract class CoreOptions with _$CoreOptions {
 
 @freezed
 abstract class SetupBase with _$SetupBase {
-  const factory SetupBase({required String path, required String overlay}) =
-      _SetupBase;
+  const factory SetupBase({
+    required String path,
+    required String overlay,
+    @JsonKey(name: 'dialer-proxies', includeIfNull: false)
+    Map<String, String>? dialerProxies,
+  }) = _SetupBase;
 
   factory SetupBase.fromJson(Map<String, dynamic> json) =>
       _$SetupBaseFromJson(json);

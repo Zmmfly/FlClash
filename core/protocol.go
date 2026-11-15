@@ -116,9 +116,11 @@ type DecryptConfigParams struct {
 }
 
 type SetupParams struct {
-	Base        *SetupBase        `json:"base,omitempty"`
-	SelectedMap map[string]string `json:"selected-map"`
-	Options     CoreOptions       `json:"options"`
+	startListeners bool
+	Base           *SetupBase        `json:"base,omitempty"`
+	ConfigPath     string            `json:"config-path,omitempty"`
+	SelectedMap    map[string]string `json:"selected-map"`
+	Options        CoreOptions       `json:"options"`
 }
 
 type CoreOptions struct {
@@ -132,8 +134,9 @@ type CoreOptions struct {
 }
 
 type SetupBase struct {
-	Path    string `json:"path"`
-	Overlay string `json:"overlay"`
+	Path          string            `json:"path"`
+	Overlay       string            `json:"overlay"`
+	DialerProxies map[string]string `json:"dialer-proxies,omitempty"`
 }
 
 type ProfileBase struct {
@@ -146,13 +149,26 @@ type ProfileBase struct {
 }
 
 type ProfileOutbounds struct {
-	Proxies     []ProfileOutbound `json:"proxies"`
-	ProxyGroups []ProfileOutbound `json:"proxy-groups"`
+	Proxies        []ProfileOutbound `json:"proxies"`
+	ProxyGroups    []ProfileOutbound `json:"proxy-groups"`
+	ProxyProviders map[string]any    `json:"proxy-providers,omitempty"`
+	RuleProviders  map[string]any    `json:"rule-providers,omitempty"`
+	SubRules       map[string]any    `json:"sub-rules,omitempty"`
 }
 
 type ProfileOutbound struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name                string   `json:"name"`
+	Type                string   `json:"type"`
+	DialerProxy         string   `json:"dialer-proxy,omitempty"`
+	Proxies             []string `json:"proxies,omitempty"`
+	Use                 []string `json:"use,omitempty"`
+	IncludeAll          bool     `json:"include-all,omitempty"`
+	IncludeAllProxies   bool     `json:"include-all-proxies,omitempty"`
+	IncludeAllProviders bool     `json:"include-all-providers,omitempty"`
+	Filter              string   `json:"filter,omitempty"`
+	ExcludeFilter       string   `json:"exclude-filter,omitempty"`
+	ExcludeType         string   `json:"exclude-type,omitempty"`
+	EmptyFallback       string   `json:"empty-fallback,omitempty"`
 }
 
 type UpdateParams struct {

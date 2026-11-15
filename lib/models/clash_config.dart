@@ -2,6 +2,7 @@ import 'package:collection/collection.dart';
 import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/enum/enum.dart';
 import 'package:fl_clash/models/core.dart';
+import 'package:fl_clash/models/dialer_overrides.dart';
 import 'package:freezed_annotation/freezed_annotation.dart';
 import 'package:yaml/yaml.dart';
 
@@ -229,6 +230,7 @@ abstract class Proxy with _$Proxy {
     required String type,
     String? now,
     @JsonKey(name: 'provider-name') String? providerName,
+    @JsonKey(name: 'dialer-proxy') String? dialerProxy,
   }) = _Proxy;
 
   factory Proxy.fromJson(Map<String, Object?> json) => _$ProxyFromJson(json);
@@ -1643,9 +1645,24 @@ Map<String, Object?> _withLegacyTunOverride(Map<String, Object?> json) {
   };
 }
 
+Object _readDialerOverrides(Map<dynamic, dynamic> json, String key) =>
+    json.containsKey(key)
+    ? DialerProxyOverrides.fromJson(json[key])
+    : const DialerProxyOverrides();
+
+Object? _dialerOverridesToJson(DialerProxyOverrides value) => value.toJson();
+
 @freezed
 abstract class ProfileOverrides with _$ProfileOverrides {
   const factory ProfileOverrides({
+    @Default(DialerProxyOverrides())
+    @JsonKey(
+      name: 'dialer-proxies',
+      readValue: _readDialerOverrides,
+      fromJson: DialerProxyOverrides.fromJson,
+      toJson: _dialerOverridesToJson,
+    )
+    DialerProxyOverrides dialerProxies,
     @Default(defaultDns) @JsonKey(fromJson: Dns.safeDnsFromJson) Dns dns,
     @Default({})
     @JsonKey(name: _dnsOverrideKeysJsonKey, fromJson: _dnsOverrideKeysFromJson)
@@ -1678,11 +1695,14 @@ abstract class ProfileOverrides with _$ProfileOverrides {
       _$ProfileOverridesFromJson(json);
 
   factory ProfileOverrides.safeFromJson(Map<String, Object?> json) {
+    final dialers =
+        _readDialerOverrides(json, 'dialer-proxies') as DialerProxyOverrides;
+    final other = Map<String, Object?>.from(json)..remove('dialer-proxies');
     return decodeSalvaging(
       'profile overrides',
-      json,
+      other,
       ProfileOverrides.fromJson,
-    );
+    ).copyWith(dialerProxies: dialers);
   }
 }
 

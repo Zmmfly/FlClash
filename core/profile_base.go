@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/common/structure"
 	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/config"
 	"go.yaml.in/yaml/v3"
@@ -59,17 +61,47 @@ func handleGetProfileOutbounds(params PathParams) (*ProfileOutbounds, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ProfileOutbounds{Proxies: outboundsOf(raw.Proxy), ProxyGroups: outboundsOf(raw.ProxyGroup)}, nil
+	proxies, err := outboundsOf(raw.Proxy, false)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := outboundsOf(raw.ProxyGroup, true)
+	if err != nil {
+		return nil, err
+	}
+	return &ProfileOutbounds{Proxies: proxies, ProxyGroups: groups, ProxyProviders: outboundMetadataNames(raw.ProxyProvider), RuleProviders: outboundMetadataNames(raw.RuleProvider), SubRules: outboundMetadataNames(raw.SubRules)}, nil
 }
 
-func outboundsOf(mappings []map[string]any) []ProfileOutbound {
-	outbounds := make([]ProfileOutbound, 0, len(mappings))
-	for _, mapping := range mappings {
-		name, _ := mapping["name"].(string)
-		kind, _ := mapping["type"].(string)
-		outbounds = append(outbounds, ProfileOutbound{Name: name, Type: kind})
+func outboundMetadataNames[V any](entries map[string]V) map[string]any {
+	if len(entries) == 0 {
+		return nil
 	}
-	return outbounds
+	names := make(map[string]any, len(entries))
+	for name := range entries {
+		names[name] = nil
+	}
+	return names
+}
+
+func outboundsOf(mappings []map[string]any, groups bool) ([]ProfileOutbound, error) {
+	result := make([]ProfileOutbound, 0, len(mappings))
+	for _, mapping := range mappings {
+		if !groups {
+			proxy, err := decodeDependencyProxy(mapping)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, ProfileOutbound{Name: proxy.Name, Type: proxy.Type, DialerProxy: proxy.Dialer})
+			continue
+		}
+		var group outboundgroup.GroupCommonOption
+		decoder := structure.NewDecoder(structure.Option{TagName: "group", WeaklyTypedInput: true})
+		if decoder.Decode(mapping, &group) != nil {
+			return nil, errors.New("invalid group metadata")
+		}
+		result = append(result, ProfileOutbound{Name: group.Name, Type: group.Type, Proxies: group.Proxies, Use: group.Use, IncludeAll: group.IncludeAll, IncludeAllProxies: group.IncludeAllProxies, IncludeAllProviders: group.IncludeAllProviders, Filter: group.Filter, ExcludeFilter: group.ExcludeFilter, ExcludeType: group.ExcludeType, EmptyFallback: group.EmptyFallback})
+	}
+	return result, nil
 }
 
 // The merged config goes to the spill directory, so the host reads it as text
@@ -99,25 +131,34 @@ func isMatchRule(rule string) bool {
 }
 
 func loadConfigWithBase(base *SetupBase, configPath string) (*config.Config, error) {
-	document, err := mergeProfileBase(base)
+	document, raw, err := prepareProfileBase(base)
 	if err != nil {
 		return nil, err
 	}
-	raw := config.DefaultRawConfig()
-	if err := document.Decode(raw); err != nil {
-		return nil, err
-	}
-	if err := writeConfigDocument(configPath, document); err != nil {
-		return nil, err
-	}
-	cfg, err := config.ParseRawConfig(raw)
+	return (&preparedConfig{raw: raw, document: document, publishPath: configPath, publishBeforeParse: true}).load()
+}
+
+func prepareProfileBase(base *SetupBase) (*yaml.Node, *config.RawConfig, error) {
+	document, err := assembleProfileBase(base)
 	if err != nil {
-		return nil, err
+		if len(base.DialerProxies) > 0 && !isDependencyPolicyError(err) {
+			err = invalidDependencyMetadata("dialer-proxies")
+		}
+		return nil, nil, err
 	}
-	return withPlatformLimits(cfg), nil
+	raw, err := prepareDependencyDocument(document, base.DialerProxies)
+	if err != nil {
+		return nil, nil, err
+	}
+	return document, raw, nil
 }
 
 func mergeProfileBase(base *SetupBase) (*yaml.Node, error) {
+	document, _, err := prepareProfileBase(base)
+	return document, err
+}
+
+func assembleProfileBase(base *SetupBase) (*yaml.Node, error) {
 	buf, err := os.ReadFile(base.Path)
 	if err != nil {
 		return nil, err

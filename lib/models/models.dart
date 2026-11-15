@@ -4,6 +4,7 @@ export 'clash_config.dart';
 export 'common.dart';
 export 'config.dart';
 export 'core.dart';
+export 'dialer_overrides.dart';
 export 'ip_quality.dart';
 export 'profile.dart';
 export 'record_filter.dart';

@@ -94,6 +94,7 @@ _Proxy _$ProxyFromJson(Map<String, dynamic> json) => _Proxy(
   type: json['type'] as String,
   now: json['now'] as String?,
   providerName: json['provider-name'] as String?,
+  dialerProxy: json['dialer-proxy'] as String?,
 );
 
 Map<String, dynamic> _$ProxyToJson(_Proxy instance) => <String, dynamic>{
@@ -101,6 +102,7 @@ Map<String, dynamic> _$ProxyToJson(_Proxy instance) => <String, dynamic>{
   'type': instance.type,
   'now': instance.now,
   'provider-name': instance.providerName,
+  'dialer-proxy': instance.dialerProxy,
 };
 
 _CustomProxy _$CustomProxyFromJson(Map<String, dynamic> json) => _CustomProxy(
@@ -554,6 +556,11 @@ Map<String, dynamic> _$ProfileTunToJson(_ProfileTun instance) =>
 
 _ProfileOverrides _$ProfileOverridesFromJson(Map<String, dynamic> json) =>
     _ProfileOverrides(
+      dialerProxies: _readDialerOverrides(json, 'dialer-proxies') == null
+          ? const DialerProxyOverrides()
+          : DialerProxyOverrides.fromJson(
+              _readDialerOverrides(json, 'dialer-proxies'),
+            ),
       dns: json['dns'] == null
           ? defaultDns
           : Dns.safeDnsFromJson(json['dns'] as Map<String, Object?>),
@@ -592,6 +599,7 @@ _ProfileOverrides _$ProfileOverridesFromJson(Map<String, dynamic> json) =>
 
 Map<String, dynamic> _$ProfileOverridesToJson(_ProfileOverrides instance) =>
     <String, dynamic>{
+      'dialer-proxies': _dialerOverridesToJson(instance.dialerProxies),
       'dns': instance.dns,
       'dns-override-keys': instance.dnsOverrideKeys
           .map((e) => _$DnsOverrideKeyEnumMap[e]!)

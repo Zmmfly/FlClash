@@ -7663,8 +7663,7 @@ class AppLocalizations {
   String customImportDroppedSubRules(num count, Object label) {
     return Intl.plural(
       count,
-      one:
-          '1 SUB-RULE rule was dropped, since custom profiles do not support sub-rules',
+      one: '1 SUB-RULE rule was dropped, since custom profiles do not support sub-rules',
       other:
           '$label SUB-RULE rules were dropped, since custom profiles do not support sub-rules',
       name: 'customImportDroppedSubRules',
@@ -9070,6 +9069,56 @@ class AppLocalizations {
       name: 'fallbackFilterDomainDesc',
       desc: '',
       args: [],
+    );
+  }
+
+  /// `A → B and B → C dial through client → C → B → A → destination. Follow profile preserves its original dialer. The core validates the combined proxy/group graph; unresolved provider dependencies are rejected.`
+  String get profileDialersDescription {
+    return Intl.message(
+      'A → B and B → C dial through client → C → B → A → destination. Follow profile preserves its original dialer. The core validates the combined proxy/group graph; unresolved provider dependencies are rejected.',
+      name: 'profileDialersDescription',
+      desc: '',
+      args: [],
+    );
+  }
+
+  /// `Stored dialer overrides cannot be read. Applying is blocked until you explicitly reset them.`
+  String get profileDialersUnreadable {
+    return Intl.message(
+      'Stored dialer overrides cannot be read. Applying is blocked until you explicitly reset them.',
+      name: 'profileDialersUnreadable',
+      desc: '',
+      args: [],
+    );
+  }
+
+  /// `Reset the stored dialer overrides? If the entire overrides document is unreadable, all profile overrides will be reset. This cannot be undone.`
+  String get profileDialersResetTip {
+    return Intl.message(
+      'Reset the stored dialer overrides? If the entire overrides document is unreadable, all profile overrides will be reset. This cannot be undone.',
+      name: 'profileDialersResetTip',
+      desc: '',
+      args: [],
+    );
+  }
+
+  /// `Source {name} is missing or ambiguous. Choose Follow profile to remove this override.`
+  String profileDialerSourceMissing(Object name) {
+    return Intl.message(
+      'Source $name is missing or ambiguous. Choose Follow profile to remove this override.',
+      name: 'profileDialerSourceMissing',
+      desc: '',
+      args: [name],
+    );
+  }
+
+  /// `Follow profile: {target}`
+  String profileDialerOriginal(Object target) {
+    return Intl.message(
+      'Follow profile: $target',
+      name: 'profileDialerOriginal',
+      desc: '',
+      args: [target],
     );
   }
 }

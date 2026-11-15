@@ -707,8 +707,6 @@ final _profileDialLoops = Expando<_DialLoops>();
 _DialLoops _dialLoopsIn(CustomProfileData data) =>
     _profileDialLoops[data] ??= _DialLoops(data.proxyGroups, data.dialers);
 
-/// Drops a dialer that leads back to its proxy, since mihomo would follow
-/// that loop on every dial.
 List<Map<String, dynamic>> appProxiesPayload(
   Iterable<CustomProxy> proxies, {
   required Map<int, String> dialers,
@@ -726,17 +724,17 @@ List<Map<String, dynamic>> appProxiesPayload(
       continue;
     }
     final dialer = chain[proxy.name];
-    if (dialer != null && !looping.contains(proxy.name)) {
-      payload.add({...proxy.definition, 'dialer-proxy': dialer});
-      continue;
-    }
     if (dialer != null) {
-      commonPrint.log(
-        'Dropped the dialer of ${proxy.name}: $dialer leads back to it',
-        logLevel: LogLevel.warning,
-      );
+      if (looping.contains(proxy.name)) {
+        throw OutboundPolicyException(
+          'custom-profile.dialer-proxies.${proxy.name}',
+          '$dialer leads back to its source',
+        );
+      }
+      payload.add({...proxy.definition, 'dialer-proxy': dialer});
+    } else {
+      payload.add({...proxy.definition}..remove('dialer-proxy'));
     }
-    payload.add({...proxy.definition}..remove('dialer-proxy'));
   }
   return payload;
 }

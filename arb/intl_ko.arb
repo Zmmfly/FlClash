@@ -1076,5 +1076,10 @@
   "fakeipFilterDesc": "이 도메인에는 Fake-IP 대신 실제 IP를 반환합니다. whitelist 모드에서는 이 도메인만 Fake-IP를 사용합니다.",
   "fallbackFilterGeositeDesc": "이 GeoSite 분류의 도메인은 바로 Fallback으로 확인합니다.",
   "fallbackFilterIpcidrDesc": "Nameserver가 이 범위의 IP를 반환하면 Fallback 결과를 사용합니다.",
-  "fallbackFilterDomainDesc": "이 도메인은 바로 Fallback으로 확인합니다."
+  "fallbackFilterDomainDesc": "이 도메인은 바로 Fallback으로 확인합니다.",
+  "profileDialersDescription": "A → B, B → C의 실제 연결 순서는 클라이언트 → C → B → A → 대상입니다. 프로필 따르기는 원래의 선행 프록시를 유지합니다. 코어는 노드와 그룹의 의존 관계를 검증하며 확인할 수 없는 제공자 의존성은 거부합니다.",
+  "profileDialersUnreadable": "저장된 선행 프록시 설정을 읽을 수 없습니다. 명시적으로 초기화할 때까지 적용할 수 없습니다.",
+  "profileDialersResetTip": "저장된 선행 프록시 설정을 초기화할까요? 전체 재정의 문서를 읽을 수 없으면 이 프로필의 모든 재정의 설정이 초기화됩니다. 이 작업은 취소할 수 없습니다.",
+  "profileDialerSourceMissing": "소스 {name}이(가) 없거나 이름이 중복됩니다. 프로필 따르기를 선택하면 이 재정의를 제거할 수 있습니다.",
+  "profileDialerOriginal": "프로필 따르기: {target}"
 }

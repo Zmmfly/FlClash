@@ -10,6 +10,7 @@ _SetupParams _$SetupParamsFromJson(Map<String, dynamic> json) => _SetupParams(
   base: json['base'] == null
       ? null
       : SetupBase.fromJson(json['base'] as Map<String, dynamic>),
+  configPath: json['config-path'] as String?,
   selectedMap: Map<String, String>.from(json['selected-map'] as Map),
   options: CoreOptions.fromJson(json['options'] as Map<String, dynamic>),
 );
@@ -17,6 +18,7 @@ _SetupParams _$SetupParamsFromJson(Map<String, dynamic> json) => _SetupParams(
 Map<String, dynamic> _$SetupParamsToJson(_SetupParams instance) =>
     <String, dynamic>{
       'base': ?instance.base,
+      'config-path': ?instance.configPath,
       'selected-map': instance.selectedMap,
       'options': instance.options,
     };
@@ -40,10 +42,17 @@ Map<String, dynamic> _$CoreOptionsToJson(_CoreOptions instance) =>
 _SetupBase _$SetupBaseFromJson(Map<String, dynamic> json) => _SetupBase(
   path: json['path'] as String,
   overlay: json['overlay'] as String,
+  dialerProxies: (json['dialer-proxies'] as Map<String, dynamic>?)?.map(
+    (k, e) => MapEntry(k, e as String),
+  ),
 );
 
 Map<String, dynamic> _$SetupBaseToJson(_SetupBase instance) =>
-    <String, dynamic>{'path': instance.path, 'overlay': instance.overlay};
+    <String, dynamic>{
+      'path': instance.path,
+      'overlay': instance.overlay,
+      'dialer-proxies': ?instance.dialerProxies,
+    };
 
 _ProfileBase _$ProfileBaseFromJson(Map<String, dynamic> json) => _ProfileBase(
   config: json['config'] as Map<String, dynamic>,

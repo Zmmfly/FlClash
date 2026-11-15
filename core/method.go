@@ -93,6 +93,10 @@ func encodeResponse(response MethodResponse) []byte {
 }
 
 func asMethodError(err error) *MethodError {
+	var policy *DependencyPolicyError
+	if errors.As(err, &policy) {
+		return policy.methodError()
+	}
 	var methodErr *MethodError
 	if errors.As(err, &methodErr) {
 		return methodErr

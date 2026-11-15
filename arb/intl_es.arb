@@ -1076,5 +1076,10 @@
   "fakeipFilterDesc": "Estos dominios reciben su IP real en lugar de una Fake-IP. En modo whitelist, solo ellos reciben Fake-IP.",
   "fallbackFilterGeositeDesc": "Los dominios de estas categorías GeoSite se resuelven directamente con Fallback.",
   "fallbackFilterIpcidrDesc": "Si Nameserver devuelve una IP de estos rangos, se usa la respuesta de Fallback.",
-  "fallbackFilterDomainDesc": "Estos dominios se resuelven directamente con Fallback."
+  "fallbackFilterDomainDesc": "Estos dominios se resuelven directamente con Fallback.",
+  "profileDialersDescription": "Para A → B y B → C, la conexión sigue cliente → C → B → A → destino. Seguir el perfil conserva su proxy previo original. El núcleo valida las dependencias de nodos y grupos y rechaza las dependencias de proveedores no resueltas.",
+  "profileDialersUnreadable": "No se pueden leer los ajustes de proxy previo guardados. Su aplicación está bloqueada hasta que los restablezcas explícitamente.",
+  "profileDialersResetTip": "¿Restablecer los ajustes de proxy previo? Si todo el documento de ajustes personalizados es ilegible, se restablecerán todos los ajustes personalizados del perfil. Esta acción no se puede deshacer.",
+  "profileDialerSourceMissing": "La fuente {name} no existe o su nombre es ambiguo. Elige seguir el perfil para eliminar este ajuste.",
+  "profileDialerOriginal": "Seguir el perfil: {target}"
 }
