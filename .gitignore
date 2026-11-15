@@ -87,4 +87,6 @@ devtools_options.yaml
 # Local Compose deployment
 /.env
 /data/
+/auth/
+/*.auth.json
 /secrets/

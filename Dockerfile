@@ -28,8 +28,8 @@ FROM alpine:3.24.1 AS runtime
 RUN apk add --no-cache ca-certificates curl tzdata \
     && addgroup -g 1000 flclash \
     && adduser -D -u 1000 -G flclash flclash \
-    && mkdir -p /data \
-    && chown 1000:1000 /data
+    && mkdir -p /data /auth \
+    && chown 1000:1000 /data /auth
 COPY --from=builder --chmod=0755 /src/dist/FlClash-web /usr/local/bin/flclash-web
 COPY LICENSE tool/web/NOTICE tool/web/LICENSE.FlClash-web /usr/share/licenses/flclash/
 ARG VCS_REF=unknown
@@ -40,6 +40,7 @@ LABEL org.opencontainers.image.title="FlClash Web panel" \
       org.opencontainers.image.licenses="GPL-3.0"
 ENV FLCLASH_WEB_LISTEN=0.0.0.0:8080 \
     FLCLASH_DATA_DIR=/data \
+    FLCLASH_WEB_AUTH_FILE=/auth/credentials.json \
     TZ=UTC
 WORKDIR /data
 USER 1000:1000

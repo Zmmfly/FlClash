@@ -66,8 +66,9 @@ class ContainerCheck:
         self.compose_file = directory / 'compose.yaml'
         shutil.copyfile(ROOT / 'compose.yaml', self.compose_file)
         self.runtime_file = directory / 'runtime.json'
+        self.username = 'admin'
         self.password = secrets.token_urlsafe(36)
-        self.env.update(FLCLASH_IMAGE=image, FLCLASH_WEB_USERNAME='admin',
+        self.env.update(FLCLASH_IMAGE=image, FLCLASH_WEB_USERNAME=self.username,
                         FLCLASH_WEB_SECURE_COOKIE='false')
         uid = os.getuid() or 1000
         gid = os.getgid() if os.getuid() else 1000
@@ -75,6 +76,8 @@ class ContainerCheck:
         self.uid = uid
         data = directory / 'data'
         data.mkdir(mode=0o700)
+        auth = directory / 'auth'
+        auth.mkdir(mode=0o700)
         secret_dir = directory / 'secrets'
         secret_dir.mkdir(mode=0o700)
         secret_file = secret_dir / 'web_password'
@@ -84,6 +87,7 @@ class ContainerCheck:
         secret_file.chmod(0o600)
         if os.getuid() == 0:
             os.chown(data, uid, gid)
+            os.chown(auth, uid, gid)
             os.chown(secret_file, uid, gid)
         require(secret_file.stat().st_mode & 0o777 == 0o600,
                 'Temporary password secret must have mode 0600')
@@ -134,6 +138,7 @@ class ContainerCheck:
                 'Compose must provide a restricted /tmp tmpfs')
         environment = service.get('environment', {})
         require(environment.get('FLCLASH_DATA_DIR') == '/data' and
+                environment.get('FLCLASH_WEB_AUTH_FILE') == '/auth/credentials.json' and
                 environment.get('FLCLASH_WEB_PASSWORD_FILE') == '/run/secrets/web_password' and
                 environment.get('FLCLASH_WEB_LISTEN') == '0.0.0.0:8080',
                 'Compose container data, secret, and listen paths must match their contract')
@@ -145,6 +150,11 @@ class ContainerCheck:
                 Path(mounts[0]['source']).resolve() == self.directory / 'data' and
                 mounts[0].get('bind', {}).get('create_host_path') is False,
                 'Relative ./data must resolve inside the disposable project without auto-creation')
+        auth_mounts = [mount for mount in service.get('volumes', []) if mount.get('target') == '/auth']
+        require(len(auth_mounts) == 1 and auth_mounts[0].get('type') == 'bind' and
+                Path(auth_mounts[0]['source']).resolve() == self.directory / 'auth' and
+                auth_mounts[0].get('bind', {}).get('create_host_path') is False,
+                'Relative ./auth must persist credentials separately from the exposed data directory')
         require(Path(config['secrets']['web_password']['file']).resolve() ==
                 self.directory / 'secrets/web_password',
                 'Relative secret file must resolve inside the disposable project')
@@ -262,7 +272,7 @@ class ContainerCheck:
             connection.close()
 
     def login(self, password=None):
-        body = json.dumps({'username': 'admin', 'password': password if password is not None else self.password})
+        body = json.dumps({'username': self.username, 'password': password if password is not None else self.password})
         return self.request('POST', '/api/auth/login', body=body,
                             headers={'Content-Type': 'application/json'})
 
@@ -288,6 +298,7 @@ class ContainerCheck:
             ('POST', '/api/http-proxy', b'{}'),
             ('GET', '/ws/core', None),
             ('GET', '/api/auth/session', None),
+            ('POST', '/api/auth/credentials', b'{}'),
         ):
             headers = {'Content-Type': 'application/json'}
             if path == '/ws/core':
@@ -317,11 +328,17 @@ class ContainerCheck:
         require(status == 200 and body == payload, 'Authenticated VFS read must return exact written bytes')
         require((self.directory / 'data' / filename).read_bytes() == payload,
                 'VFS writes must reach the disposable bind-mounted data directory')
+        bootstrap_password = self.password
+        cookie = self.change_credentials(cookie)
         old_container = self.container_id()
         new_container = self.start(recreate=True)
         require(old_container != new_container, 'Persistence test must actually recreate the container')
         require(self.request('GET', '/api/auth/session', cookie=cookie)[0] == 401,
                 'Recreating the server must invalidate its old in-memory session')
+        status, _, _ = self.request('POST', '/api/auth/login',
+                                    body=json.dumps({'username': 'admin', 'password': bootstrap_password}),
+                                    headers={'Content-Type': 'application/json'})
+        require(status == 401, 'Bootstrap credentials must not override persisted account changes after restart')
         cookie = self.authenticated_cookie()
         status, _, body = self.request('GET', '/api/fs/read' + query, cookie=cookie)
         require(status == 200 and body == payload, 'Data must survive container force-recreation')
@@ -330,7 +347,43 @@ class ContainerCheck:
                 'Authenticated logout must return HTTP 204')
         require(self.request('GET', '/api/auth/session', cookie=cookie)[0] == 401,
                 'Logout must invalidate the server-side session')
-        print('PASS: protected APIs/WS, login cookie, persistent filesystem, recreation, and logout')
+        print('PASS: protected APIs/WS, persisted credential updates, filesystem, recreation, and logout')
+
+    def change_credentials(self, cookie):
+        status, _, body = self.request('GET', '/api/auth/session', cookie=cookie)
+        require(status == 200 and json.loads(body).get('username') == self.username,
+                'Authenticated session must expose the current account name')
+        second_cookie = self.authenticated_cookie()
+        new_username = 'container-admin'
+        new_password = secrets.token_urlsafe(36)
+        payload = {'currentPassword': 'wrong-' + secrets.token_urlsafe(36),
+                   'username': new_username, 'newPassword': new_password}
+        status, _, _ = self.request('POST', '/api/auth/credentials', json.dumps(payload), cookie=cookie,
+                                    headers={'Content-Type': 'application/json'})
+        require(status == 403 and self.request('GET', '/api/auth/session', cookie=cookie)[0] == 200,
+                'Wrong current password must reject the change without invalidating the current session')
+        payload['currentPassword'] = self.password
+        status, _, body = self.request('POST', '/api/auth/credentials', json.dumps(payload), cookie=cookie,
+                                       headers={'Content-Type': 'application/json'})
+        require(status == 200 and json.loads(body).get('ok') is True,
+                'Authenticated account update must persist successfully')
+        for previous in (cookie, second_cookie):
+            require(self.request('GET', '/api/auth/session', cookie=previous)[0] == 401,
+                    'Account changes must revoke every existing session')
+        credential_file = self.directory / 'auth/credentials.json'
+        saved = credential_file.read_text()
+        require(self.password not in saved and new_password not in saved,
+                'Persistent account storage must never contain plaintext passwords')
+        require(credential_file.stat().st_mode & 0o777 == 0o600,
+                'Persistent account storage must remain owner-only')
+        self.username, self.password = new_username, new_password
+        current = self.authenticated_cookie()
+        status, _, body = self.request('GET', '/api/auth/session', cookie=current)
+        require(status == 200 and json.loads(body).get('username') == new_username,
+                'Updated credentials must authenticate with the new account name')
+        require(self.request('GET', '/api/fs/read?path=%2Fauth%2Fcredentials.json', cookie=current)[0] == 400,
+                'Persistent account storage must stay outside the virtual filesystem')
+        return current
 
     def cleanup(self):
         if not self.started:
