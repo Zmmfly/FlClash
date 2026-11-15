@@ -1,0 +1,531 @@
+import 'dart:async';
+
+import '../web_api/index.dart';
+import '../web_shim/web_core_bridge.dart';
+import 'facade.dart';
+import 'profile_handles.dart';
+
+export 'profile_handles.dart';
+
+class _RuntimeReceiptProof {
+  const _RuntimeReceiptProof(
+    this.operationId,
+    this.action,
+    this.desiredRevision,
+  );
+  final String operationId;
+  final String action;
+  final String desiredRevision;
+}
+
+String _runtimeAction(String path) {
+  const actions = <String, String>{
+    '/api/v1/runtime:apply': 'apply-configuration',
+    '/api/v1/runtime:reconcile': 'reconcile-settings',
+    '/api/v1/runtime/proxies:select': 'proxy-selection',
+    '/api/v1/runtime/connections:close': 'close-connection',
+    '/api/v1/runtime/connections:close-all': 'close-connections',
+    '/api/v1/runtime/connections:reset': 'reset-connections',
+    '/api/v1/runtime/traffic:reset': 'reset-traffic',
+    '/api/v1/runtime/dns:clear-cache': 'clear-dns-cache',
+    '/api/v1/runtime/network:changed': 'network-changed',
+    '/api/v1/runtime/listener:set-enabled': 'listener-state',
+    '/api/v1/runtime/core:gc': 'collect-memory',
+    '/api/v1/runtime/geo:update': 'geo-update',
+    '/api/v1/runtime/provider-sources:refresh': 'refresh-provider-source',
+    '/api/v1/runtime/mitm/certificate:generate': 'mitm-generate-certificate',
+    '/api/v1/runtime/mitm/scripts:run': 'mitm-run-script',
+  };
+  final action = actions[path];
+  if (action != null) return action;
+  if (RegExp(
+    r'^/api/v1/runtime/provider-sources/[1-9][0-9]{0,77}:write$',
+  ).hasMatch(path))
+    return 'write-provider-source';
+  if (RegExp(
+    r'^/api/v1/runtime/provider-sources/[1-9][0-9]{0,77}:sideload$',
+  ).hasMatch(path))
+    return 'sideload-provider-source';
+  throw const WebApiProtocolException('Not a typed runtime command route');
+}
+
+void _requireRuntimeState(
+  Map<String, Object?> state,
+  _RuntimeReceiptProof proof, {
+  bool initial = false,
+}) {
+  if (state['operationId'] != proof.operationId ||
+      state['action'] != proof.action ||
+      requireApiRevision(state['desiredRevision']) != proof.desiredRevision) {
+    throw const WebApiProtocolException(
+      'Runtime state does not match the accepted operation, action and desired revision',
+    );
+  }
+  if (initial && state['phase'] != 'pending') {
+    throw const WebApiProtocolException(
+      'The immutable runtime receipt must describe the initial pending intent',
+    );
+  }
+  if (!const {
+    'pending',
+    'applying',
+    'applied',
+    'failed',
+    'unknown',
+  }.contains(state['phase'])) {
+    throw const WebApiProtocolException('Unknown runtime apply phase');
+  }
+}
+
+class WebRuntimeBinding {
+  WebRuntimeBinding._(this.repository) {
+    repository.registerExternalReceipt('runtime', _decodeRuntimeReceipt);
+    repository.registerExternalReceipt('runtime:apply', _decodeRuntimeReceipt);
+    repository.registerExternalReceipt(
+      'runtime:reconcile',
+      _decodeRuntimeReceipt,
+    );
+    _sessionSubscription = repository.sessionChanges.listen((_) {
+      _proxySnapshot = null;
+      _receiptProofs.clear();
+      webRuntimeSources.clear();
+    });
+  }
+
+  static WebRuntimeBinding? _instance;
+
+  static WebRuntimeBinding configure(WebApiRepository repository) {
+    final current = _instance;
+    if (current != null && identical(current.repository, repository))
+      return current;
+    if (current != null) unawaited(current.close());
+    final binding = WebRuntimeBinding._(repository);
+    _instance = binding;
+    WebCoreBridge.instance.configureTypedRuntime(
+      dispatch: (frame) => webRuntimeDispatchFrame(frame, binding: binding),
+      receiveEvent: binding.receiveEvent,
+      subscriptionFrame: binding.subscribeFrame,
+    );
+    return binding;
+  }
+
+  static WebRuntimeBinding get instance =>
+      _instance ??
+      (throw const WebApiException(
+        'runtime_unconfigured',
+        'The Web API repository is not initialized',
+      ));
+
+  final WebApiRepository repository;
+  // Ephemeral receipt proofs, not a second journal/client or mutation barrier.
+  final _receiptProofs = <String, _RuntimeReceiptProof>{};
+  ({ApiEditVersion version, String generation})? _proxySnapshot;
+  final _topics = <String>{
+    'commit',
+    'runtime',
+    'delay',
+    'connections',
+    'dns',
+    'loaded',
+    'geo',
+    'dialerLoop',
+    'traffic',
+  };
+  late final StreamSubscription<void> _sessionSubscription;
+  bool _closed = false;
+
+  Set<String> get topics => Set.unmodifiable(_topics);
+
+  Future<ApiReceipt> readReceipt(String resource) async {
+    final path = resource.startsWith('/api/')
+        ? resource
+        : '/api/v1/runtime/$resource';
+    final receipt = await repository.readExternal(path);
+    if (resource == 'proxies') {
+      final data = apiObject(receipt.data);
+      _proxySnapshot = (
+        version: repository.captureReadVersion(receipt),
+        generation: requireApiRevision(data['runtimeGeneration']),
+      );
+    }
+    return receipt;
+  }
+
+  Future<Object?> read(String resource) async =>
+      (await readReceipt(resource)).data;
+
+  Future<Object?> query(String resource, Map<String, Object?> payload) async =>
+      (await repository.queryExternal(
+        '/api/v1/runtime/$resource',
+        payload,
+      )).data;
+
+  Future<Map<String, Object?>> runtimeState() async =>
+      apiObject(await read('state'));
+
+  Future<int?> startTime() async {
+    final state = await runtimeState();
+    final value = state['startTimeMs'];
+    if (value == null || value == 0) return null;
+    return apiInteger(value, 'runtime.startTimeMs');
+  }
+
+  Map<String, Object?> _decodeRuntimeReceipt(Object? value) {
+    final state = apiObject(value);
+    final operationId = state['operationId'];
+    if (operationId is! String) {
+      throw const WebApiProtocolException(
+        'Runtime receipt has no operation identity',
+      );
+    }
+    requireApiOperationId(operationId);
+    final pending = repository.pendingOperation;
+    final _RuntimeReceiptProof? proof;
+    if (pending != null) {
+      // The shared client validates envelope.operationId against this pending
+      // operation before its repository decoder runs. Bind data to that same
+      // operation while it is still live, before completeOperation clears it.
+      if (pending.operationId != operationId) {
+        throw const WebApiProtocolException(
+          'Runtime receipt data belongs to another operation',
+        );
+      }
+      proof = _RuntimeReceiptProof(
+        pending.operationId,
+        _runtimeAction(pending.path),
+        requireApiRevision(
+          (BigInt.parse(requireApiRevision(pending.expectedRevision)) +
+                  BigInt.one)
+              .toString(),
+        ),
+      );
+    } else {
+      proof = _receiptProofs[operationId];
+    }
+    if (proof == null) {
+      throw const WebApiProtocolException(
+        'Runtime receipt has no original pending-operation proof',
+      );
+    }
+    _requireRuntimeState(state, proof, initial: true);
+    if (_receiptProofs.length >= 256 &&
+        !_receiptProofs.containsKey(operationId)) {
+      _receiptProofs.remove(_receiptProofs.keys.first);
+    }
+    _receiptProofs[operationId] = proof;
+    return state;
+  }
+
+  Future<Object?> command(
+    String resource,
+    Map<String, Object?> payload, {
+    String baseline = 'state',
+    ApiEditVersion? editVersion,
+  }) async {
+    final epoch = repository.client.sessionEpoch;
+    if (editVersion == null &&
+        (resource == 'proxies:select' || resource == '/api/v1/runtime:apply'))
+      throw const WebApiException(
+        'edit_baseline_required',
+        'This command requires the original source read, not a fresh status revision',
+      );
+    final version =
+        editVersion ??
+        repository.captureReadVersion(await readReceipt(baseline));
+    final path = resource.startsWith('/api/')
+        ? resource
+        : '/api/v1/runtime/$resource';
+    final expectedAction = _runtimeAction(path);
+    // Validate during the repository acceptance callback, before its shared
+    // pending operation is completed. Post-projection decoding must not bind
+    // this receipt to an unrelated operation that may have started meanwhile.
+    repository.registerExternalReceipt(path, _decodeRuntimeReceipt);
+    Map<String, Object?> accepted;
+    try {
+      accepted = await repository.executeExternalCommand(
+        path,
+        payload,
+        apiObject,
+        editVersion: version,
+      );
+    } on WebApiUnknownCommitException catch (error) {
+      final recovered = await repository.recoverOperation(error.operationId);
+      if (recovered.operationId != error.operationId) {
+        throw const WebApiProtocolException(
+          'Recovered runtime receipt belongs to another operation',
+        );
+      }
+      accepted = apiObject(recovered.data);
+      final proof = _receiptProofs[error.operationId];
+      if (proof == null || recovered.revision != proof.desiredRevision) {
+        throw const WebApiProtocolException(
+          'Recovered runtime receipt has a different desired revision',
+        );
+      }
+    }
+    repository.client.requireSession(epoch);
+    final operationId = accepted['operationId'];
+    final proof = operationId is String ? _receiptProofs[operationId] : null;
+    if (proof == null || proof.action != expectedAction) {
+      throw const WebApiProtocolException(
+        'Runtime receipt has no proof from the original pending operation',
+      );
+    }
+    _requireRuntimeState(accepted, proof, initial: true);
+    final deadline = DateTime.now().add(const Duration(seconds: 85));
+    var state = accepted;
+    while (true) {
+      repository.client.requireSession(epoch);
+      _requireRuntimeState(state, proof);
+      switch (state['phase']) {
+        case 'applied':
+          return state['result'];
+        case 'failed':
+        case 'unknown':
+          final error = apiObject(state['error'], 'runtime.error');
+          if (error['code'] is! String ||
+              (error['code'] as String).isEmpty ||
+              error['message'] is! String) {
+            throw const WebApiProtocolException(
+              'Invalid runtime failure details',
+            );
+          }
+          throw WebApiException(
+            error['code'] as String,
+            error['message'] as String,
+            details: {'operationId': operationId, 'phase': state['phase']},
+          );
+        case 'pending':
+        case 'applying':
+          if (DateTime.now().isAfter(deadline)) {
+            throw WebApiException(
+              'effect_unknown',
+              'The accepted runtime result is not yet confirmed',
+              details: {'operationId': operationId},
+            );
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          final receipt = await readReceipt(
+            'operations/${Uri.encodeComponent(proof.operationId)}',
+          );
+          if (receipt.operationId != null &&
+              receipt.operationId != proof.operationId) {
+            throw const WebApiProtocolException(
+              'Runtime status envelope belongs to another operation',
+            );
+          }
+          state = apiObject(receipt.data);
+          continue;
+        default:
+          throw const WebApiProtocolException('Unknown runtime apply phase');
+      }
+    }
+  }
+
+  Future<Object?> selectProxy(String group, String proxy) async {
+    var snapshot = _proxySnapshot;
+    if (snapshot == null) {
+      await read('proxies');
+      snapshot = _proxySnapshot;
+    }
+    if (snapshot == null)
+      throw const WebApiProtocolException(
+        'Read a versioned proxy snapshot before selecting',
+      );
+    final result = await command('proxies:select', {
+      'groupName': group,
+      'proxyName': proxy,
+      'runtimeGeneration': snapshot.generation,
+    }, editVersion: snapshot.version);
+    await read('proxies');
+    return result;
+  }
+
+  void setTopic(String topic, bool enabled) {
+    if (topic != 'log' && topic != 'route') {
+      throw const WebApiProtocolException(
+        'Only log and route watches are mutable subscriptions',
+      );
+    }
+    final changed = enabled ? _topics.add(topic) : _topics.remove(topic);
+    if (changed) WebCoreBridge.instance.notifyRuntimeSubscriptionsChanged();
+  }
+
+  Map<String, Object?> subscribeFrame() => {
+    'type': 'subscribe',
+    'topics': topics.toList()..sort(),
+    if (repository.storeId != null) 'storeId': repository.storeId,
+    if (repository.revision != null) 'revision': repository.revision,
+  };
+
+  Future<Map<String, Object?>?> receiveEvent(Map<String, Object?> event) async {
+    final type = event['type'];
+    if (type == 'commit') {
+      await repository.handleCommitEvent(event);
+      return null;
+    }
+    if (type == 'snapshot') {
+      final storeId = event['storeId'];
+      if (storeId is! String || storeId.isEmpty) {
+        throw const WebApiProtocolException(
+          'The event snapshot has no store identity',
+        );
+      }
+      if (event['invalidate'] == true || storeId != repository.storeId) {
+        await repository.onReconnect();
+      }
+      return null;
+    }
+    if (type == 'pong' || type == 'runtime') return null;
+    final nativeType = switch (type) {
+      'log' => 'log',
+      'delay' => 'delay',
+      'connections' => 'request',
+      'dns' => 'dns',
+      'loaded' => 'loaded',
+      'geo' => 'geoUpdate',
+      'route' => 'routeChanged',
+      'dialerLoop' => 'dialerLoop',
+      'traffic' => 'requestTraffic',
+      _ => throw const WebApiProtocolException('Unsupported typed event'),
+    };
+    return {
+      'method': 'message',
+      'arguments': [
+        {'type': nativeType, 'data': event['data']},
+      ],
+    };
+  }
+
+  Future<
+    ({Map<String, Object?> base, String handle, ApiEditVersion editVersion})
+  >
+  profileBaseResource(String internalHandle) async {
+    final local = webRuntimeSources.profileId(internalHandle);
+    final receipt = await readReceipt(
+      '/api/v1/profiles/${Uri.encodeComponent(profileWireId(internalHandle))}/base',
+    );
+    final version = repository.captureReadVersion(
+      receipt,
+      kind: ApiIdentity.profile,
+    );
+    return (
+      base: apiObject(receipt.data),
+      handle: webRuntimeSources.versionedProfileHandle(local, version),
+      editVersion: version,
+    );
+  }
+
+  Future<
+    ({Map<String, Object?> snapshot, String handle, ApiEditVersion editVersion})
+  >
+  setupStateResource(int profileId) async {
+    final wire = repository.identities.encode(ApiIdentity.profile, profileId);
+    final receipt = await readReceipt(
+      '/api/v1/profiles/${Uri.encodeComponent(wire)}/setup-state',
+    );
+    final version = repository.captureReadVersion(
+      receipt,
+      kind: ApiIdentity.profile,
+    );
+    return (
+      snapshot: apiObject(receipt.data),
+      handle: webRuntimeSources.versionedProfileHandle(profileId, version),
+      editVersion: version,
+    );
+  }
+
+  Future<({String yaml, String handle})> buildProfileResource({
+    required String sourceHandle,
+    required String overlay,
+    Map<String, Object?>? dialerProxies,
+    Map<String, Object?> resourceBindings = const {},
+  }) async {
+    final version = webRuntimeSources.editVersion(sourceHandle);
+    final receipt = await repository.queryExternal('/api/v1/profiles:build', {
+      'id': profileWireId(sourceHandle),
+      'overlay': overlay,
+      if (dialerProxies != null) 'dialerProxies': dialerProxies,
+      'resourceBindings': resourceBindings,
+    });
+    if (receipt.revision != version.revision)
+      throw const WebApiException(
+        'source_revision_conflict',
+        'The profile changed while the candidate was being built; rebuild from one snapshot',
+      );
+    final yaml = apiObject(receipt.data)['yaml'] as String;
+    return (
+      yaml: yaml,
+      handle: webRuntimeSources.editorBuffer(
+        yaml,
+        editVersion: version,
+        profileId: webRuntimeSources.profileId(sourceHandle),
+      ),
+    );
+  }
+
+  Future<Object?> applyProfile({
+    required String sourceHandle,
+    String? overlay,
+    String? candidateHandle,
+    required Map<String, Object?> selectedMap,
+    required Map<String, Object?> options,
+    Map<String, Object?> resourceBindings = const {},
+    Map<String, Object?>? dialerProxies,
+  }) async {
+    final handle = candidateHandle ?? sourceHandle;
+    final version = webRuntimeSources.editVersion(handle);
+    final local = webRuntimeSources.candidateProfileId(handle);
+    if (candidateHandle != null &&
+        local != webRuntimeSources.profileId(sourceHandle))
+      throw const WebApiProtocolException(
+        'Candidate belongs to a different source profile',
+      );
+    return command('/api/v1/runtime:apply', {
+      'profileId': repository.identities.encode(ApiIdentity.profile, local),
+      if (overlay != null) 'overlay': overlay,
+      if (candidateHandle != null)
+        'candidateYaml': webRuntimeSources.readEditorBuffer(candidateHandle),
+      'selectedMap': selectedMap,
+      'options': options,
+      if (dialerProxies != null) 'dialerProxies': dialerProxies,
+      'resourceBindings': resourceBindings,
+    }, editVersion: version);
+  }
+
+  Future<Object?> reconcile() =>
+      command('/api/v1/runtime:reconcile', {}, baseline: '/api/v1/settings');
+
+  String profileWireId(String handle) => repository.identities.encode(
+    ApiIdentity.profile,
+    webRuntimeSources.profileId(handle),
+    path: 'runtime.profileId',
+  );
+
+  Object? localCapture(Object? value, {bool list = false}) {
+    if (value == null) return null;
+    final json = apiObject(value);
+    if (list) {
+      json['exchanges'] = [
+        for (final item in apiList(json['exchanges'])) localCapture(item),
+      ];
+    } else {
+      json['id'] = repository.identities.decode(
+        ApiIdentity.mitmExchange,
+        json['id'],
+      );
+    }
+    return json;
+  }
+
+  String captureWireId(int handle) =>
+      repository.identities.encode(ApiIdentity.mitmExchange, handle);
+
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    await _sessionSubscription.cancel();
+    _proxySnapshot = null;
+    _receiptProofs.clear();
+  }
+}

@@ -1,0 +1,41 @@
+import 'dart:async';
+
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+class WebProfileWorkflow {
+  const WebProfileWorkflow(this.repository);
+
+  final WebApiRepository repository;
+
+  Future<Profile> save(
+    Profile draft, {
+    required ApiEditVersion editVersion,
+    required FutureOr<void> Function(Profile canonical) onCommitted,
+  }) => repository.runIntent(() async {
+    final canonical = await repository.saveProfile(
+      draft,
+      editVersion: editVersion,
+    );
+    await onCommitted(canonical);
+    return canonical;
+  });
+
+  Future<void> delete(
+    int id, {
+    required ApiEditVersion editVersion,
+    required FutureOr<void> Function() onCommitted,
+  }) => repository.runIntent(() async {
+    await repository.deleteProfile(id, editVersion: editVersion);
+    await onCommitted();
+  });
+
+  Future<void> reorder(
+    List<int> ids, {
+    required ApiEditVersion editVersion,
+    required FutureOr<void> Function() onCommitted,
+  }) => repository.runIntent(() async {
+    await repository.reorderProfiles(ids, editVersion: editVersion);
+    await onCommitted();
+  });
+}

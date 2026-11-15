@@ -1,0 +1,121 @@
+import 'draft_ids.dart';
+import 'errors.dart';
+
+enum ApiIdentity {
+  configuration,
+  runtime,
+  profile,
+  rule,
+  proxyGroup,
+  customProxy,
+  script,
+  clashProvider,
+  iconSet,
+  mitmModule,
+  mitmExchange,
+}
+
+final _decimalId = RegExp(r'^(0|[1-9][0-9]*|-[1-9][0-9]*)$');
+final _minInt64 = BigInt.parse('-9223372036854775808');
+final _maxInt64 = BigInt.parse('9223372036854775807');
+
+String requireWireId(Object? value, String path) {
+  if (value is! String || value.length > 20 || !_decimalId.hasMatch(value)) {
+    throw WebApiProtocolException(
+      'Expected a decimal string identity at $path',
+    );
+  }
+  final number = BigInt.parse(value);
+  if (number < _minInt64 || number > _maxInt64) {
+    throw WebApiProtocolException('Identity outside int64 range at $path');
+  }
+  return value;
+}
+
+class ApiIdentityRegistry {
+  final _wireToLocal = <(ApiIdentity, String), int>{};
+  final _localToWire = <(ApiIdentity, int), String>{};
+  final _aliases = <(ApiIdentity, int), int>{};
+  final _drafts = <(ApiIdentity, int)>{};
+  int _nextHandle = 1;
+
+  int decode(ApiIdentity kind, Object? wire, {String path = 'id'}) {
+    final value = requireWireId(wire, path);
+    return _wireToLocal.putIfAbsent((kind, value), () {
+      if (_nextHandle > maxSafeLocalId) {
+        throw const WebApiProtocolException('Local identity space exhausted');
+      }
+      final local = _nextHandle++;
+      _localToWire[(kind, local)] = value;
+      return local;
+    });
+  }
+
+  int canonical(ApiIdentity kind, int local) {
+    _requireSafe(local);
+    return _aliases[(kind, local)] ?? local;
+  }
+
+  String encode(ApiIdentity kind, int local, {String path = 'id'}) {
+    final wire = _localToWire[(kind, canonical(kind, local))];
+    if (wire == null) {
+      throw WebApiProtocolException('Unbound identity at $path');
+    }
+    return wire;
+  }
+
+  bool isBound(ApiIdentity kind, int local) =>
+      _localToWire.containsKey((kind, canonical(kind, local)));
+
+  void registerDraft(ApiIdentity kind, int local) {
+    _requireSafe(local);
+    if (isBound(kind, local)) return;
+    reserveWebDraftId(local);
+    if (_drafts.any((key) => key.$2 == local && key.$1 != kind)) {
+      throw const WebApiProtocolException(
+        'Draft identity belongs to another resource',
+      );
+    }
+    _drafts.add((kind, local));
+  }
+
+  int bindDraft(ApiIdentity kind, int local, Object? wire) {
+    registerDraft(kind, local);
+    final value = requireWireId(wire, 'receipt.id');
+    final previousWire = _localToWire[(kind, local)];
+    if (previousWire != null && previousWire != value) {
+      throw const WebApiProtocolException(
+        'Draft was bound to a different identity',
+      );
+    }
+    final previous = _wireToLocal[(kind, value)];
+    if (previous != null && previous != local) {
+      _aliases[(kind, previous)] = local;
+      _localToWire.remove((kind, previous));
+      for (final key in _aliases.keys.toList()) {
+        if (key.$1 == kind && _aliases[key] == previous) {
+          _aliases[key] = local;
+        }
+      }
+    }
+    _wireToLocal[(kind, value)] = local;
+    _localToWire[(kind, local)] = value;
+    _drafts.remove((kind, local));
+    return local;
+  }
+
+  void clear() {
+    _wireToLocal.clear();
+    _localToWire.clear();
+    _aliases.clear();
+    _drafts.clear();
+  }
+
+  void _requireSafe(int local) {
+    if (local.abs() > maxSafeLocalId || local == 0 || local == -1) {
+      throw const WebApiProtocolException(
+        'Unsafe or placeholder local identity',
+      );
+    }
+  }
+}

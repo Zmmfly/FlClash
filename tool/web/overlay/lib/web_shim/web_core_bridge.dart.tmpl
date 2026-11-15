@@ -6,6 +6,60 @@ class WebCoreBridge {
   final Map<String, void Function(int pid)> _connectHandlers = {};
   final Map<String, void Function()> _disconnectHandlers = {};
   final List<void Function()> _networkChangeListeners = [];
+  final Set<void Function()> _runtimeSubscriptionListeners = {};
+  Future<Map<String, Object?>> Function(Map<String, Object?>)?
+  _dispatchTypedCall;
+  Future<Map<String, Object?>?> Function(Map<String, Object?>)?
+  _receiveTypedEvent;
+  Map<String, Object?> Function()? _subscriptionFrame;
+
+  void configureTypedRuntime({
+    required Future<Map<String, Object?>> Function(Map<String, Object?>)
+    dispatch,
+    required Future<Map<String, Object?>?> Function(Map<String, Object?>)
+    receiveEvent,
+    required Map<String, Object?> Function() subscriptionFrame,
+  }) {
+    _dispatchTypedCall = dispatch;
+    _receiveTypedEvent = receiveEvent;
+    _subscriptionFrame = subscriptionFrame;
+  }
+
+  Future<Map<String, Object?>> dispatchTypedCall(Map<String, Object?> frame) {
+    final dispatch = _dispatchTypedCall;
+    if (dispatch == null)
+      throw StateError('The typed runtime is not configured');
+    return dispatch(frame);
+  }
+
+  Future<Map<String, Object?>?> receiveTypedEvent(Map<String, Object?> event) {
+    final receive = _receiveTypedEvent;
+    if (receive == null)
+      throw StateError('The typed runtime is not configured');
+    return receive(event);
+  }
+
+  Map<String, Object?> typedSubscriptionFrame() {
+    final frame = _subscriptionFrame;
+    if (frame == null) throw StateError('The typed runtime is not configured');
+    return frame();
+  }
+
+  void addRuntimeSubscriptionListener(void Function() listener) {
+    _runtimeSubscriptionListeners.add(listener);
+  }
+
+  void removeRuntimeSubscriptionListener(void Function() listener) {
+    _runtimeSubscriptionListeners.remove(listener);
+  }
+
+  void notifyRuntimeSubscriptionsChanged() {
+    for (final listener in List<void Function()>.of(
+      _runtimeSubscriptionListeners,
+    )) {
+      listener();
+    }
+  }
 
   void addNetworkChangeListener(void Function() listener) {
     _networkChangeListeners.add(listener);

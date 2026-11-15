@@ -1,0 +1,437 @@
+import 'dart:async';
+
+import 'package:fl_clash/web_api/index.dart';
+import 'package:flutter/foundation.dart';
+
+import 'backup.dart';
+import 'source_consent.dart';
+import 'sources.dart';
+
+class WebDavJob {
+  const WebDavJob({
+    required this.operationId,
+    required this.desiredRevision,
+    required this.action,
+    required this.phase,
+    required this.result,
+  });
+
+  final String operationId;
+  final String? desiredRevision;
+  final String action;
+  final String phase;
+  final Map<String, Object?> result;
+}
+
+class WebDavJobSummary {
+  const WebDavJobSummary({
+    required this.operationId,
+    required this.action,
+    required this.phase,
+    required this.currentTupleMatches,
+    required this.needsPrepare,
+  });
+  final String operationId;
+  final String action;
+  final String phase;
+  final bool currentTupleMatches;
+  final bool needsPrepare;
+
+  factory WebDavJobSummary.decode(Object? value) {
+    final data = apiObject(value, 'DAV safe job summary');
+    final id = data['operationId'];
+    final action = data['action'];
+    final phase = data['phase'];
+    if (id is! String ||
+        action is! String ||
+        phase is! String ||
+        !const {
+          'probe',
+          'backup',
+          'prepare-restore',
+          'restore',
+          'reconcile',
+        }.contains(action) ||
+        !const {
+          'pending',
+          'applying',
+          'prepared',
+          'succeeded',
+          'failed',
+          'unknown',
+        }.contains(phase) ||
+        data['stage'] is! String ||
+        data['updatedAt'] is! String ||
+        DateTime.tryParse(data['updatedAt'] as String) == null ||
+        data['currentTupleMatches'] is! bool ||
+        data['needsPrepare'] is! bool ||
+        data.keys.any(
+          (key) => !const {
+            'operationId',
+            'action',
+            'phase',
+            'stage',
+            'errorCode',
+            'updatedAt',
+            'currentTupleMatches',
+            'needsPrepare',
+          }.contains(key),
+        )) {
+      throw const WebApiProtocolException('Invalid DAV safe summary');
+    }
+    return WebDavJobSummary(
+      operationId: requireApiOperationId(id),
+      action: action,
+      phase: phase,
+      currentTupleMatches: data['currentTupleMatches'] as bool,
+      needsPrepare: data['needsPrepare'] as bool,
+    );
+  }
+
+  WebDavJob asUncertainJob() => WebDavJob(
+    operationId: operationId,
+    desiredRevision: null,
+    action: action,
+    phase: phase,
+    result: const {},
+  );
+}
+
+class WebDavPreparedRestore {
+  const WebDavPreparedRestore(this.operationId, this.preview);
+
+  final String operationId;
+  final WebBackupPreview preview;
+}
+
+class WebDavUncertainException extends WebApiException {
+  const WebDavUncertainException(this.workflows, this.job)
+    : super(
+        'dav_effect_unknown',
+        'Read the existing DAV job; never retry its upload',
+      );
+
+  final WebDavWorkflows workflows;
+  final WebDavJob job;
+}
+
+final _lastDavJob = Expando<String>('web-dav-job');
+final _davResolution = Expando<String>('web-dav-resolution');
+final _davSessionBound = Expando<bool>('web-dav-session-bound');
+
+class WebDavWorkflows {
+  WebDavWorkflows(this.repository, {this.confirmSource}) {
+    repository.registerExternalReceipt('/api/v1/dav', decodeJob);
+    if (_davSessionBound[repository] != true) {
+      _davSessionBound[repository] = true;
+      repository.sessionChanges.listen((_) {
+        _lastDavJob[repository] = null;
+        _davResolution[repository] = null;
+      });
+    }
+  }
+
+  final WebApiRepository repository;
+  final Future<bool> Function(WebSourceConsentPreparation)? confirmSource;
+
+  Future<WebDavJob> readJob(String id) async {
+    final receipt = await repository.readExternal(_jobPath(id));
+    final job = decodeJob(receipt.data);
+    if (job.operationId != id)
+      throw const WebApiProtocolException('DAV job changed its identity');
+    return job;
+  }
+
+  Future<WebDavJob> probe({required ApiEditVersion editVersion}) =>
+      _perform('probe', {'intent': 'probe-dav'}, editVersion);
+
+  Future<WebDavJob> backup({
+    required bool includeDavCredentials,
+    required ApiEditVersion editVersion,
+  }) async {
+    final unresolved = (await summaries())
+        .where(
+          (job) =>
+              job.currentTupleMatches &&
+              const {'pending', 'applying', 'unknown'}.contains(job.phase),
+        )
+        .firstOrNull;
+    final proof = _davResolution[repository];
+    if (unresolved != null &&
+        (unresolved.phase != 'unknown' || proof == null)) {
+      throw WebDavUncertainException(this, unresolved.asUncertainJob());
+    }
+    return _perform('backup', {
+      'intent': includeDavCredentials
+          ? 'backup-to-dav-with-credentials'
+          : 'backup-to-dav',
+      'format': 'flclash-v1',
+      'includeDavCredentials': includeDavCredentials,
+      if (proof != null) 'resolutionOperationId': proof,
+    }, editVersion);
+  }
+
+  Future<List<WebDavJobSummary>> summaries() async {
+    final receipt = await repository.readExternal('/api/v1/dav/jobs');
+    final rows = apiList(receipt.data);
+    if (rows.length > 256)
+      throw const WebApiProtocolException('DAV summary budget exceeded');
+    return [for (final row in rows) WebDavJobSummary.decode(row)];
+  }
+
+  Future<WebDavPreparedRestore> prepareRestore({
+    required bool override,
+    required bool onlyProfiles,
+    required bool restoreDavCredentials,
+    required ApiEditVersion editVersion,
+  }) async {
+    final job = await _perform('prepare-restore', {
+      'intent': restoreDavCredentials
+          ? 'prepare-dav-restore-with-credentials'
+          : 'prepare-dav-restore',
+      'strategy': override ? 'override' : 'merge',
+      'onlyProfiles': onlyProfiles,
+      'restoreDavCredentials': restoreDavCredentials,
+    }, editVersion);
+    final receipt = await repository.readExternal(_jobPath(job.operationId));
+    final current = decodeJob(receipt.data);
+    if (current.operationId != job.operationId ||
+        current.phase != 'prepared' ||
+        current.desiredRevision != receipt.revision) {
+      throw const WebApiException(
+        'revision_conflict',
+        'The DAV preview changed; keep the current data',
+      );
+    }
+    return WebDavPreparedRestore(
+      job.operationId,
+      WebBackupWorkflows(repository).decodePreview(
+        current.result['preparation'],
+        receipt: receipt,
+        restoreDavCredentials: restoreDavCredentials,
+      ),
+    );
+  }
+
+  Future<void> restore(WebDavPreparedRestore prepared) async {
+    final preview = prepared.preview;
+    final job = await repository.executeExternalCommand(
+      '/api/v1/dav:restore',
+      {
+        'intent': preview.restoreDavCredentials
+            ? 'restore-dav-backup-with-credentials'
+            : 'restore-dav-backup',
+        'preparationOperationId': prepared.operationId,
+        'token': preview.token,
+        'archiveDigest': preview.archiveDigest,
+        'planDigest': preview.planDigest,
+        'restoreDavCredentials': preview.restoreDavCredentials,
+      },
+      decodeJob,
+      editVersion: preview.editVersion,
+    );
+    if (job.action != 'restore' ||
+        job.phase != 'succeeded' ||
+        apiObject(job.result['restored'])['restored'] != true) {
+      throw const WebApiProtocolException(
+        'DAV restore has no committed result',
+      );
+    }
+  }
+
+  Future<WebDavJob> reconcile(WebDavJob original) async {
+    if (original.action != 'backup' || original.phase != 'unknown') {
+      throw const WebApiException(
+        'dav_reconcile_invalid',
+        'Only an uncertain upload can be observed',
+      );
+    }
+    final receipt = await repository.readExternal('/api/v1/settings');
+    final version = repository.captureReadVersion(receipt);
+    final observed = await _perform(
+      'reconcile',
+      {'intent': 'reconcile-dav-backup'},
+      version,
+      path: '${_jobPath(original.operationId)}:reconcile',
+    );
+    if (observed.result['remoteMatches'] == true) {
+      _davResolution[repository] = observed.operationId;
+    }
+    return observed;
+  }
+
+  Future<WebDavJob> _perform(
+    String action,
+    Map<String, Object?> body,
+    ApiEditVersion version, {
+    String? path,
+  }) => repository.runIntent(() async {
+    final grant = await WebSourceWorkflows(repository).prepareAndConfirm(
+      purpose:
+          'dav-${action == 'prepare-restore'
+              ? 'restore'
+              : action == 'reconcile'
+              ? 'backup'
+              : action}',
+      key: const {'kind': 'dav', 'id': 'settings'},
+      editVersion: version,
+      confirm: confirmSource,
+    );
+    WebDavJob accepted;
+    try {
+      accepted = await repository.executeExternalCommand(
+        path ?? '/api/v1/dav:$action',
+        {...body, if (grant != null) 'authorizationId': grant.authorizationId},
+        decodeJob,
+        editVersion: version,
+      );
+    } on WebApiUnknownCommitException catch (error) {
+      if (action == 'backup') _lastDavJob[repository] = error.operationId;
+      rethrow;
+    }
+    if (accepted.action != action)
+      throw const WebApiProtocolException('DAV action changed in its receipt');
+    if (action == 'backup') _lastDavJob[repository] = accepted.operationId;
+    return _wait(accepted);
+  });
+
+  Future<WebDavJob> _wait(WebDavJob accepted) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 95));
+    var job = accepted;
+    while (true) {
+      switch (job.phase) {
+        case 'succeeded':
+        case 'prepared':
+          return job;
+        case 'failed':
+          throw WebApiException(
+            'dav_operation_failed',
+            'DAV transfer failed; no success is asserted',
+            details: {'operationId': job.operationId},
+          );
+        case 'unknown':
+          throw WebDavUncertainException(this, job);
+        case 'pending':
+        case 'applying':
+          if (DateTime.now().isAfter(deadline))
+            throw WebDavUncertainException(this, job);
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          job = await readJob(job.operationId);
+        default:
+          throw const WebApiProtocolException('Unknown DAV job phase');
+      }
+    }
+  }
+
+  WebDavJob decodeJob(Object? value) {
+    final data = apiObject(value, 'DAV job');
+    final id = data['operationId'];
+    final action = data['action'];
+    final phase = data['phase'];
+    if (id is! String ||
+        action is! String ||
+        phase is! String ||
+        !const {
+          'probe',
+          'backup',
+          'prepare-restore',
+          'restore',
+          'reconcile',
+        }.contains(action) ||
+        !const {
+          'pending',
+          'applying',
+          'prepared',
+          'succeeded',
+          'failed',
+          'unknown',
+        }.contains(phase) ||
+        data['stage'] is! String ||
+        data['updatedAt'] is! String ||
+        DateTime.tryParse(data['updatedAt'] as String) == null) {
+      throw const WebApiProtocolException('Invalid DAV job');
+    }
+    final result = data['result'] == null
+        ? <String, Object?>{}
+        : apiObject(data['result']);
+    if (result.keys.any(
+          (key) => !const {
+            'reachable',
+            'etag',
+            'conditional',
+            'archiveDigest',
+            'archiveSize',
+            'preparation',
+            'restored',
+            'reconciliationOf',
+            'remoteMatches',
+          }.contains(key),
+        ) ||
+        result['remoteMatches'] != null && result['remoteMatches'] is! bool ||
+        result['reachable'] != null && result['reachable'] is! bool) {
+      throw const WebApiProtocolException('Invalid DAV result metadata');
+    }
+    if (phase == 'succeeded' && action == 'backup' ||
+        phase == 'succeeded' && action == 'reconcile') {
+      final size = apiInteger(result['archiveSize'], 'DAV archive size');
+      final digest = result['archiveDigest'];
+      if (size < 0 ||
+          size > 32 * 1024 * 1024 ||
+          digest is! String ||
+          !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+          result['conditional'] is! bool) {
+        throw const WebApiProtocolException(
+          'DAV success has no complete transfer observation',
+        );
+      }
+    }
+    if (phase == 'prepared' &&
+        (action != 'prepare-restore' || result['preparation'] is! Map)) {
+      throw const WebApiProtocolException('DAV restore preview is incomplete');
+    }
+    return WebDavJob(
+      operationId: requireApiOperationId(id),
+      desiredRevision: requireApiRevision(data['desiredRevision']),
+      action: action,
+      phase: phase,
+      result: result,
+    );
+  }
+
+  String _jobPath(String id) =>
+      '/api/v1/dav/jobs/${Uri.encodeComponent(requireApiOperationId(id))}';
+}
+
+/// No network request is made on view mount or setting projection changes.
+/// Probe is an explicit user action, with the same source-consent UI as transfer.
+class WebDavConnectionController extends ValueNotifier<bool?> {
+  WebDavConnectionController(this.repository) : super(null);
+
+  final WebApiRepository repository;
+  bool _closed = false;
+  int _generation = 0;
+
+  Future<void> update(Object? _) async {
+    _generation++;
+    if (!_closed) value = null;
+  }
+
+  Future<void> probe() async {
+    final generation = ++_generation;
+    value = null;
+    final receipt = await repository.readExternal('/api/v1/settings');
+    final job = await WebDavWorkflows(
+      repository,
+      confirmSource: showWebSourceConsent,
+    ).probe(editVersion: repository.captureReadVersion(receipt));
+    if (!_closed && generation == _generation)
+      value = job.result['reachable'] == true;
+  }
+
+  @override
+  void dispose() {
+    _closed = true;
+    _generation++;
+    super.dispose();
+  }
+}

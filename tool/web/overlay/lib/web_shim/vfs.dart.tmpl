@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
@@ -32,423 +31,193 @@ class WebFileSystem {
   WebFileSystem._();
 
   static final WebFileSystem instance = WebFileSystem._();
+  static const maxFileBytes = 32 * 1024 * 1024;
+  static const maxMemoryBytes = 96 * 1024 * 1024;
+  static const maxNodes = 2048;
+  static const _directories = {
+    '/', '/data', '/data/profiles', '/data/providers', '/tmp', '/downloads',
+  };
 
   final Map<String, VfsNode> _nodes = {};
-  final List<WebNetInterface> _networkInterfaces = [];
+  List<WebNetInterface> _networkInterfaces = const [];
   bool _initialized = false;
-  bool isCoreListening = false;
-  int coreStartTimeMs = 0;
 
-  List<WebNetInterface> get networkInterfaces {
-    ensureInitialized();
-    return List.unmodifiable(_networkInterfaces);
-  }
+  List<WebNetInterface> get networkInterfaces =>
+      List.unmodifiable(_networkInterfaces);
 
-  void refreshNetworkInterfaces() {
-    ensureInitialized();
-    {
-      final res = JsBridge.syncJsonRequest('GET', '/api/fs/interfaces');
-      if (res['ok'] == false) {
-        throw StateError('Failed to load network interfaces: ${res['error']}');
-      }
-      if (res['networkInterfaces'] is List) {
-        _networkInterfaces.clear();
-        for (final item in (res['networkInterfaces'] as List)) {
-          if (item is Map) {
-            final name = item['name']?.toString() ?? 'eth0';
-            final addrs =
-                (item['addresses'] as List?)
-                    ?.map((e) => e.toString())
-                    .toList() ??
-                const [];
-            _networkInterfaces.add(
-              WebNetInterface(name: name, addresses: addrs),
-            );
-          }
-        }
-      }
+  Future<void> refreshNetworkInterfaces() async {
+    final response = await JsBridge.asyncJsonRequest(
+      'GET',
+      '/api/v1/runtime/network-interfaces',
+    );
+    if (response['data'] case final List items) {
+      _networkInterfaces = [
+        for (final item in items)
+          if (item case {'name': final String name, 'addresses': final List values})
+            WebNetInterface(name: name, addresses: values.cast<String>()),
+      ];
+      return;
     }
+    throw StateError('Network-interface resource is unavailable');
   }
 
   String normalize(String rawPath) {
-    final trimmed = rawPath.trim();
-    if (trimmed.isEmpty) return '/data';
-    var cleaned = p.posix.normalize(
-      trimmed.startsWith('/') ? trimmed : '/data/$trimmed',
-    );
-    if (cleaned.length > 1 && cleaned.endsWith('/')) {
-      cleaned = cleaned.substring(0, cleaned.length - 1);
+    if (rawPath.contains('\u0000')) {
+      throw ArgumentError('Invalid temporary buffer path');
     }
-    return cleaned;
+    if (rawPath.isEmpty) return '/data';
+    return p.posix.normalize(rawPath.startsWith('/') ? rawPath : '/data/$rawPath');
   }
 
-  bool _isLocalOnlyPath(String normPath) {
-    return normPath == '/downloads' || normPath.startsWith('/downloads/');
+  bool _ephemeral(String path) =>
+      path.startsWith('/tmp/') || path.startsWith('/downloads/');
+
+  void _requireEphemeral(String path) {
+    if (!_ephemeral(path)) {
+      throw UnsupportedError('Persistent resources require their typed API');
+    }
   }
 
   void ensureInitialized() {
     if (_initialized) return;
-    _ensureLocalDirs();
-    {
-      final snap = JsBridge.syncJsonRequest('GET', '/api/fs/snapshot');
-      if (snap['ok'] == false || snap['entries'] is! List) {
-        throw StateError('Failed to load filesystem snapshot: ${snap['error']}');
-      }
-      if (snap['entries'] is List) {
-        for (final item in (snap['entries'] as List)) {
-          if (item is! Map) continue;
-          final path = normalize(item['path']?.toString() ?? '');
-          final isDir = item['isDir'] == true;
-          final size = (item['size'] as num?)?.toInt() ?? 0;
-          final mtimeMs =
-              (item['mtimeMs'] as num?)?.toInt() ??
-              DateTime.now().millisecondsSinceEpoch;
-          Uint8List? content;
-          final b64 = item['contentBase64'] as String?;
-          if (b64 != null && b64.isNotEmpty) {
-            content = base64Decode(b64);
-          }
-          _nodes[path] = VfsNode(
-            path: path,
-            isDir: isDir,
-            size: content?.length ?? size,
-            mtimeMs: mtimeMs,
-            bytes: content,
-          );
-          _ensureParentDirsInMemory(path);
-        }
-      }
-      isCoreListening = snap['isListening'] == true;
-      coreStartTimeMs = (snap['startTimeMs'] as num?)?.toInt() ?? 0;
-      if (snap['networkInterfaces'] is List) {
-        _networkInterfaces.clear();
-        for (final item in (snap['networkInterfaces'] as List)) {
-          if (item is Map) {
-            final name = item['name']?.toString() ?? 'eth0';
-            final addrs =
-                (item['addresses'] as List?)
-                    ?.map((e) => e.toString())
-                    .toList() ??
-                const [];
-            _networkInterfaces.add(
-              WebNetInterface(name: name, addresses: addrs),
-            );
-          }
-        }
-      }
+    for (final directory in _directories) {
+      _nodes[directory] = VfsNode(path: directory, isDir: true);
     }
     _initialized = true;
   }
 
-  void _ensureLocalDirs() {
-    for (final dir in [
-      '/',
-      '/data',
-      '/data/profiles',
-      '/data/providers',
-      '/tmp',
-      '/downloads',
-    ]) {
-      _nodes[dir] = VfsNode(path: dir, isDir: true);
-    }
-  }
-
-  void _ensureParentDirsInMemory(String normPath) {
-    var current = p.posix.dirname(normPath);
-    while (current.isNotEmpty && current != '/' && current != '.') {
-      _nodes.putIfAbsent(current, () => VfsNode(path: current, isDir: true));
-      final next = p.posix.dirname(current);
-      if (next == current) break;
-      current = next;
+  void _parents(String path) {
+    var parent = p.posix.dirname(path);
+    while (!_directories.contains(parent)) {
+      _requireEphemeral(parent);
+      _nodes.putIfAbsent(parent, () => VfsNode(path: parent, isDir: true));
+      parent = p.posix.dirname(parent);
     }
   }
 
   VfsNode? stat(String rawPath) {
-    final norm = normalize(rawPath);
-    final virtualPath = norm == '/' || const ['/data', '/tmp', '/downloads'].any(
-      (root) => norm == root || norm.startsWith('$root/'),
-    );
-    if (!virtualPath) return null;
     ensureInitialized();
-    final cached = _nodes[norm];
-    if (cached != null) return cached;
-    if (_isLocalOnlyPath(norm)) return null;
-
-    final remote = JsBridge.syncJsonRequest(
-      'GET',
-      '/api/fs/stat?path=${Uri.encodeQueryComponent(norm)}',
-    );
-    if (remote['ok'] == false) {
-      throw StateError('Filesystem stat failed: ${remote['error']}');
+    final path = normalize(rawPath);
+    if (!_directories.contains(path) && !_ephemeral(path)) {
+      if (path.startsWith('/data/')) _requireEphemeral(path);
+      return null;
     }
-    if (remote['exists'] == true) {
-      final node = VfsNode(
-        path: norm,
-        isDir: remote['isDir'] == true,
-        size: (remote['size'] as num?)?.toInt() ?? 0,
-        mtimeMs:
-            (remote['mtimeMs'] as num?)?.toInt() ??
-            DateTime.now().millisecondsSinceEpoch,
-      );
-      _nodes[norm] = node;
-      _ensureParentDirsInMemory(norm);
-      return node;
-    }
-    return null;
+    return _nodes[path];
   }
 
   bool exists(String rawPath) => stat(rawPath) != null;
-
   bool isDirectory(String rawPath) => stat(rawPath)?.isDir == true;
-
-  bool isFile(String rawPath) {
-    final node = stat(rawPath);
-    return node != null && !node.isDir;
-  }
+  bool isFile(String rawPath) => stat(rawPath)?.isDir == false;
 
   Uint8List readBytes(String rawPath) {
-    ensureInitialized();
-    final norm = normalize(rawPath);
-    final cached = _nodes[norm];
-    if (cached != null && !cached.isDir && cached.bytes != null) {
-      return Uint8List.fromList(cached.bytes!);
+    final path = normalize(rawPath);
+    _requireEphemeral(path);
+    final node = stat(path);
+    if (node == null || node.isDir || node.bytes == null) {
+      throw StateError('Temporary buffer does not exist');
     }
-    if (_isLocalOnlyPath(norm)) {
-      throw Exception('File not found: $norm');
-    }
-    final remote = JsBridge.syncReadBase64(norm);
-    if (remote['ok'] == false) {
-      throw StateError('Filesystem read failed: ${remote['error']}');
-    }
-    if (remote['exists'] == true && remote['isDir'] != true) {
-      final b64 = remote['contentBase64'] as String? ?? '';
-      final bytes = b64.isEmpty ? Uint8List(0) : base64Decode(b64);
-      final mtime =
-          (remote['mtimeMs'] as num?)?.toInt() ??
-          DateTime.now().millisecondsSinceEpoch;
-      _nodes[norm] = VfsNode(
-        path: norm,
-        isDir: false,
-        size: bytes.length,
-        mtimeMs: mtime,
-        bytes: bytes,
-      );
-      _ensureParentDirsInMemory(norm);
-      return Uint8List.fromList(bytes);
-    }
-    throw Exception('File not found: $norm');
-  }
-
-  void updateCacheFromServerWrite({
-    required String rawPath,
-    required int size,
-    required int mtimeMs,
-    Uint8List? bytes,
-  }) {
-    ensureInitialized();
-    final norm = normalize(rawPath);
-    _ensureParentDirsInMemory(norm);
-    _nodes[norm] = VfsNode(
-      path: norm,
-      isDir: false,
-      size: bytes?.length ?? size,
-      mtimeMs: mtimeMs,
-      bytes: bytes,
-    );
+    return Uint8List.fromList(node.bytes!);
   }
 
   void writeBytes(String rawPath, List<int> data, {bool append = false}) {
     ensureInitialized();
-    final norm = normalize(rawPath);
-    final incoming = data is Uint8List ? data : Uint8List.fromList(data);
-    Uint8List finalBytes;
-    if (append && exists(norm) && isFile(norm)) {
-      final existing = readBytes(norm);
-      final builder = BytesBuilder(copy: false)
-        ..add(existing)
-        ..add(incoming);
-      finalBytes = builder.toBytes();
-    } else {
-      finalBytes = Uint8List.fromList(incoming);
+    final path = normalize(rawPath);
+    _requireEphemeral(path);
+    if (_nodes[path]?.isDir == true) {
+      throw StateError('Cannot write a directory');
     }
-
-    if (!_isLocalOnlyPath(norm)) {
-      final mode = append ? 'append' : 'write';
-      _requireSuccess(JsBridge.syncBinaryWrite(
-        '/api/fs/write?path=${Uri.encodeQueryComponent(norm)}&mode=$mode',
-        append ? incoming : finalBytes,
-      ));
+    final previous = _nodes[path]?.bytes;
+    final length = data.length + (append ? previous?.length ?? 0 : 0);
+    if (length > maxFileBytes) throw StateError('Temporary buffer exceeds 32 MiB');
+    final memory = _nodes.values.fold<int>(0, (total, node) => total + (node.bytes?.length ?? 0));
+    if (memory - (previous?.length ?? 0) + length > maxMemoryBytes ||
+        _nodes.length + path.split('/').length > maxNodes) {
+      throw StateError('Temporary buffer capacity exceeded');
     }
-    _ensureParentDirsInMemory(norm);
-    final now = DateTime.now().millisecondsSinceEpoch;
-    _nodes[norm] = VfsNode(
-      path: norm,
-      isDir: false,
-      size: finalBytes.length,
-      mtimeMs: now,
-      bytes: finalBytes,
-    );
-
-    if (norm.startsWith('/downloads/')) {
-      final filename = p.posix.basename(norm);
-      if (!JsBridge.triggerDownload(filename, finalBytes)) {
-        throw StateError('Download failed: $filename');
+    final bytes = append && previous != null
+        ? (BytesBuilder(copy: false)..add(previous)..add(data)).takeBytes()
+        : Uint8List.fromList(data);
+    if (path.startsWith('/downloads/')) {
+      if (!JsBridge.triggerDownload(p.posix.basename(path), bytes)) {
+        throw StateError('Browser download failed');
       }
-      return;
     }
-
-
-  }
-
-  void _requireSuccess(Map<String, dynamic> result) {
-    if (result['ok'] != true) {
-      throw StateError('Filesystem operation failed (${result['status']}): ${result['error']}');
-    }
+    _parents(path);
+    _nodes[path] = VfsNode(path: path, isDir: false, size: bytes.length, bytes: bytes);
   }
 
   void mkdir(String rawPath, {bool recursive = false}) {
     ensureInitialized();
-    final norm = normalize(rawPath);
-    if (!_isLocalOnlyPath(norm)) {
-      _requireSuccess(JsBridge.syncJsonRequest(
-        'POST',
-        '/api/fs/mkdir?path=${Uri.encodeQueryComponent(norm)}&recursive=$recursive',
-      ));
+    final path = normalize(rawPath);
+    if (_directories.contains(path)) return;
+    _requireEphemeral(path);
+    if (_nodes[path]?.isDir == false) throw StateError('A buffer already exists');
+    if (_nodes.length + path.split('/').length > maxNodes) {
+      throw StateError('Temporary buffer capacity exceeded');
     }
     if (recursive) {
-      _ensureParentDirsInMemory('$norm/child');
-    } else {
-      _nodes[norm] = VfsNode(path: norm, isDir: true);
+      _parents(path);
+    } else if (_nodes[p.posix.dirname(path)]?.isDir != true) {
+      throw StateError('Temporary parent does not exist');
     }
+    _nodes[path] = VfsNode(path: path, isDir: true);
   }
 
   void delete(String rawPath, {bool recursive = false}) {
     ensureInitialized();
-    final norm = normalize(rawPath);
-    if (!_isLocalOnlyPath(norm)) {
-      _requireSuccess(JsBridge.syncJsonRequest(
-        'POST',
-        '/api/fs/delete?path=${Uri.encodeQueryComponent(norm)}&recursive=$recursive',
-      ));
+    final path = normalize(rawPath);
+    _requireEphemeral(path);
+    final prefix = '$path/';
+    if (!recursive && _nodes.keys.any((key) => key.startsWith(prefix))) {
+      throw StateError('Temporary directory is not empty');
     }
-    _nodes.remove(norm);
-    if (recursive) {
-      final prefix = '$norm/';
-      _nodes.removeWhere((key, _) => key.startsWith(prefix));
-    }
+    _nodes.remove(path);
+    if (recursive) _nodes.removeWhere((key, _) => key.startsWith(prefix));
   }
 
   void rename(String fromRaw, String toRaw) {
     ensureInitialized();
     final from = normalize(fromRaw);
     final to = normalize(toRaw);
+    _requireEphemeral(from);
+    _requireEphemeral(to);
     if (from == to) return;
-
-    final existing = stat(from);
-    if (existing == null) throw StateError('File not found: $from');
-    if (to.startsWith('/downloads/')) {
+    if (_nodes.containsKey(to) || to.startsWith('$from/')) {
+      throw StateError('Invalid temporary buffer destination');
+    }
+    final source = _nodes[from];
+    if (source == null) throw StateError('Temporary buffer does not exist');
+    if (to.startsWith('/downloads/') && !source.isDir) {
       copy(from, to);
       delete(from);
       return;
     }
-    _requireSuccess(JsBridge.syncJsonRequest('POST', '/api/fs/rename', {
-      'from': from,
-      'to': to,
-    }));
-    if (existing != null) {
-      _ensureParentDirsInMemory(to);
-      if (existing.isDir) {
-        final prefix = '$from/';
-        final updates = <String, VfsNode>{};
-        final removals = <String>[from];
-        for (final entry in _nodes.entries) {
-          if (entry.key.startsWith(prefix)) {
-            final suffix = entry.key.substring(from.length);
-            final newPath = '$to$suffix';
-            removals.add(entry.key);
-            updates[newPath] = VfsNode(
-              path: newPath,
-              isDir: entry.value.isDir,
-              size: entry.value.size,
-              mtimeMs: entry.value.mtimeMs,
-              bytes: entry.value.bytes,
-            );
-          }
-        }
-        for (final k in removals) {
-          _nodes.remove(k);
-        }
-        _nodes[to] = VfsNode(path: to, isDir: true, mtimeMs: existing.mtimeMs);
-        _nodes.addAll(updates);
-      } else {
-        final bytes = existing.bytes;
-        _nodes.remove(from);
-        _nodes[to] = VfsNode(
-          path: to,
-          isDir: false,
-          size: existing.size,
-          mtimeMs: DateTime.now().millisecondsSinceEpoch,
-          bytes: bytes,
-        );
+    _parents(to);
+    final moved = <String, VfsNode>{};
+    final prefix = '$from/';
+    for (final entry in _nodes.entries) {
+      if (entry.key == from || entry.key.startsWith(prefix)) {
+        final path = '$to${entry.key.substring(from.length)}';
+        moved[path] = VfsNode(path: path, isDir: entry.value.isDir,
+          size: entry.value.size, mtimeMs: entry.value.mtimeMs, bytes: entry.value.bytes);
       }
     }
-
+    _nodes.removeWhere((key, _) => key == from || key.startsWith(prefix));
+    _nodes.addAll(moved);
   }
 
-  void copy(String fromRaw, String toRaw) {
-    ensureInitialized();
-    final from = normalize(fromRaw);
-    final to = normalize(toRaw);
-    if (from == to) return;
-
-    if (to.startsWith('/downloads/')) {
-      final bytes = readBytes(from);
-      _nodes[to] = VfsNode(
-        path: to,
-        isDir: false,
-        size: bytes.length,
-        bytes: bytes,
-      );
-      if (!JsBridge.triggerDownload(p.posix.basename(to), bytes)) {
-        throw StateError('Download failed: $to');
-      }
-      return;
-    }
-
-    final srcNode = stat(from);
-    if (srcNode != null && srcNode.bytes != null) {
-      writeBytes(to, srcNode.bytes!);
-      return;
-    }
-
-    final res = JsBridge.syncJsonRequest('POST', '/api/fs/copy', {
-      'from': from,
-      'to': to,
-    });
-    _requireSuccess(res);
-    _ensureParentDirsInMemory(to);
-    _nodes[to] = VfsNode(
-      path: to,
-      isDir: false,
-      size: (res['size'] as num?)?.toInt() ?? (srcNode?.size ?? 0),
-      mtimeMs:
-          (res['mtimeMs'] as num?)?.toInt() ??
-          DateTime.now().millisecondsSinceEpoch,
-    );
-  }
+  void copy(String fromRaw, String toRaw) => writeBytes(toRaw, readBytes(fromRaw));
 
   List<VfsNode> list(String rawDir, {bool recursive = false}) {
     ensureInitialized();
-    final norm = normalize(rawDir);
-    final prefix = norm == '/' ? '/' : '$norm/';
-    final results = <VfsNode>[];
-    for (final entry in _nodes.entries) {
-      final path = entry.key;
-      if (path == norm || !path.startsWith(prefix)) continue;
-      final rel = path.substring(prefix.length);
-      if (!recursive && rel.contains('/')) continue;
-      results.add(entry.value);
-    }
-    return results;
+    final path = normalize(rawDir);
+    if (path != '/tmp' && path != '/downloads') _requireEphemeral(path);
+    final prefix = '$path/';
+    return [
+      for (final entry in _nodes.entries)
+        if (entry.key.startsWith(prefix) &&
+            (recursive || !entry.key.substring(prefix.length).contains('/')))
+          entry.value,
+    ];
   }
 }

@@ -1,0 +1,2571 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+
+import 'package:collection/collection.dart';
+import 'package:fl_clash/models/models.dart';
+
+import 'attachment.dart';
+import 'canonical_projection.dart';
+import 'client.dart';
+import 'codec.dart';
+import 'errors.dart';
+import 'identity.dart';
+import 'operation.dart';
+import 'query.dart';
+import 'records.dart';
+import 'transport.dart';
+
+enum _EditSubject { row, collection, create, external }
+
+class _RepositoryIntent {
+  _RepositoryIntent(this.sequence, this.epoch);
+  final int sequence;
+  final int epoch;
+  final settled = Completer<void>();
+}
+
+class _PreparedOperation {
+  const _PreparedOperation(
+    this.path,
+    this.storeId,
+    this.epoch,
+    this.revision,
+    this.operationId,
+    this.requestDigest,
+    this.expiresAt,
+    this.fieldDigests,
+    this.dependencies,
+    this.originalVersion,
+    this.contentSha256,
+    this.attachmentReferences,
+    this.attachmentDigests,
+  );
+  final String path;
+  final String storeId;
+  final int epoch;
+  final String revision;
+  final String operationId;
+  final String requestDigest;
+  final DateTime expiresAt;
+  final Map<String, String> fieldDigests;
+  final Map<String, String> dependencies;
+  final ApiEditVersion originalVersion;
+  final String contentSha256;
+  final Set<String> attachmentReferences;
+  final Map<String, String> attachmentDigests;
+}
+
+class _DependencyPreparation {
+  const _DependencyPreparation(
+    this.job,
+    this.reference,
+    this.urlDigest,
+    this.expiresAt,
+  );
+  final _PreparedOperation job;
+  final String reference;
+  final String urlDigest;
+  final DateTime expiresAt;
+}
+
+class _DependencyGrant {
+  const _DependencyGrant(this.source, this.expiresAt);
+  final _DependencyPreparation source;
+  final DateTime expiresAt;
+}
+
+class ApiEditVersion {
+  const ApiEditVersion._({
+    required this.storeId,
+    required Object issuer,
+    required this.revision,
+    required this.kind,
+    required this.localId,
+    required int epoch,
+    required _EditSubject subject,
+    required String fingerprint,
+    String? wireId,
+    String? readPath,
+    this.scope = ApiRevisionScope.configuration,
+  }) : _issuer = issuer,
+       _epoch = epoch,
+       _subject = subject,
+       _fingerprint = fingerprint,
+       _wireId = wireId,
+       _readPath = readPath;
+
+  final String storeId;
+  final Object _issuer;
+  final String revision;
+  final ApiIdentity kind;
+  final int? localId;
+  final int _epoch;
+  final _EditSubject _subject;
+  final String _fingerprint;
+  final String? _wireId;
+  final String? _readPath;
+  final ApiRevisionScope scope;
+}
+
+class ApiCatalog<T> {
+  const ApiCatalog({
+    required this.resource,
+    required this.singular,
+    required this.plural,
+    required this.identity,
+    required this.decode,
+    required this.encode,
+    required this.localId,
+    this.profileOwned = false,
+  });
+
+  final String resource;
+  final String singular;
+  final String plural;
+  final ApiIdentity identity;
+  final T Function(Object? value) decode;
+  final Map<String, Object?> Function(T value) encode;
+  final int Function(T value) localId;
+  final bool profileOwned;
+}
+
+class WebApiRepository {
+  WebApiRepository({
+    ApiTransport? transport,
+    ApiOperationJournal? journal,
+    ApiIdentityRegistry? identities,
+    Duration timeout = const Duration(seconds: 30),
+    String? origin,
+    void Function()? onUnauthorized,
+  }) : identities = identities ?? ApiIdentityRegistry(),
+       _client = WebApiClient(
+         transport: transport,
+         journal: journal,
+         timeout: timeout,
+         origin: origin,
+         onUnauthorized: onUnauthorized,
+       ) {
+    codec = ApiModelCodec(this.identities);
+    for (final binding
+        in _client.pendingOperation?.drafts ?? const <ApiDraftBinding>[]) {
+      this.identities.registerDraft(binding.kind, binding.handle);
+    }
+    _sessionSubscription = _client.sessionChanges.listen((_) {
+      _generation++;
+      _cache.clear();
+      _completed.clear();
+      _storeId = null;
+      _blockedStore = false;
+      _profileUnfolds.clear();
+      _authorizedOperations.clear();
+      _preparedOperations.clear();
+      _dependencyPreparations.clear();
+      _dependencyGrants.clear();
+      if (_client.pendingOperation == null) _pendingRecoveryError = null;
+      _queue = Future<void>.value();
+      final barrier = _writeBarrier;
+      _writeBarrier = null;
+      if (barrier != null && !barrier.isCompleted) barrier.complete();
+      this.identities.clear();
+      _changes.add(null);
+    });
+  }
+
+  final ApiIdentityRegistry identities;
+  late final ApiModelCodec codec;
+  final WebApiClient _client;
+  final _changes = StreamController<void>.broadcast(sync: true);
+  late final StreamSubscription<void> _sessionSubscription;
+  final _cache = <(String, ApiRevisionScope), ApiReceipt>{};
+  final _reads = <(String, ApiRevisionScope, int, int), Future<ApiReceipt>>{};
+  final _completed = <String, ApiReceipt>{};
+  final _receiptEvents = <String>{};
+  final _externalDecoders = <String, Object? Function(Object?)>{};
+  final _profileUnfolds = <(String, String), Set<String>>{};
+  final _sources = Expando<ApiEditVersion>();
+  final _tokenIssuer = Object();
+  final _authorizedOperations = <String, (String, int, String)>{};
+  final _preparedOperations = <String, _PreparedOperation>{};
+  final _dependencyPreparations = <String, _DependencyPreparation>{};
+  final _dependencyGrants = <String, _DependencyGrant>{};
+  final _intentZoneKey = Object();
+  final _intents = <int, _RepositoryIntent>{};
+  int _intentSequence = 0;
+  Set<String> Function(String, String)? _readProfilePresentation;
+  void Function(String, String, Set<String>)? _writeProfilePresentation;
+  Future<void> _queue = Future<void>.value();
+  Completer<void>? _writeBarrier;
+  String? _storeId;
+  int _generation = 0;
+  bool _notifyQueued = false;
+  bool _closed = false;
+  bool _blockedStore = false;
+  WebApiException? _pendingRecoveryError;
+
+  WebApiClient get client => _client;
+  String? get revision => _client.revision;
+  String? get storeId => _storeId;
+  bool get isSessionActive => _client.isActive;
+  Stream<void> get changes => _changes.stream;
+  Stream<void> get sessionChanges => _client.sessionChanges;
+  ApiPendingOperation? get pendingOperation => _client.pendingOperation;
+  WebApiException? get pendingRecoveryError =>
+      pendingOperation == null ? null : _pendingRecoveryError;
+
+  late final groups = ApiCatalog<ProxyGroup>(
+    resource: 'proxy-groups',
+    singular: 'group',
+    plural: 'groups',
+    identity: ApiIdentity.proxyGroup,
+    decode: codec.proxyGroup,
+    encode: codec.proxyGroupInput,
+    localId: (value) => value.id,
+    profileOwned: true,
+  );
+  late final proxies = ApiCatalog<CustomProxy>(
+    resource: 'custom-proxies',
+    singular: 'proxy',
+    plural: 'proxies',
+    identity: ApiIdentity.customProxy,
+    decode: codec.customProxy,
+    encode: codec.customProxyInput,
+    localId: (value) => value.id,
+  );
+  late final scripts = ApiCatalog<Script>(
+    resource: 'scripts',
+    singular: 'script',
+    plural: 'scripts',
+    identity: ApiIdentity.script,
+    decode: codec.script,
+    encode: codec.scriptInput,
+    localId: (value) => value.id,
+  );
+  late final providers = ApiCatalog<ClashProvider>(
+    resource: 'clash-providers',
+    singular: 'provider',
+    plural: 'providers',
+    identity: ApiIdentity.clashProvider,
+    decode: codec.clashProvider,
+    encode: codec.clashProviderInput,
+    localId: (value) => value.id,
+  );
+  late final iconSets = ApiCatalog<IconSet>(
+    resource: 'icon-sets',
+    singular: 'iconSet',
+    plural: 'iconSets',
+    identity: ApiIdentity.iconSet,
+    decode: codec.iconSet,
+    encode: codec.iconSetInput,
+    localId: (value) => value.id,
+  );
+  late final modules = ApiCatalog<MitmModule>(
+    resource: 'mitm-modules',
+    singular: 'module',
+    plural: 'modules',
+    identity: ApiIdentity.mitmModule,
+    decode: codec.mitmModule,
+    encode: codec.mitmModuleInput,
+    localId: (value) => value.id,
+  );
+
+  Future<void> initialize() async {
+    await _readReceipt(
+      '/api/v1/meta',
+      ApiRevisionScope.configuration,
+      bypass: true,
+    );
+    final pending = pendingOperation;
+    if (pending != null && _writeBarrier == null) {
+      try {
+        await recoverOperation(pending.operationId);
+      } on WebApiException catch (error) {
+        _pendingRecoveryError = error;
+      }
+    }
+  }
+
+  void ackPendingUnrecoverable(String operationId, {required String intent}) {
+    _client.ackPendingUnrecoverable(operationId, intent: intent);
+    _authorizedOperations.remove(operationId);
+    _preparedOperations.remove(operationId);
+    _pendingRecoveryError = null;
+    _invalidate(ApiRevisionScope.configuration);
+    _invalidate(ApiRevisionScope.cache);
+  }
+
+  void registerExternalReceipt(
+    String resource,
+    Object? Function(Object?) decode,
+  ) {
+    final prefix = resource.startsWith('/api/v1/')
+        ? resource
+        : '/api/v1/$resource';
+    if (prefix.contains('?') || prefix.contains('#') || prefix.contains('..')) {
+      throw ArgumentError('Invalid receipt resource prefix');
+    }
+    _externalDecoders[prefix] = decode;
+  }
+
+  Future<T> executeExternalCommand<T>(
+    String path,
+    Map<String, Object?> payload,
+    T Function(Object?) decode, {
+    required ApiEditVersion editVersion,
+    List<ApiDraftBinding> drafts = const [],
+    String? operationId,
+  }) async {
+    if ((path == '/api/v1/profiles:import-custom' ||
+            path == '/api/v1/mitm-modules:import') &&
+        operationId == null) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Custom profile import requires its original prepared operation',
+      );
+    }
+    if (operationId != null) {
+      final prepared = _preparedOperations[operationId];
+      if (prepared != null) {
+        _validatePrepared(prepared, path, payload, editVersion);
+      } else if (path == '/api/v1/content:write' ||
+          path == '/api/v1/mitm-modules:arguments' ||
+          path == '/api/v1/profiles:import-custom' ||
+          path == '/api/v1/mitm-modules:import' ||
+          _authorizedOperations[operationId] !=
+              (editVersion.storeId, editVersion._epoch, editVersion.revision)) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'The server operation does not belong to this prepared read context',
+        );
+      }
+    }
+    _externalDecoders.putIfAbsent(path, () => decode);
+    final receipt = await _mutate(
+      path,
+      payload,
+      editVersion: editVersion,
+      drafts: drafts,
+      operationId: operationId,
+    );
+    if (receipt.revision != revision) {
+      throw WebApiCommittedProjectionException(
+        receipt.operationId!,
+        receipt.revision,
+      );
+    }
+    return _projectCommitted(
+      receipt,
+      () async => _decodeExternalReceipt(receipt, decode),
+    );
+  }
+
+  Future<void> handleCommitEvent(Map<String, Object?> event) async {
+    if (!_client.isActive || _closed || _blockedStore) return;
+    final revision = requireApiRevision(event['revision']);
+    final operationId = event['operationId'];
+    if (operationId != null && operationId is! String) {
+      throw const WebApiProtocolException('Invalid event operation identity');
+    }
+    _client.observeRevision(revision);
+    _invalidate(ApiRevisionScope.configuration);
+    if (operationId is String && pendingOperation?.operationId == operationId) {
+      _receiptEvents.add(operationId);
+      if (_writeBarrier == null) await recoverOperation(operationId);
+    }
+  }
+
+  Future<T> runIntent<T>(FutureOr<T> Function() body) {
+    final inherited = Zone.current[_intentZoneKey];
+    if (inherited is _RepositoryIntent) {
+      _client.requireSession(inherited.epoch);
+      return Future<T>.sync(body);
+    }
+    final epoch = _client.sessionEpoch;
+    _client.requireSession(epoch);
+    final previous = [
+      for (final intent in _intents.values)
+        if (intent.epoch == epoch) intent.settled.future,
+    ];
+    final intent = _RepositoryIntent(++_intentSequence, epoch);
+    _intents[intent.sequence] = intent;
+    final future = runZoned(() async {
+      await Future.wait(previous);
+      _client.requireSession(epoch);
+      return await body();
+    }, zoneValues: {_intentZoneKey: intent});
+    return future.whenComplete(() {
+      _intents.remove(intent.sequence);
+      if (!intent.settled.isCompleted) intent.settled.complete();
+    });
+  }
+
+  Future<void> drainIntents() async {
+    final epoch = _client.sessionEpoch;
+    _client.requireSession(epoch);
+    await _drainReadBoundary(epoch);
+    _requireStore();
+    if (pendingOperation case final pending?) {
+      throw WebApiPendingOperationException(pending.operationId);
+    }
+  }
+
+  Future<void> _drainReadBoundary(int epoch) async {
+    final inherited = Zone.current[_intentZoneKey];
+    final boundary = inherited is _RepositoryIntent
+        ? inherited.sequence - 1
+        : _intentSequence;
+    final fences = [
+      for (final intent in _intents.values)
+        if (intent.epoch == epoch && intent.sequence <= boundary)
+          intent.settled.future,
+    ];
+    final queue = _queue;
+    await Future.wait(fences);
+    await queue;
+    _client.requireSession(epoch);
+  }
+
+  void configureProfilePresentation({
+    required Set<String> Function(String storeId, String wireId) read,
+    required void Function(String storeId, String wireId, Set<String>) write,
+  }) {
+    _readProfilePresentation = read;
+    _writeProfilePresentation = write;
+    _profileUnfolds.clear();
+    _notify();
+  }
+
+  Future<ApiAttachment> readAttachmentExternal(String path) async {
+    final uri = Uri.parse(path);
+    if (uri.hasAuthority ||
+        uri.scheme.isNotEmpty ||
+        uri.fragment.isNotEmpty ||
+        uri.pathSegments.any((part) => part == '.' || part == '..') ||
+        (uri.path != '/api/v1/backups' &&
+            !(uri.path.startsWith('/api/v1/content/') &&
+                uri.path.endsWith('/download')))) {
+      throw const WebApiProtocolException('Not a typed API attachment route');
+    }
+    final epoch = _client.sessionEpoch;
+    _client.requireSession(epoch);
+    await _drainReadBoundary(epoch);
+    if (_storeId == null) await initialize();
+    for (var attempt = 0; attempt < 3; attempt++) {
+      _requireStore();
+      if (_writeBarrier case final barrier?) await barrier.future;
+      _client.requireSession(epoch);
+      if (pendingOperation case final pending?) {
+        throw WebApiPendingOperationException(pending.operationId);
+      }
+      final generation = _generation;
+      final previous = revision;
+      final result = await _client.readAttachment(path);
+      _client.requireSession(epoch);
+      if (generation != _generation || result.revision != revision) continue;
+      if (previous != revision) _invalidate(ApiRevisionScope.configuration);
+      return result;
+    }
+    throw const WebApiException(
+      'revision_unstable',
+      'Retry the attachment after concurrent changes settle',
+    );
+  }
+
+  Future<ApiReceipt> readExternal(String path) =>
+      _readReceipt(path, ApiRevisionScope.configuration, force: true);
+
+  Future<ApiReceipt> queryExternal(
+    String path,
+    Map<String, Object?> payload,
+  ) async {
+    final epoch = _client.sessionEpoch;
+    _client.requireSession(epoch);
+    _requireStore();
+    await _drainReadBoundary(epoch);
+    if (_storeId == null) await initialize();
+    if (_writeBarrier case final barrier?) await barrier.future;
+    _client.requireSession(epoch);
+    if (pendingOperation case final pending?) {
+      throw WebApiPendingOperationException(pending.operationId);
+    }
+    final previous = revision;
+    final receipt = await _client.query(path, payload);
+    _client.requireSession(epoch);
+    if (path == '/api/v1/sources:prepare') {
+      _recordDependencyPreparation(receipt);
+    }
+    if (previous != revision) _invalidate(ApiRevisionScope.configuration);
+    return receipt;
+  }
+
+  ApiEditVersion captureEditVersion(ApiIdentity kind, Object original) {
+    final token = _sources[original];
+    if (token != null) _validateVersion(token);
+    if (token == null ||
+        token.kind != kind ||
+        token._fingerprint != _fingerprint(original)) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'Reload the original canonical value before editing',
+      );
+    }
+    _validateVersion(token);
+    return token;
+  }
+
+  ApiEditVersion captureCollectionVersion(
+    ApiIdentity kind,
+    List<Object?> rows,
+  ) {
+    final direct = _sources[rows];
+    if (direct != null) return captureEditVersion(kind, rows);
+    if (rows.isEmpty) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'Keep the original empty collection version',
+      );
+    }
+    final tokens = [
+      for (final row in rows)
+        if (row is Object) captureEditVersion(kind, row),
+    ];
+    final first = tokens.first;
+    if (tokens.length != rows.length ||
+        first._readPath == null ||
+        tokens.any(
+          (token) =>
+              token.revision != first.revision ||
+              token._readPath != first._readPath,
+        )) {
+      throw const WebApiException(
+        'edit_baseline_mismatch',
+        'The list combines different read snapshots',
+      );
+    }
+    return ApiEditVersion._(
+      issuer: _tokenIssuer,
+      storeId: first.storeId,
+      revision: first.revision,
+      kind: kind,
+      localId: null,
+      epoch: first._epoch,
+      subject: _EditSubject.collection,
+      fingerprint: _fingerprint(rows),
+      readPath: first._readPath,
+    );
+  }
+
+  ApiEditVersion captureCreateVersion(ApiIdentity kind) {
+    _client.requireSession(_client.sessionEpoch);
+    _requireStore();
+    final revision = _client.revision;
+    if (_storeId == null || revision == null) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'Read the authoritative store before creating a draft',
+      );
+    }
+    return ApiEditVersion._(
+      issuer: _tokenIssuer,
+      storeId: _storeId!,
+      revision: revision,
+      kind: kind,
+      localId: null,
+      epoch: _client.sessionEpoch,
+      subject: _EditSubject.create,
+      fingerprint: '',
+    );
+  }
+
+  ApiEditVersion captureReadVersion(
+    ApiReceipt receipt, {
+    ApiIdentity kind = ApiIdentity.configuration,
+  }) {
+    _requireStore();
+    if (!_client.ownsReceipt(receipt) || _storeId == null) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'The read does not belong to this authenticated store',
+      );
+    }
+    return ApiEditVersion._(
+      issuer: _tokenIssuer,
+      storeId: _storeId!,
+      revision: receipt.revision,
+      kind: kind,
+      localId: null,
+      epoch: _client.sessionEpoch,
+      subject: _EditSubject.external,
+      fingerprint: _jsonFingerprint(receipt.data),
+      scope: _client.receiptScope(receipt)!,
+    );
+  }
+
+  String registerPreparedOperation(ApiReceipt receipt, ApiEditVersion version) {
+    final proof = _client.requestProof(receipt);
+    final attachmentPath = RegExp(
+      r'^/api/v1/content-preparations/([^/?#]+)/attachments$',
+    ).firstMatch(proof?.path ?? '');
+    if (attachmentPath != null && proof != null) {
+      return _rotatePreparedAttachment(
+        receipt,
+        version,
+        proof,
+        attachmentPath.group(1)!,
+      );
+    }
+    if (proof?.path == '/api/v1/mitm-modules:prepare-import') {
+      requireEditVersion(version);
+      if (version.kind != ApiIdentity.mitmModule ||
+          (version._subject != _EditSubject.create &&
+              version._subject != _EditSubject.row)) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Module import requires its original module read or create intent',
+        );
+      }
+    } else {
+      requireReadVersion(version);
+    }
+    if (proof == null ||
+        proof.method != 'POST' ||
+        proof.expectedRevision != version.revision ||
+        receipt.revision != version.revision ||
+        _client.receiptScope(receipt) != ApiRevisionScope.configuration) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Preparation must come from the original authenticated read revision',
+      );
+    }
+    final finalPath = switch (proof.path) {
+      '/api/v1/content:prepare-write' => '/api/v1/content:write',
+      '/api/v1/mitm-modules:prepare-arguments' =>
+        '/api/v1/mitm-modules:arguments',
+      '/api/v1/profiles:prepare-custom-import' =>
+        '/api/v1/profiles:import-custom',
+      '/api/v1/mitm-modules:prepare-import' => '/api/v1/mitm-modules:import',
+      _ => throw const WebApiException(
+        'operation_context_mismatch',
+        'Not a supported content preparation endpoint',
+      ),
+    };
+    final data = apiObject(receipt.data);
+    final id = data['operationId'];
+    final digest = data['requestDigest'];
+    final contentDigest = data['contentSha256'];
+    if (id is! String ||
+        data['preparedJobId'] != id ||
+        digest is! String ||
+        contentDigest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(contentDigest)) {
+      throw const WebApiProtocolException(
+        'Invalid prepared operation identifiers or digest',
+      );
+    }
+    requireApiOperationId(id);
+    if (proof.path == '/api/v1/profiles:prepare-custom-import') {
+      const fields = {
+        'expectedRevision',
+        'profileId',
+        'url',
+        'authorizationId',
+      };
+      final urlDigest = proof.fieldDigests['url'];
+      if (version._subject != _EditSubject.row ||
+          version.kind != ApiIdentity.profile ||
+          version._wireId == null ||
+          proof.fieldDigests['profileId'] !=
+              apiPayloadDigest(version._wireId) ||
+          data['profileId'] != version._wireId ||
+          urlDigest == null ||
+          !RegExp(r'^[0-9a-f]{64}$').hasMatch(urlDigest) ||
+          proof.fieldDigests.keys.any((key) => !fields.contains(key))) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Custom import preparation requires the original profile read and URL request',
+        );
+      }
+    } else if (proof.path == '/api/v1/mitm-modules:prepare-import') {
+      final existing = proof.fieldDigests['id'] ?? proof.fieldDigests['key.id'];
+      if (proof.fieldDigests['source'] == null ||
+          version._subject == _EditSubject.create && existing != null ||
+          version._subject == _EditSubject.row &&
+              existing != apiPayloadDigest(version._wireId)) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Module import source or existing identity differs from its original intent',
+        );
+      }
+    } else if (version._subject == _EditSubject.row) {
+      final key = proof.path == '/api/v1/content:prepare-write'
+          ? 'key.id'
+          : 'id';
+      if (version.kind != ApiIdentity.mitmModule ||
+          proof.fieldDigests[key] != apiPayloadDigest(version._wireId)) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Preparation belongs to another module',
+        );
+      }
+    }
+    final expires = _preparedExpiry(data['expiresAt']);
+    final previous = _preparedOperations[id];
+    if (previous != null) {
+      if (!identical(previous.originalVersion, version) ||
+          previous.requestDigest != digest ||
+          previous.path != finalPath ||
+          previous.contentSha256 != contentDigest) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'A registered prepared job cannot be rolled back or rebound',
+        );
+      }
+      return id;
+    }
+    _preparedOperations[id] = _PreparedOperation(
+      finalPath,
+      version.storeId,
+      version._epoch,
+      version.revision,
+      id,
+      digest,
+      expires,
+      proof.fieldDigests,
+      _preparedDependencies(data),
+      version,
+      contentDigest,
+      _attachmentReferences(data),
+      const {},
+    );
+    if (_preparedOperations.length > 64) {
+      _preparedOperations.remove(_preparedOperations.keys.first);
+    }
+    return id;
+  }
+
+  DateTime _preparedExpiry(Object? expiry) {
+    if (expiry is! String ||
+        !RegExp(
+          r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$',
+        ).hasMatch(expiry)) {
+      throw const WebApiProtocolException('Invalid preparation expiry');
+    }
+    final expires = DateTime.tryParse(expiry);
+    final now = DateTime.now().toUtc();
+    if (expires == null ||
+        !expires.isAfter(now) ||
+        expires.difference(now) > const Duration(minutes: 5) ||
+        expires.year != int.parse(expiry.substring(0, 4)) ||
+        expires.month != int.parse(expiry.substring(5, 7)) ||
+        expires.day != int.parse(expiry.substring(8, 10)) ||
+        expires.hour != int.parse(expiry.substring(11, 13)) ||
+        expires.minute != int.parse(expiry.substring(14, 16)) ||
+        expires.second != int.parse(expiry.substring(17, 19))) {
+      throw const WebApiException(
+        'content_preparation_expired',
+        'Prepare the content again using the original read revision',
+      );
+    }
+    return expires;
+  }
+
+  Set<String> _attachmentReferences(Map<String, Object?> data) {
+    final rows = apiList(data['attachmentReferences'] ?? const []);
+    if (rows.length > 1000 ||
+        rows.any(
+          (value) => value is! String || value.isEmpty || value.length > 256,
+        ) ||
+        rows.toSet().length != rows.length) {
+      throw const WebApiProtocolException(
+        'Invalid initial attachment references',
+      );
+    }
+    return Set<String>.unmodifiable(rows.cast<String>());
+  }
+
+  String _rotatePreparedAttachment(
+    ApiReceipt receipt,
+    ApiEditVersion version,
+    ApiRequestProof proof,
+    String segment,
+  ) {
+    _validateVersion(version);
+    final String id;
+    try {
+      id = Uri.decodeComponent(segment);
+    } catch (_) {
+      throw const WebApiProtocolException('Invalid attachment job route');
+    }
+    final job = _preparedOperations[id];
+    final data = apiObject(receipt.data);
+    final digest = data['requestDigest'];
+    final references =
+        job?.attachmentReferences
+            .where(
+              (reference) =>
+                  proof.fieldDigests['sourceReference'] ==
+                  apiPayloadDigest(reference),
+            )
+            .toList() ??
+        const <String>[];
+    final bytesDigest = proof.fieldDigests['bytes'];
+    const fields = {
+      'expectedRevision',
+      'requestDigest',
+      'sourceReference',
+      'bytes',
+    };
+    if (job == null ||
+        !identical(job.originalVersion, version) ||
+        job.storeId != _storeId ||
+        job.epoch != _client.sessionEpoch ||
+        job.revision != version.revision ||
+        !job.expiresAt.isAfter(DateTime.now().toUtc()) ||
+        proof.path !=
+            '/api/v1/content-preparations/${Uri.encodeComponent(id)}/attachments' ||
+        proof.method != 'POST' ||
+        proof.expectedRevision != job.revision ||
+        receipt.revision != job.revision ||
+        _client.receiptScope(receipt) != ApiRevisionScope.configuration ||
+        proof.fieldDigests['requestDigest'] !=
+            apiPayloadDigest(job.requestDigest) ||
+        proof.fieldDigests.keys.any((field) => !fields.contains(field)) ||
+        references.length != 1 ||
+        bytesDigest == null ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(bytesDigest) ||
+        data['preparedJobId'] != id ||
+        data['operationId'] != id ||
+        data['contentSha256'] != job.contentSha256 ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+        digest == job.requestDigest) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Attachment rotation does not belong to the original prepared job and request',
+      );
+    }
+    final expires = _preparedExpiry(data['expiresAt']);
+    final rotated = _PreparedOperation(
+      job.path,
+      job.storeId,
+      job.epoch,
+      job.revision,
+      job.operationId,
+      digest,
+      expires,
+      job.fieldDigests,
+      _preparedDependencies(data),
+      job.originalVersion,
+      job.contentSha256,
+      job.attachmentReferences,
+      Map.unmodifiable({
+        ...job.attachmentDigests,
+        references.single: bytesDigest,
+      }),
+    );
+    _preparedOperations[id] = rotated;
+    _dependencyPreparations.removeWhere(
+      (_, source) => identical(source.job, job),
+    );
+    _dependencyGrants.removeWhere(
+      (_, grant) => identical(grant.source.job, job),
+    );
+    return id;
+  }
+
+  void _validatePrepared(
+    _PreparedOperation prepared,
+    String path,
+    Map<String, Object?> payload,
+    ApiEditVersion version,
+  ) {
+    if (path == '/api/v1/mitm-modules:import') {
+      requireEditVersion(version);
+      if (version.kind != ApiIdentity.mitmModule ||
+          (version._subject != _EditSubject.create &&
+              version._subject != _EditSubject.row)) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Module import requires its original intent',
+        );
+      }
+    } else {
+      requireReadVersion(version);
+    }
+    if (prepared.path != path ||
+        prepared.storeId != version.storeId ||
+        prepared.epoch != version._epoch ||
+        prepared.revision != version.revision ||
+        payload['preparedJobId'] != prepared.operationId ||
+        payload['requestDigest'] != prepared.requestDigest ||
+        !prepared.expiresAt.isAfter(DateTime.now().toUtc())) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'The final command differs from its preparation',
+      );
+    }
+    if (payload.containsKey('expectedRevision') &&
+            payload['expectedRevision'] != version.revision ||
+        payload.containsKey('operationId') &&
+            payload['operationId'] != prepared.operationId) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Prepared command identity or revision changed',
+      );
+    }
+    if (prepared.attachmentDigests.isNotEmpty &&
+        payload.containsKey('attachments')) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Rotated attachments are immutable server blobs, not final request inputs',
+      );
+    }
+    _validateDependencyGrants(prepared, payload);
+    if (path == '/api/v1/mitm-modules:import') {
+      final existing =
+          prepared.fieldDigests['id'] ?? prepared.fieldDigests['key.id'];
+      if (version._subject == _EditSubject.create && existing != null ||
+          version._subject == _EditSubject.row &&
+              existing != apiPayloadDigest(version._wireId)) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Module import baseline changed after preparation',
+        );
+      }
+      for (final field in [
+        'id',
+        'key',
+        'source',
+        'bytes',
+        'url',
+        'metadata',
+        'attachments',
+        'authorizationId',
+      ]) {
+        if (payload.containsKey(field) &&
+            apiPayloadDigest(payload[field]) != prepared.fieldDigests[field]) {
+          throw const WebApiException(
+            'operation_context_mismatch',
+            'Module import changed after preparation',
+          );
+        }
+      }
+      const fields = {
+        'id',
+        'key',
+        'source',
+        'bytes',
+        'url',
+        'metadata',
+        'attachments',
+        'authorizationId',
+        'authorizationIds',
+        'preparedJobId',
+        'requestDigest',
+        'expectedRevision',
+        'operationId',
+      };
+      if (payload.keys.any((field) => !fields.contains(field))) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Unexpected module import field',
+        );
+      }
+      return;
+    }
+    if (path == '/api/v1/profiles:import-custom') {
+      const fields = {
+        'id',
+        'preparedJobId',
+        'requestDigest',
+        'authorizationIds',
+        'expectedRevision',
+        'operationId',
+      };
+      if (version._subject != _EditSubject.row ||
+          version.kind != ApiIdentity.profile ||
+          version._wireId == null ||
+          apiPayloadDigest(version._wireId) !=
+              prepared.fieldDigests['profileId'] ||
+          apiPayloadDigest(payload['id']) !=
+              prepared.fieldDigests['profileId'] ||
+          payload.keys.any((key) => !fields.contains(key)) ||
+          payload.containsKey('expectedRevision') &&
+              payload['expectedRevision'] != version.revision ||
+          payload.containsKey('operationId') &&
+              payload['operationId'] != prepared.operationId) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Custom import must use the original profile and immutable prepared job',
+        );
+      }
+      return;
+    }
+    final requiredField = path == '/api/v1/content:write' ? 'key' : 'id';
+    if (apiPayloadDigest(payload[requiredField]) !=
+        prepared.fieldDigests[requiredField]) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'The final resource differs from its preparation',
+      );
+    }
+    for (final field in [
+      'bytes',
+      'metadata',
+      'attachments',
+      'detachReferences',
+      'arguments',
+    ]) {
+      final value = payload[field];
+      if (value == null ||
+          field == 'bytes' && value == '' ||
+          (field == 'attachments' || field == 'detachReferences') &&
+              value is List &&
+              value.isEmpty) {
+        continue;
+      }
+      if (apiPayloadDigest(value) != prepared.fieldDigests[field]) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Content changed after preparation',
+        );
+      }
+    }
+  }
+
+  Map<String, String> _preparedDependencies(Map<String, Object?> data) {
+    final dependencies = <String, String>{};
+    final rows = apiList(data['dependencies'] ?? const []);
+    if (rows.length > 1000) {
+      throw const WebApiProtocolException('Too many prepared dependencies');
+    }
+    for (final row in rows) {
+      final item = apiObject(row);
+      final reference = item['sourceReference'];
+      final digest = item['urlDigest'];
+      if (reference is! String ||
+          reference.isEmpty ||
+          reference.length > 256 ||
+          digest is! String ||
+          !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+          dependencies.containsKey(reference)) {
+        throw const WebApiProtocolException(
+          'Invalid prepared dependency manifest',
+        );
+      }
+      dependencies[reference] = digest;
+    }
+    return Map.unmodifiable(dependencies);
+  }
+
+  void _recordDependencyPreparation(ApiReceipt receipt) {
+    final proof = _client.requestProof(receipt);
+    if (proof == null) return;
+    final jobs = _preparedOperations.values.where(
+      (job) =>
+          proof.fieldDigests['importJobId'] ==
+          apiPayloadDigest(job.operationId),
+    );
+    if (jobs.isEmpty) return;
+    final job = jobs.single;
+    final purpose = job.path == '/api/v1/profiles:import-custom'
+        ? 'custom-profile-dependency'
+        : 'mitm-resource-import';
+    final references = job.dependencies.keys.where(
+      (reference) =>
+          proof.fieldDigests['sourceReference'] == apiPayloadDigest(reference),
+    );
+    final data = apiObject(receipt.data);
+    final id = data['preparationId'];
+    final expires = data['expiresAt'] is String
+        ? DateTime.tryParse(data['expiresAt'] as String)
+        : null;
+    const fields = {
+      'expectedRevision',
+      'purpose',
+      'importJobId',
+      'sourceReference',
+    };
+    if (proof.expectedRevision != job.revision ||
+        receipt.revision != job.revision ||
+        proof.fieldDigests['purpose'] != apiPayloadDigest(purpose) ||
+        data['purpose'] != purpose ||
+        references.length != 1 ||
+        id is! String ||
+        id.isEmpty ||
+        expires == null ||
+        !expires.isAfter(DateTime.now().toUtc()) ||
+        proof.fieldDigests.keys.any((field) => !fields.contains(field))) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Dependency preparation does not belong to its prepared manifest',
+      );
+    }
+    final reference = references.single;
+    if (data['urlDigest'] != job.dependencies[reference]) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Dependency source digest changed',
+      );
+    }
+    if (purpose == 'custom-profile-dependency') {
+      final key = apiObject(data['key']);
+      if (key['kind'] != 'custom-import-dependency' ||
+          apiPayloadDigest(key['id']) != job.fieldDigests['profileId'] ||
+          key['name'] != reference) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Dependency key differs from its original profile reference',
+        );
+      }
+    }
+    _dependencyPreparations[id] = _DependencyPreparation(
+      job,
+      reference,
+      data['urlDigest'] as String,
+      expires,
+    );
+    if (_dependencyPreparations.length > 4096) {
+      _dependencyPreparations.remove(_dependencyPreparations.keys.first);
+    }
+  }
+
+  void _recordDependencyGrant(
+    ApiPendingOperation operation,
+    ApiReceipt receipt,
+  ) {
+    if (operation.body == null) return;
+    final body = apiObject(jsonDecode(operation.body!));
+    final source = _dependencyPreparations[body['preparationId']];
+    if (source == null) return;
+    final job = source.job;
+    final data = apiObject(receipt.data);
+    final id = data['authorizationId'];
+    final expires = data['expiresAt'] is String
+        ? DateTime.tryParse(data['expiresAt'] as String)
+        : null;
+    if (!identical(_preparedOperations[job.operationId], job) ||
+        job.epoch != _client.sessionEpoch ||
+        job.storeId != _storeId ||
+        operation.expectedRevision != job.revision ||
+        body['urlDigest'] != source.urlDigest ||
+        body['intent'] != 'authorize-server-private-source' ||
+        data['importOperationId'] != job.operationId ||
+        id is! String ||
+        id.isEmpty ||
+        expires == null ||
+        !expires.isAfter(DateTime.now().toUtc()) ||
+        !source.expiresAt.isAfter(DateTime.now().toUtc())) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Authorization does not belong to the original dependency preparation',
+      );
+    }
+    final previous = _dependencyGrants[id];
+    if (previous != null &&
+        (!identical(previous.source.job, job) ||
+            previous.source.reference != source.reference)) {
+      throw const WebApiProtocolException(
+        'Authorization identity was reused for another dependency',
+      );
+    }
+    _dependencyGrants[id] = _DependencyGrant(source, expires);
+    if (_dependencyGrants.length > 4096) {
+      _dependencyGrants.remove(_dependencyGrants.keys.first);
+    }
+  }
+
+  void _validateDependencyGrants(
+    _PreparedOperation job,
+    Map<String, Object?> payload,
+  ) {
+    if (!payload.containsKey('authorizationIds')) return;
+    final ids = payload['authorizationIds'];
+    if (ids is! List || ids.length > 1000) {
+      throw const WebApiException(
+        'operation_context_mismatch',
+        'Expected per-reference authorization identities',
+      );
+    }
+    final seen = <String>{};
+    final references = <String>{};
+    for (final id in ids) {
+      final grant = id is String ? _dependencyGrants[id] : null;
+      if (id is! String ||
+          !seen.add(id) ||
+          grant == null ||
+          !identical(grant.source.job, job) ||
+          job.epoch != _client.sessionEpoch ||
+          job.storeId != _storeId ||
+          !references.add(grant.source.reference) ||
+          job.dependencies[grant.source.reference] != grant.source.urlDigest ||
+          !grant.expiresAt.isAfter(DateTime.now().toUtc()) ||
+          !grant.source.expiresAt.isAfter(DateTime.now().toUtc())) {
+        throw const WebApiException(
+          'operation_context_mismatch',
+          'Authorization is not an owned ticket for this exact prepared reference',
+        );
+      }
+    }
+  }
+
+  void requireEditVersion(ApiEditVersion token) {
+    _validateVersion(token);
+    if (token.scope != ApiRevisionScope.configuration) {
+      throw const WebApiException(
+        'edit_baseline_mismatch',
+        'Cache revisions cannot authorize business intent',
+      );
+    }
+  }
+
+  void requireReadVersion(ApiEditVersion token) {
+    requireEditVersion(token);
+    if (token._subject == _EditSubject.create) {
+      throw const WebApiException(
+        'read_baseline_required',
+        'Use an actual business read, not a create or cache version',
+      );
+    }
+  }
+
+  Future<T> executeExternalCacheCommand<T>(
+    String path,
+    Map<String, Object?> payload,
+    T Function(Object?) decode,
+  ) async {
+    _externalDecoders.putIfAbsent(path, () => decode);
+    final receipt = await _mutate(path, payload, scope: ApiRevisionScope.cache);
+    if (receipt.revision != _client.revisionFor(ApiRevisionScope.cache)) {
+      throw WebApiCommittedProjectionException(
+        receipt.operationId!,
+        receipt.revision,
+      );
+    }
+    return _projectCommitted(
+      receipt,
+      () async => _decodeExternalReceipt(receipt, decode),
+    );
+  }
+
+  Future<ApiReceipt> readExternalCache(String path) =>
+      _readReceipt(path, ApiRevisionScope.cache, force: true);
+
+  void endSession() => _client.endSession();
+
+  void beginSession() => _client.beginSession();
+
+  ApiQuery<T> queryProjection<T>(Future<List<T>> Function() read) =>
+      ApiQuery(read, changes, sessionEpoch: () => _client.sessionEpoch);
+
+  bool ownsReadProjection(Object value) {
+    final token = _sources[value];
+    return _client.isActive &&
+        token != null &&
+        token._epoch == _client.sessionEpoch &&
+        token.storeId == _storeId;
+  }
+
+  Map<int, String> dialerTargets(List<ProxyDialer> rows) {
+    final token = captureEditVersion(ApiIdentity.profile, rows);
+    if (token._subject != _EditSubject.collection ||
+        token._readPath?.startsWith('/api/v1/proxy-dialers?') != true) {
+      throw const WebApiProtocolException('Expected canonical dialer records');
+    }
+    final map = Map<int, String>.unmodifiable({
+      for (final row in rows) row.proxyId: row.target,
+    });
+    _sources[map] = ApiEditVersion._(
+      issuer: _tokenIssuer,
+      storeId: token.storeId,
+      revision: token.revision,
+      kind: token.kind,
+      localId: null,
+      epoch: token._epoch,
+      subject: _EditSubject.collection,
+      fingerprint: _fingerprint(map),
+      readPath: token._readPath,
+    );
+    return map;
+  }
+
+  ApiQuery<Profile> profiles({int? id}) => _query(
+    '/api/v1/profiles${id == null ? '' : '?id=${_wire(ApiIdentity.profile, id)}'}',
+    _profile,
+  );
+
+  ApiQuery<Rule> rules({int? profileId, bool added = false}) {
+    if (added && profileId == null) {
+      throw ArgumentError('Added rules need a profile identity');
+    }
+    final scope = added
+        ? 'added'
+        : profileId == null
+        ? 'global'
+        : 'profile';
+    return _query(
+      '/api/v1/rules?scope=$scope${profileId == null ? '' : '&profileId=${_wire(ApiIdentity.profile, profileId)}'}',
+      codec.rule,
+    );
+  }
+
+  ApiQuery<int> disabledRuleIds(int profileId) => queryProjection(() async {
+    final receipt = await _readReceipt(
+      '/api/v1/disabled-rules?profileId=${_wire(ApiIdentity.profile, profileId)}',
+      ApiRevisionScope.configuration,
+    );
+    return _tagCollection(
+      _disabled(receipt.data, profileId),
+      ApiIdentity.rule,
+      receipt.revision,
+      '/api/v1/disabled-rules?profileId=${_wire(ApiIdentity.profile, profileId)}',
+    );
+  });
+
+  ApiQuery<T> catalog<T>(ApiCatalog<T> spec, {int? profileId}) =>
+      _query(_catalogPath(spec, profileId: profileId), spec.decode);
+
+  ApiQuery<ProxyDialer> dialers(int profileId) => queryProjection(() async {
+    final receipt = await _readReceipt(
+      '/api/v1/proxy-dialers?profileId=${_wire(ApiIdentity.profile, profileId)}',
+      ApiRevisionScope.configuration,
+    );
+    return _tagCollection(
+      _dialers(receipt.data, profileId),
+      ApiIdentity.profile,
+      receipt.revision,
+      '/api/v1/proxy-dialers?profileId=${_wire(ApiIdentity.profile, profileId)}',
+    );
+  });
+
+  Future<Profile> saveProfile(
+    Profile profile, {
+    ApiEditVersion? editVersion,
+  }) async {
+    if (editVersion != null) _validateVersion(editVersion);
+    final bound = identities.isBound(ApiIdentity.profile, profile.id);
+    final version = _rowVersion(
+      ApiIdentity.profile,
+      profile.id,
+      editVersion,
+      create: !bound,
+    );
+    if (!bound) identities.registerDraft(ApiIdentity.profile, profile.id);
+    final receipt = await _mutate(
+      '/api/v1/profiles:${bound ? 'update' : 'create'}',
+      {
+        if (bound) 'id': _wire(ApiIdentity.profile, profile.id),
+        'profile': codec.profileInput(profile),
+      },
+      editVersion: version,
+      drafts: bound
+          ? const []
+          : [ApiDraftBinding(ApiIdentity.profile, profile.id)],
+      refresh: ['/api/v1/profiles'],
+    );
+    final saved = codec.profile(receipt.data);
+    return _currentRow(receipt, profiles().get, (item) => item.id, saved.id);
+  }
+
+  Future<Profile> setProfileUnfoldSet(int id, Set<String> unfoldSet) async {
+    final profile = await profiles(id: id).getSingle();
+    _storeUnfoldSet(id, unfoldSet);
+    _notify();
+    return profile.copyWith(unfoldSet: Set.unmodifiable(unfoldSet));
+  }
+
+  Profile _profile(Object? data) {
+    final profile = codec.profile(data);
+    final wire = _wire(ApiIdentity.profile, profile.id);
+    return profile.copyWith(
+      unfoldSet: _profileUnfolds.putIfAbsent(
+        (_storeId ?? '', wire),
+        () => Set.unmodifiable(
+          _readProfilePresentation?.call(_storeId ?? '', wire) ?? const {},
+        ),
+      ),
+    );
+  }
+
+  Future<Profile> renameProfile(
+    int id,
+    String label, {
+    required ApiEditVersion editVersion,
+  }) async {
+    _rowVersion(ApiIdentity.profile, id, editVersion);
+    final receipt = await _mutate(
+      '/api/v1/profiles:rename',
+      {'id': _wire(ApiIdentity.profile, id), 'label': label},
+      editVersion: editVersion,
+      refresh: ['/api/v1/profiles'],
+    );
+    return _currentRow(receipt, profiles().get, (item) => item.id, id);
+  }
+
+  Future<Profile> resetDialerOverrides(
+    int id, {
+    required ApiEditVersion editVersion,
+  }) async {
+    _rowVersion(ApiIdentity.profile, id, editVersion);
+    final receipt = await _mutate(
+      '/api/v1/profiles:reset-dialers',
+      {'id': _wire(ApiIdentity.profile, id)},
+      editVersion: editVersion,
+      refresh: ['/api/v1/profiles'],
+    );
+    return _currentRow(receipt, profiles().get, (item) => item.id, id);
+  }
+
+  Future<void> deleteProfile(
+    int id, {
+    required ApiEditVersion editVersion,
+  }) async {
+    await _mutate(
+      '/api/v1/profiles:delete',
+      {'id': _wire(ApiIdentity.profile, id)},
+      editVersion: editVersion,
+      refresh: ['/api/v1/profiles'],
+    );
+  }
+
+  Future<void> reorderProfiles(
+    List<int> ids, {
+    required ApiEditVersion editVersion,
+  }) async {
+    await _mutate(
+      '/api/v1/profiles:reorder',
+      {'ids': _wireIds(ApiIdentity.profile, ids)},
+      editVersion: editVersion,
+      refresh: ['/api/v1/profiles'],
+    );
+  }
+
+  Future<Rule> saveRule(
+    Rule rule, {
+    int? profileId,
+    ApiEditVersion? editVersion,
+  }) async {
+    if (editVersion != null) _validateVersion(editVersion);
+    final bound = identities.isBound(ApiIdentity.rule, rule.id);
+    if (!bound) identities.registerDraft(ApiIdentity.rule, rule.id);
+    final owner = profileId ?? rule.profileId;
+    final version = _rowVersion(
+      ApiIdentity.rule,
+      rule.id,
+      editVersion,
+      create: !bound,
+    );
+    final receipt = await _mutate(
+      '/api/v1/rules:${bound ? 'update' : 'create'}',
+      {
+        if (bound) 'id': _wire(ApiIdentity.rule, rule.id),
+        'rule': codec.ruleInput(rule, profileId: owner),
+      },
+      editVersion: version,
+      drafts: bound ? const [] : [ApiDraftBinding(ApiIdentity.rule, rule.id)],
+      refresh: [_rulesPath(owner)],
+    );
+    return _currentRow(
+      receipt,
+      rules(profileId: owner).get,
+      (item) => item.id,
+      rule.id,
+    );
+  }
+
+  Future<void> deleteRules(
+    Iterable<int> ids, {
+    required ApiEditVersion editVersion,
+  }) async {
+    await _mutate('/api/v1/rules:delete', {
+      'ids': _wireIds(ApiIdentity.rule, ids),
+    }, editVersion: editVersion);
+  }
+
+  Future<void> reorderRules({
+    int? profileId,
+    required List<int> ids,
+    required ApiEditVersion editVersion,
+  }) async {
+    await _mutate(
+      '/api/v1/rules:reorder',
+      {
+        'profileId': profileId == null
+            ? null
+            : _wire(ApiIdentity.profile, profileId),
+        'ids': _wireIds(ApiIdentity.rule, ids),
+      },
+      editVersion: editVersion,
+      refresh: [_rulesPath(profileId)],
+    );
+  }
+
+  Future<List<Rule>> replaceProfileRules(
+    int profileId,
+    List<Rule> rules, {
+    required ApiEditVersion editVersion,
+  }) => replaceRules(profileId, rules, editVersion: editVersion);
+
+  Future<List<Rule>> replaceRules(
+    int? profileId,
+    List<Rule> rules, {
+    required ApiEditVersion editVersion,
+  }) async {
+    _collectionVersion(ApiIdentity.rule, editVersion, _rulesPath(profileId));
+    final drafts = <ApiDraftBinding>[];
+    final inputs = _replacementInputs(
+      ApiIdentity.rule,
+      rules,
+      (value) => value.id,
+      (value) => {
+        ...codec.ruleInput(value),
+        'profileId': profileId == null
+            ? null
+            : _wire(ApiIdentity.profile, profileId),
+      },
+      drafts,
+    );
+    final receipt = await _mutate(
+      '/api/v1/rules:replace',
+      {
+        'profileId': profileId == null
+            ? null
+            : _wire(ApiIdentity.profile, profileId),
+        'rules': inputs,
+      },
+      editVersion: editVersion,
+      drafts: drafts,
+      refresh: [_rulesPath(profileId)],
+    );
+    return _projectCommitted(receipt, this.rules(profileId: profileId).get);
+  }
+
+  Future<void> replaceDisabledRules(
+    int profileId,
+    Iterable<int> ruleIds, {
+    required ApiEditVersion editVersion,
+  }) async {
+    await _mutate('/api/v1/disabled-rules:replace', {
+      'profileId': _wire(ApiIdentity.profile, profileId),
+      'ruleIds': _wireIds(ApiIdentity.rule, ruleIds),
+    }, editVersion: editVersion);
+  }
+
+  Future<T> saveCatalog<T>(
+    ApiCatalog<T> spec,
+    T value, {
+    int? profileId,
+    ApiEditVersion? editVersion,
+  }) async {
+    _requireOwner(spec, profileId);
+    if (editVersion != null) _validateVersion(editVersion);
+    final id = spec.localId(value);
+    final bound = identities.isBound(spec.identity, id);
+    if (!bound) identities.registerDraft(spec.identity, id);
+    final version = _rowVersion(spec.identity, id, editVersion, create: !bound);
+    final receipt = await _mutate(
+      '/api/v1/${spec.resource}:${bound ? 'update' : 'create'}',
+      {
+        if (profileId != null)
+          'profileId': _wire(ApiIdentity.profile, profileId),
+        if (bound) 'id': _wire(spec.identity, id),
+        spec.singular: spec.encode(value),
+      },
+      editVersion: version,
+      drafts: bound ? const [] : [ApiDraftBinding(spec.identity, id)],
+      refresh: [_catalogPath(spec, profileId: profileId)],
+    );
+    return _currentRow(
+      receipt,
+      catalog(spec, profileId: profileId).get,
+      spec.localId,
+      id,
+    );
+  }
+
+  Future<void> deleteCatalog<T>(
+    ApiCatalog<T> spec,
+    Iterable<int> ids, {
+    int? profileId,
+    required ApiEditVersion editVersion,
+  }) async {
+    _requireOwner(spec, profileId);
+    await _mutate(
+      '/api/v1/${spec.resource}:delete',
+      {
+        if (profileId != null)
+          'profileId': _wire(ApiIdentity.profile, profileId),
+        'ids': _wireIds(spec.identity, ids),
+      },
+      editVersion: editVersion,
+      refresh: [_catalogPath(spec, profileId: profileId)],
+    );
+  }
+
+  Future<void> reorderCatalog<T>(
+    ApiCatalog<T> spec,
+    List<int> ids, {
+    int? profileId,
+    required ApiEditVersion editVersion,
+  }) async {
+    _requireOwner(spec, profileId);
+    await _mutate(
+      '/api/v1/${spec.resource}:reorder',
+      {
+        if (profileId != null)
+          'profileId': _wire(ApiIdentity.profile, profileId),
+        'ids': _wireIds(spec.identity, ids),
+      },
+      editVersion: editVersion,
+      refresh: [_catalogPath(spec, profileId: profileId)],
+    );
+  }
+
+  Future<List<T>> replaceCatalog<T>(
+    ApiCatalog<T> spec,
+    List<T> values, {
+    int? profileId,
+    required ApiEditVersion editVersion,
+  }) async {
+    _collectionVersion(
+      spec.identity,
+      editVersion,
+      _catalogPath(spec, profileId: profileId),
+    );
+    _requireOwner(spec, profileId);
+    final drafts = <ApiDraftBinding>[];
+    final inputs = _replacementInputs(
+      spec.identity,
+      values,
+      spec.localId,
+      spec.encode,
+      drafts,
+    );
+    final receipt = await _mutate(
+      '/api/v1/${spec.resource}:replace',
+      {
+        if (profileId != null)
+          'profileId': _wire(ApiIdentity.profile, profileId),
+        spec.plural: inputs,
+      },
+      editVersion: editVersion,
+      drafts: drafts,
+      refresh: [_catalogPath(spec, profileId: profileId)],
+    );
+    return _projectCommitted(receipt, catalog(spec, profileId: profileId).get);
+  }
+
+  Future<void> replaceDialers(
+    int profileId,
+    Map<int, String> dialers, {
+    required ApiEditVersion editVersion,
+  }) async {
+    await _mutate('/api/v1/proxy-dialers:replace', {
+      'profileId': _wire(ApiIdentity.profile, profileId),
+      'dialers': [
+        for (final entry in dialers.entries)
+          {
+            'proxyId': _wire(ApiIdentity.customProxy, entry.key),
+            'target': entry.value,
+          },
+      ],
+    }, editVersion: editVersion);
+  }
+
+  Future<IconSet> refreshIconSet(
+    int id, {
+    required ApiEditVersion editVersion,
+  }) async {
+    _rowVersion(ApiIdentity.iconSet, id, editVersion);
+    final receipt = await _mutate('/api/v1/icon-sets:refresh', {
+      'id': _wire(ApiIdentity.iconSet, id),
+    }, editVersion: editVersion);
+    return _currentRow(receipt, catalog(iconSets).get, (item) => item.id, id);
+  }
+
+  Future<List<IconRecord>> iconRecords({String? url, String? query}) async {
+    if ((url == null) == (query == null)) {
+      throw ArgumentError('Choose url or query');
+    }
+    final path =
+        '/api/v1/icon-cache?${url == null ? 'query=${Uri.encodeQueryComponent(query!)}' : 'url=${Uri.encodeQueryComponent(url)}'}';
+    return _decodeList(
+      (await _readReceipt(path, ApiRevisionScope.cache)).data,
+      codec.iconRecord,
+    );
+  }
+
+  Future<IconRecord> putIcon(String url, {bool touch = false}) async =>
+      codec.iconRecord(
+        (await _mutate('/api/v1/icon-cache:${touch ? 'touch' : 'put'}', {
+          'url': url,
+        }, scope: ApiRevisionScope.cache)).data,
+      );
+
+  Future<void> deleteIcons(Iterable<String> urls) async {
+    await _mutate('/api/v1/icon-cache:delete', {
+      'urls': urls.toList(),
+    }, scope: ApiRevisionScope.cache);
+  }
+
+  Future<IpQualityRecord?> freshIpQuality(String ip, Duration maxAge) async {
+    final receipt = await _readReceipt(
+      '/api/v1/ip-quality-cache?ip=${Uri.encodeQueryComponent(ip)}&maxAgeMillis=${maxAge.inMilliseconds}',
+      ApiRevisionScope.cache,
+      force: true,
+    );
+    final rows = _decodeList(receipt.data, codec.ipQualityRecord);
+    if (rows.length > 1) {
+      throw const WebApiProtocolException('Duplicate IP cache entries');
+    }
+    return rows.firstOrNull;
+  }
+
+  Future<IpQualityRecord> putIpQuality(IpQuality quality) async =>
+      codec.ipQualityRecord(
+        (await _mutate('/api/v1/ip-quality-cache:put', {
+          'quality': quality.toJson(),
+        }, scope: ApiRevisionScope.cache)).data,
+      );
+
+  void onRevisionEvent(String revision, {String? operationId}) {
+    unawaited(
+      handleCommitEvent({
+        'revision': revision,
+        'operationId': operationId,
+      }).catchError((Object error, StackTrace stack) {
+        if (!_closed) _changes.addError(error, stack);
+      }),
+    );
+  }
+
+  Future<void> onReconnect() async {
+    _invalidate(ApiRevisionScope.configuration);
+    _invalidate(ApiRevisionScope.cache);
+    await initialize();
+  }
+
+  Future<ApiReceipt> recoverOperation(
+    String operationId, {
+    bool replay = false,
+    bool resolve = false,
+  }) => _serialize(() async {
+    if (_completed[operationId] case final receipt?) return receipt;
+    final operation = _client.pendingOperation;
+    if (operation == null || operation.operationId != operationId) {
+      throw const WebApiProtocolException('Unknown pending operation');
+    }
+    final barrier = Completer<void>();
+    _writeBarrier = barrier;
+    try {
+      final receipt = await (resolve
+          ? _client.resolveOperation(operationId)
+          : replay
+          ? _client.retryOperation(operationId)
+          : _client.recoverOperation(operationId));
+      _accept(operation, receipt);
+      _client.completeOperation(receipt);
+      _pendingRecoveryError = null;
+      _invalidate(operation.scope, notify: false);
+      _remember(receipt);
+      return receipt;
+    } on WebApiSessionException {
+      rethrow;
+    } on WebApiException catch (error) {
+      if (_client.pendingOperation != null) _pendingRecoveryError = error;
+      if (error.revision case final revision?) {
+        _client.observeRevision(revision, scope: operation.scope);
+      }
+      _invalidate(operation.scope, notify: false);
+      rethrow;
+    } finally {
+      _releaseBarrier(barrier);
+    }
+  });
+
+  ApiQuery<T> _query<T>(String path, T Function(Object?) decode) =>
+      queryProjection(() async {
+        final receipt = await _readReceipt(
+          path,
+          ApiRevisionScope.configuration,
+        );
+        return _tagCollection(
+          _decodeList(receipt.data, decode),
+          _resourceIdentity(path),
+          receipt.revision,
+          path,
+        );
+      });
+
+  Future<ApiReceipt> _readReceipt(
+    String path,
+    ApiRevisionScope scope, {
+    bool bypass = false,
+    bool force = false,
+  }) async {
+    final epoch = _client.sessionEpoch;
+    _client.requireSession(epoch);
+    _requireStore();
+    if (!bypass) await _drainReadBoundary(epoch);
+    if (_storeId == null && path != '/api/v1/meta') {
+      await _readReceipt(
+        '/api/v1/meta',
+        ApiRevisionScope.configuration,
+        bypass: true,
+      );
+    }
+    if (_writeBarrier case final barrier? when !bypass) await barrier.future;
+    _client.requireSession(epoch);
+    if (_client.pendingOperation case final pending? when !bypass) {
+      throw WebApiPendingOperationException(pending.operationId);
+    }
+    final key = (path, scope);
+    if (force) _cache.remove(key);
+    for (var attempt = 0; attempt < 5; attempt++) {
+      final generation = _generation;
+      final cached = _cache[key];
+      if (cached != null && cached.revision == _client.revisionFor(scope)) {
+        return cached;
+      }
+      final readKey = (path, scope, generation, epoch);
+      final future = _reads.putIfAbsent(
+        readKey,
+        () => _client.read(path, scope: scope),
+      );
+      final ApiReceipt receipt;
+      try {
+        receipt = await future;
+      } finally {
+        if (identical(_reads[readKey], future)) {
+          final _ = _reads.remove(readKey);
+        }
+      }
+      _client.requireSession(epoch);
+      if (generation != _generation) continue;
+      if (path == '/api/v1/meta') _acceptMeta(receipt);
+      if (receipt.revision != _client.revisionFor(scope)) continue;
+      final advanced = _cache.entries.any(
+        (entry) =>
+            entry.key.$2 == scope && entry.value.revision != receipt.revision,
+      );
+      _cache.removeWhere(
+        (key, value) => key.$2 == scope && value.revision != receipt.revision,
+      );
+      _cache[key] = receipt;
+      if (advanced) _notify();
+      return receipt;
+    }
+    throw const WebApiException(
+      'revision_unstable',
+      'The server revision changed repeatedly; retry the read',
+    );
+  }
+
+  Future<ApiReceipt> _mutate(
+    String path,
+    Map<String, Object?> payload, {
+    List<ApiDraftBinding> drafts = const [],
+    List<String> refresh = const [],
+    ApiRevisionScope scope = ApiRevisionScope.configuration,
+    ApiEditVersion? editVersion,
+    String? operationId,
+  }) => _serialize(() async {
+    if (scope == ApiRevisionScope.configuration) {
+      if (editVersion == null) {
+        throw const WebApiException(
+          'edit_baseline_required',
+          'Capture the actual read version before issuing a command',
+        );
+      }
+      _validateVersion(editVersion);
+      if (editVersion.scope != ApiRevisionScope.configuration) {
+        throw const WebApiException(
+          'edit_baseline_mismatch',
+          'Cache revisions cannot authorize business commands',
+        );
+      }
+    }
+    if (_client.pendingOperation case final pending?) {
+      throw WebApiPendingOperationException(pending.operationId);
+    }
+    if (_storeId == null) await initialize();
+    if (_client.revisionFor(scope) == null) {
+      await _readReceipt(
+        scope == ApiRevisionScope.configuration
+            ? '/api/v1/meta'
+            : '/api/v1/icon-cache?query=',
+        scope,
+        bypass: true,
+      );
+    }
+    final barrier = Completer<void>();
+    _writeBarrier = barrier;
+    try {
+      ApiReceipt receipt;
+      try {
+        receipt = await _client.command(
+          path,
+          payload,
+          drafts: drafts,
+          scope: scope,
+          expectedRevision: editVersion?.revision,
+          operationId: operationId,
+        );
+      } on WebApiUnknownCommitException catch (error) {
+        if (!_receiptEvents.remove(error.operationId)) rethrow;
+        receipt = await _client.recoverOperation(error.operationId);
+      }
+      final operation = _client.requirePendingReceipt(receipt);
+      try {
+        _accept(operation, receipt);
+      } on WebApiOperationSupersededException {
+        rethrow;
+      } catch (_) {
+        throw WebApiUnknownCommitException(operation.operationId);
+      }
+      _client.completeOperation(receipt);
+      _invalidate(scope, notify: false);
+      _remember(receipt);
+      try {
+        for (final resource in refresh) {
+          await _readReceipt(resource, scope, bypass: true);
+        }
+      } catch (_) {
+        throw WebApiCommittedProjectionException(
+          receipt.operationId!,
+          receipt.revision,
+        );
+      }
+      return receipt;
+    } on WebApiSessionException {
+      rethrow;
+    } on WebApiException catch (error) {
+      if (error.revision case final revision?) {
+        _client.observeRevision(revision, scope: scope);
+      }
+      _invalidate(scope, notify: false);
+      rethrow;
+    } finally {
+      _releaseBarrier(barrier);
+    }
+  });
+
+  Future<T> _serialize<T>(Future<T> Function() body) => runIntent(() {
+    final epoch = _client.sessionEpoch;
+    final run = _queue.then((_) {
+      _client.requireSession(epoch);
+      _requireStore();
+      return body();
+    });
+    _queue = run.then<void>((_) {}, onError: (Object _) {});
+    return run;
+  });
+
+  void _accept(ApiPendingOperation operation, ApiReceipt receipt) {
+    _client.requirePendingReceipt(receipt);
+    if (!identical(_client.pendingOperation, operation) ||
+        receipt.operationId != operation.operationId) {
+      throw const WebApiOperationSupersededException();
+    }
+    if (operation.path == '/api/v1/sources:authorize') {
+      _recordDependencyGrant(operation, receipt);
+      final data = apiObject(receipt.data);
+      if (data['importOperationId'] case final String importOperationId) {
+        requireApiOperationId(importOperationId);
+        _authorizedOperations[importOperationId] = (
+          _storeId!,
+          _client.sessionEpoch,
+          operation.expectedRevision,
+        );
+      }
+    }
+    for (final binding in operation.drafts) {
+      Object? source = binding.index == null
+          ? receipt.data
+          : apiList(receipt.data)[binding.index!];
+      for (final segment in binding.path) {
+        source = segment is int
+            ? apiList(source)[segment]
+            : apiObject(source)[segment];
+      }
+      identities.bindDraft(
+        binding.kind,
+        binding.handle,
+        apiObject(source)['id'],
+      );
+    }
+    final external =
+        _externalDecoders.keys
+            .where(
+              (prefix) =>
+                  operation.path == prefix ||
+                  operation.path.startsWith('$prefix:') ||
+                  operation.path.startsWith('$prefix/'),
+            )
+            .toList()
+          ..sort((a, b) => b.length.compareTo(a.length));
+    if (external.isNotEmpty) {
+      _decodeExternalReceipt(receipt, _externalDecoders[external.first]!);
+      return;
+    }
+    final parts = operation.path.split('/').last.split(':');
+    final resource = parts.first;
+    final command = parts.last;
+    if (command == 'delete') {
+      final data = apiObject(receipt.data);
+      if (resource == 'icon-cache' || resource == 'ip-quality-cache') {
+        final key = resource == 'icon-cache' ? 'deletedUrls' : 'deletedIps';
+        for (final value in apiList(data[key])) {
+          if (value is! String) {
+            throw const WebApiProtocolException('Invalid cache delete receipt');
+          }
+        }
+      } else {
+        for (final value in apiList(data['deletedIds'])) {
+          requireWireId(value, 'deletedIds');
+        }
+      }
+      return;
+    }
+    switch (resource) {
+      case 'profiles':
+        if (command == 'reorder') {
+          _decodeList(receipt.data, codec.profile);
+        } else {
+          codec.profile(receipt.data);
+        }
+      case 'rules':
+        if (command == 'replace' || command == 'reorder') {
+          _decodeList(receipt.data, codec.rule);
+        } else {
+          codec.rule(receipt.data);
+        }
+      case 'disabled-rules':
+        _disabled(receipt.data);
+      case 'proxy-dialers':
+        _dialers(receipt.data);
+      case 'icon-cache':
+        codec.iconRecord(receipt.data);
+      case 'ip-quality-cache':
+        codec.ipQualityRecord(receipt.data);
+      default:
+        final specs = <ApiCatalog<Object>>[
+          groups,
+          proxies,
+          scripts,
+          providers,
+          iconSets,
+          modules,
+        ];
+        final spec = specs
+            .where((item) => item.resource == resource)
+            .firstOrNull;
+        if (spec == null) {
+          throw const WebApiProtocolException('Unsupported operation receipt');
+        }
+        if (command == 'replace' || command == 'reorder') {
+          _decodeList(receipt.data, spec.decode);
+        } else {
+          spec.decode(receipt.data);
+        }
+    }
+  }
+
+  void _acceptMeta(ApiReceipt receipt) {
+    final meta = apiObject(receipt.data, 'meta');
+    final store = meta['storeId'];
+    if (store is! String ||
+        store.isEmpty ||
+        meta['revision'] != receipt.revision) {
+      throw const WebApiProtocolException('Invalid server store identity');
+    }
+    apiInteger(meta['schemaVersion'], 'meta.schemaVersion');
+    _client.bindStore(store);
+    if (_storeId != null && _storeId != store) {
+      _cache.clear();
+      identities.clear();
+      _generation++;
+      _blockedStore = true;
+      throw const WebApiException(
+        'store_changed',
+        'The authoritative store was replaced; reload the session',
+      );
+    }
+    _storeId = store;
+    _client.observeRevision(receipt.revision);
+  }
+
+  List<int> _disabled(Object? value, [int? profileId]) {
+    final data = apiObject(value, 'disabledRules');
+    final owner = codec.id(ApiIdentity.profile, data['profileId']);
+    if (profileId != null &&
+        owner != identities.canonical(ApiIdentity.profile, profileId)) {
+      throw const WebApiProtocolException('Mismatched disabled-rule owner');
+    }
+    final rows = List<int>.unmodifiable([
+      for (final value in apiList(data['ruleIds']))
+        codec.id(ApiIdentity.rule, value),
+    ]);
+    return rows;
+  }
+
+  List<ProxyDialer> _dialers(Object? value, [int? profileId]) {
+    final data = apiObject(value, 'proxyDialers');
+    final owner = codec.id(ApiIdentity.profile, data['profileId']);
+    if (profileId != null &&
+        owner != identities.canonical(ApiIdentity.profile, profileId)) {
+      throw const WebApiProtocolException('Mismatched dialer owner');
+    }
+    return [
+      for (final value in apiList(data['dialers']))
+        codec.proxyDialer({
+          ...apiObject(value),
+          'profileId': data['profileId'],
+        }),
+    ];
+  }
+
+  List<Map<String, Object?>> _replacementInputs<T>(
+    ApiIdentity kind,
+    List<T> values,
+    int Function(T) id,
+    Map<String, Object?> Function(T) encode,
+    List<ApiDraftBinding> drafts,
+  ) {
+    final seen = <int>{};
+    return [
+      for (final (index, value) in values.indexed)
+        (() {
+          final local = id(value);
+          if (!seen.add(identities.canonical(kind, local))) {
+            throw const WebApiProtocolException(
+              'Duplicate identities in replacement',
+            );
+          }
+          final bound = identities.isBound(kind, local);
+          if (!bound) {
+            identities.registerDraft(kind, local);
+            drafts.add(ApiDraftBinding(kind, local, index: index));
+          }
+          return {if (bound) 'id': _wire(kind, local), ...encode(value)};
+        })(),
+    ];
+  }
+
+  String _wire(ApiIdentity kind, int id) => codec.wireId(kind, id);
+
+  List<String> _wireIds(ApiIdentity kind, Iterable<int> ids) {
+    final result = [for (final id in ids) _wire(kind, id)];
+    if (result.toSet().length != result.length) {
+      throw const WebApiProtocolException('Duplicate command identities');
+    }
+    return result;
+  }
+
+  String _catalogPath<T>(ApiCatalog<T> spec, {int? profileId}) =>
+      '/api/v1/${spec.resource}${profileId == null ? '' : '?profileId=${_wire(ApiIdentity.profile, profileId)}'}';
+
+  void _requireOwner<T>(ApiCatalog<T> spec, int? profileId) {
+    if (spec.profileOwned != (profileId != null)) {
+      throw ArgumentError('Invalid resource owner');
+    }
+  }
+
+  String _rulesPath(int? profileId) =>
+      '/api/v1/rules?scope=${profileId == null ? 'global' : 'profile'}${profileId == null ? '' : '&profileId=${_wire(ApiIdentity.profile, profileId)}'}';
+
+  List<T> _decodeList<T>(Object? value, T Function(Object?) decode) =>
+      List.unmodifiable([for (final item in apiList(value)) decode(item)]);
+
+  void _invalidate(ApiRevisionScope scope, {bool notify = true}) {
+    _generation++;
+    _cache.removeWhere((key, _) => key.$2 == scope);
+    if (notify) _notify();
+  }
+
+  void _notify() {
+    if (_closed || _notifyQueued) return;
+    _notifyQueued = true;
+    scheduleMicrotask(() {
+      _notifyQueued = false;
+      if (!_closed) _changes.add(null);
+    });
+  }
+
+  void _releaseBarrier(Completer<void> barrier) {
+    if (identical(_writeBarrier, barrier)) _writeBarrier = null;
+    if (!barrier.isCompleted) barrier.complete();
+    _notify();
+  }
+
+  Future<T> _projectCommitted<T>(
+    ApiReceipt receipt,
+    Future<T> Function() read,
+  ) async {
+    try {
+      return await read();
+    } on WebApiSessionException {
+      rethrow;
+    } catch (_) {
+      throw WebApiCommittedProjectionException(
+        receipt.operationId!,
+        receipt.revision,
+      );
+    }
+  }
+
+  Future<T> _currentRow<T>(
+    ApiReceipt receipt,
+    Future<List<T>> Function() read,
+    int Function(T) id,
+    int expectedId,
+  ) => _projectCommitted(
+    receipt,
+    () async => (await read()).firstWhere((item) => id(item) == expectedId),
+  );
+
+  void _storeUnfoldSet(int id, Set<String> value) {
+    final wire = _wire(ApiIdentity.profile, id);
+    final stored = Set<String>.unmodifiable(value);
+    _writeProfilePresentation?.call(_storeId!, wire, stored);
+    _profileUnfolds[(_storeId!, wire)] = stored;
+  }
+
+  void _validateVersion(ApiEditVersion token) {
+    if (!identical(token._issuer, _tokenIssuer)) {
+      throw const WebApiException(
+        'edit_issuer_mismatch',
+        'The edit version belongs to another repository',
+      );
+    }
+    _client.requireSession(token._epoch);
+    _requireStore();
+    if (token.storeId != _storeId) {
+      throw const WebApiException(
+        'edit_store_changed',
+        'The edit belongs to another authoritative store',
+      );
+    }
+    requireApiRevision(token.revision);
+  }
+
+  ApiEditVersion _rowVersion(
+    ApiIdentity kind,
+    int id,
+    ApiEditVersion? token, {
+    bool create = false,
+  }) {
+    if (token == null) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'Save requires the original read version, not the latest global revision',
+      );
+    }
+    _validateVersion(token);
+    if (token.kind != kind ||
+        (create
+            ? token._subject != _EditSubject.create
+            : token._subject != _EditSubject.row ||
+                  token._wireId != _wire(kind, id))) {
+      throw const WebApiException(
+        'edit_baseline_mismatch',
+        'The edit version belongs to another resource',
+      );
+    }
+    return token;
+  }
+
+  void _collectionVersion(ApiIdentity kind, ApiEditVersion token, String path) {
+    _validateVersion(token);
+    if (token.kind != kind ||
+        token._subject != _EditSubject.collection ||
+        token._readPath != path) {
+      throw const WebApiException(
+        'edit_baseline_mismatch',
+        'Replacement requires the original complete owner collection',
+      );
+    }
+  }
+
+  T _decodeExternalReceipt<T>(ApiReceipt receipt, T Function(Object?) decode) {
+    final value = decode(receipt.data);
+    if (value is! ApiCanonicalProjectionCarrier) return value;
+    final projections = List<ApiCanonicalProjection>.of(
+      value.canonicalProjections,
+      growable: false,
+    );
+    if (projections.isEmpty) return value;
+    _requireCanonicalMutationReceipt(receipt);
+    final fingerprints = <String>[];
+    for (final projection in projections) {
+      final matches = switch ((projection.kind, projection.model)) {
+        (ApiIdentity.profile, Profile()) ||
+        (ApiIdentity.script, Script()) ||
+        (ApiIdentity.clashProvider, ClashProvider()) ||
+        (ApiIdentity.mitmModule, MitmModule()) => true,
+        _ => false,
+      };
+      if (!matches ||
+          !identities.isBound(projection.kind, _modelId(projection.model))) {
+        throw const WebApiProtocolException(
+          'Expected an already bound canonical model of the declared kind',
+        );
+      }
+      fingerprints.add(_fingerprint(projection.model));
+    }
+    for (final (index, projection) in projections.indexed) {
+      Object? node = receipt.data;
+      for (final segment in projection.path) {
+        if (segment is String && node is Map && node.containsKey(segment)) {
+          node = node[segment];
+        } else if (segment is int &&
+            node is List &&
+            segment >= 0 &&
+            segment < node.length) {
+          node = node[segment];
+        } else {
+          throw const WebApiProtocolException(
+            'Canonical projection path is absent from the mutation receipt',
+          );
+        }
+      }
+      final canonical = switch (projection.kind) {
+        ApiIdentity.profile => codec.profile(node),
+        ApiIdentity.script => codec.script(node),
+        ApiIdentity.clashProvider => codec.clashProvider(node),
+        ApiIdentity.mitmModule => codec.mitmModule(node),
+        _ => throw const WebApiProtocolException(
+          'Unsupported canonical projection kind',
+        ),
+      };
+      if (fingerprints[index] != _fingerprint(canonical)) {
+        throw const WebApiProtocolException(
+          'Canonical model does not match the original mutation receipt',
+        );
+      }
+    }
+    _requireCanonicalMutationReceipt(receipt);
+    for (final projection in projections) {
+      _tagRow(projection.model, projection.kind, receipt.revision);
+    }
+    return value;
+  }
+
+  void _requireCanonicalMutationReceipt(ApiReceipt receipt) {
+    _client.requireSession(_client.sessionEpoch);
+    _requireStore();
+    if (!_client.ownsReceipt(receipt) ||
+        _storeId == null ||
+        _storeId != _client.boundStoreId ||
+        _client.receiptScope(receipt) != ApiRevisionScope.configuration ||
+        receipt.operationId == null) {
+      throw const WebApiProtocolException(
+        'Canonical models require an owned configuration mutation receipt',
+      );
+    }
+    if (!identical(_completed[receipt.operationId], receipt)) {
+      _client.requirePendingReceipt(receipt);
+    }
+  }
+
+  T _tagRow<T>(T value, ApiIdentity kind, String revision, {String? readPath}) {
+    if (value is! Object) {
+      throw const WebApiProtocolException('Missing canonical model');
+    }
+    final id = _modelId(value);
+    _sources[value] = ApiEditVersion._(
+      issuer: _tokenIssuer,
+      storeId: _storeId!,
+      revision: revision,
+      kind: kind,
+      localId: id,
+      epoch: _client.sessionEpoch,
+      subject: _EditSubject.row,
+      wireId: _wire(kind, id),
+      fingerprint: _fingerprint(value),
+      readPath: readPath,
+    );
+    return value;
+  }
+
+  List<T> _tagCollection<T>(
+    List<T> rows,
+    ApiIdentity kind,
+    String revision,
+    String path,
+  ) {
+    final ids = <int>{};
+    for (final row in rows) {
+      if (row is Profile ||
+          row is Rule ||
+          row is ProxyGroup ||
+          row is CustomProxy ||
+          row is Script ||
+          row is ClashProvider ||
+          row is IconSet ||
+          row is MitmModule) {
+        final id = _modelId(row as Object);
+        if (!ids.add(id)) {
+          throw const WebApiProtocolException(
+            'Duplicate resource identity in API collection',
+          );
+        }
+        _tagRow(row, kind, revision, readPath: path);
+      }
+    }
+    _sources[rows] = ApiEditVersion._(
+      issuer: _tokenIssuer,
+      storeId: _storeId!,
+      revision: revision,
+      kind: kind,
+      localId: null,
+      epoch: _client.sessionEpoch,
+      subject: _EditSubject.collection,
+      fingerprint: _fingerprint(rows),
+      readPath: path,
+    );
+    return rows;
+  }
+
+  ApiIdentity _resourceIdentity(String path) =>
+      switch (Uri.parse(path).path.split('/').last) {
+        'profiles' => ApiIdentity.profile,
+        'rules' => ApiIdentity.rule,
+        'proxy-groups' => ApiIdentity.proxyGroup,
+        'custom-proxies' => ApiIdentity.customProxy,
+        'scripts' => ApiIdentity.script,
+        'clash-providers' => ApiIdentity.clashProvider,
+        'icon-sets' => ApiIdentity.iconSet,
+        'mitm-modules' => ApiIdentity.mitmModule,
+        _ => throw const WebApiProtocolException('Unknown model collection'),
+      };
+
+  int _modelId(Object value) => switch (value) {
+    Profile(:final id) ||
+    Rule(:final id) ||
+    ProxyGroup(:final id) ||
+    CustomProxy(:final id) ||
+    Script(:final id) ||
+    ClashProvider(:final id) ||
+    IconSet(:final id) ||
+    MitmModule(:final id) => id,
+    _ => throw const WebApiProtocolException(
+      'Unknown canonical model identity',
+    ),
+  };
+
+  Object? _modelDocument(Object? value) => switch (value) {
+    Profile() => {
+      'id': _wire(ApiIdentity.profile, value.id),
+      ...codec.profileInput(value),
+      'lastUpdateDate': value.lastUpdateDate?.toIso8601String(),
+      'subscriptionInfo': value.subscriptionInfo?.toJson(),
+      'order': value.order,
+    },
+    Rule() => {
+      'id': _wire(ApiIdentity.rule, value.id),
+      ...codec.ruleInput(value),
+      'order': value.order,
+    },
+    ProxyGroup() => {
+      'id': _wire(ApiIdentity.proxyGroup, value.id),
+      'profileId': value.profileId == null
+          ? null
+          : _wire(ApiIdentity.profile, value.profileId!),
+      ...codec.proxyGroupInput(value),
+      'order': value.order,
+    },
+    CustomProxy() => {
+      'id': _wire(ApiIdentity.customProxy, value.id),
+      ...codec.customProxyInput(value),
+      'order': value.order,
+    },
+    Script() => {
+      'id': _wire(ApiIdentity.script, value.id),
+      ...codec.scriptInput(value),
+      'lastUpdateTime': value.lastUpdateTime.toIso8601String(),
+      'order': value.order,
+    },
+    ClashProvider() => {
+      'id': _wire(ApiIdentity.clashProvider, value.id),
+      ...codec.clashProviderInput(value),
+      'behavior': value.behavior.name,
+      'format': value.format.name,
+      'order': value.order,
+    },
+    IconSet() => {
+      'id': _wire(ApiIdentity.iconSet, value.id),
+      ...codec.iconSetInput(value),
+      'lastUpdateTime': value.lastUpdateTime?.toIso8601String(),
+      'order': value.order,
+    },
+    MitmModule() => {
+      'id': _wire(ApiIdentity.mitmModule, value.id),
+      ...codec.mitmModuleInput(value),
+      'resources': value.resources,
+      'scripts': value.scripts,
+      'lastUpdateTime': value.lastUpdateTime.toIso8601String(),
+      'order': value.order,
+    },
+    ProxyDialer() => {
+      'profileId': _wire(ApiIdentity.profile, value.profileId),
+      'proxyId': _wire(ApiIdentity.customProxy, value.proxyId),
+      'target': value.target,
+    },
+    List() => [for (final item in value) _modelDocument(item)],
+    Map() => {
+      for (final entry in value.entries)
+        entry.key.toString(): _modelDocument(entry.value),
+    },
+    _ => value,
+  };
+
+  String _fingerprint(Object value) => _jsonFingerprint(_modelDocument(value));
+
+  String _jsonFingerprint(Object? value) {
+    Object? ordered(Object? item) => switch (item) {
+      Map() => {
+        for (final key
+            in item.keys.map((key) => key.toString()).toList()..sort())
+          key: ordered(item[key]),
+      },
+      List() => [for (final child in item) ordered(child)],
+      _ => item,
+    };
+    return sha256.convert(utf8.encode(jsonEncode(ordered(value)))).toString();
+  }
+
+  void _requireStore() {
+    if (_blockedStore) {
+      throw const WebApiException(
+        'store_changed',
+        'Reload the replaced store before continuing',
+      );
+    }
+  }
+
+  void _remember(ApiReceipt receipt) {
+    final operationId = receipt.operationId!;
+    _completed[operationId] = receipt;
+    _receiptEvents.remove(operationId);
+    if (_completed.length > 64) _completed.remove(_completed.keys.first);
+  }
+
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    await _sessionSubscription.cancel();
+    await _client.close();
+    identities.clear();
+    _cache.clear();
+    _completed.clear();
+    _authorizedOperations.clear();
+    _preparedOperations.clear();
+    _dependencyPreparations.clear();
+    _dependencyGrants.clear();
+    _profileUnfolds.clear();
+    await _changes.close();
+  }
+}

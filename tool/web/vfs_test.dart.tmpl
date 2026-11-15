@@ -1,14 +1,13 @@
 import 'dart:js_interop';
+import 'dart:typed_data';
 
 import 'package:rust_api/dart_io.dart' as io;
 import 'package:rust_api/vfs.dart';
 
-// WEBPANEL.md: host integration probes remain unavailable; virtual I/O errors fail loudly.
-@JS('window.__webTestRequests')
-external int get requestCount;
-
-@JS('window.__webTestMode')
-external set testMode(JSString value);
+// WEBPANEL.md: Web keeps only ephemeral /tmp and /downloads; every persistent
+// resource is owned by its typed API and a file path reaching it must fail.
+@JS('window.__vfsTestReport')
+external void _report(JSString message);
 
 void expect(bool condition, String message) {
   if (!condition) throw StateError(message);
@@ -24,48 +23,199 @@ void expectFailure(void Function() operation, String message) {
   expect(failed, message);
 }
 
-void main() {
-  final fs = WebFileSystem.instance;
-  expect(!io.Directory('/run/systemd/system').existsSync(), 'The browser must not advertise the native Linux helper');
-  for (final path in ['/usr/bin/pkexec', '/proc/self/status', '/etc/ssl/certs',
-                      '/sys/class/net', '/data/../../run/systemd/system',
-                      '/database', '/tmp-other', '/downloads-other']) {
-    expect(!fs.exists(path), 'Native host probes must be absent: $path');
+Future<void> main() async {
+  try {
+    await _run();
+    _report('pass'.toJS);
+  } catch (error, stack) {
+    _report('fail: $error\n$stack'.toJS);
   }
-  expect(requestCount == 0, 'Host probes must not issue any backend or snapshot request');
-  testMode = 'snapshot-failure'.toJS;
-  expectFailure(fs.ensureInitialized, 'Snapshot failures must not become an empty successful filesystem');
-  testMode = 'success'.toJS;
-  fs.ensureInitialized();
-  expect(fs.readBytes('/data/existing')[0] == 1, 'Snapshot retry must load server data');
-  testMode = 'stat-failure'.toJS;
-  for (final path in ['/data/missing', '/tmp/missing']) {
-    expectFailure(() => fs.stat(path), 'Real virtual-path I/O errors must not become missing files: $path');
+}
+
+Future<void> _run() async {
+  final fs = WebFileSystem.instance;
+  for (final directory in const [
+    '/',
+    '/data',
+    '/data/profiles',
+    '/data/providers',
+    '/tmp',
+    '/downloads',
+  ]) {
+    expect(fs.isDirectory(directory), 'Fixed directory missing: $directory');
+  }
+  for (final path in const [
+    '/run/systemd/system',
+    '/etc/passwd',
+    '/proc/self/status',
+    '/sys/class/net',
+    '/data/../../run/systemd/system',
+  ]) {
+    expect(!fs.exists(path), 'Host path must not exist: $path');
+  }
+  expect(
+    !io.Directory('/run/systemd/system').existsSync(),
+    'The browser must not advertise the native Linux helper',
+  );
+  expectFailure(
+    () => fs.normalize('/tmp/a\u0000b'),
+    'NUL path must be rejected',
+  );
+
+  for (final operation in <void Function()>[
+    () => fs.writeBytes('/data/database.sqlite', [1]),
+    () => fs.writeBytes('/data/profiles/1.yaml', [1]),
+    () => fs.writeBytes('relative.txt', [1]),
+    () => fs.writeBytes('/run/escape', [1]),
+    () => fs.mkdir('/data/cache'),
+    () => fs.mkdir('/data/profiles/nested'),
+    () => fs.readBytes('/data/existing'),
+    () => fs.delete('/data/profiles'),
+    () => fs.rename('/tmp/absent', '/data/moved'),
+    () => fs.copy('/data/existing', '/tmp/copied'),
+    () => io.File('/data/database.sqlite').createSync(),
+    () => io.File('/etc/passwd').writeAsStringSync('x'),
+    () => io.Directory('/data/cache').createSync(recursive: true),
+    () => io.File('/data/existing').readAsBytesSync(),
+  ]) {
+    expectFailure(operation, 'Persistent resource operation must fail');
+  }
+  expectFailure(
+    () => fs.stat('/data/cache'),
+    'A failed persistent mkdir must not become addressable',
+  );
+  expectFailure(
+    () => fs.stat('/data/database.sqlite'),
+    'A failed persistent write must not become addressable',
+  );
+  expectFailure(
+    () => fs.stat('relative.txt'),
+    'A relative path must not fall back to /tmp',
+  );
+  expect(
+    fs.isDirectory('/data/profiles'),
+    'A failed persistent delete must keep the fixed directory',
+  );
+
+  final file = io.File('/tmp/a.txt');
+  file.writeAsStringSync('hello');
+  expect(file.existsSync(), 'An ephemeral write must create the file');
+  expect(file.readAsStringSync() == 'hello', 'Ephemeral read-back must match');
+  expect(file.lengthSync() == 5, 'Ephemeral length must match');
+  file.writeAsBytesSync([33], mode: io.FileMode.append);
+  expect(file.readAsStringSync() == 'hello!', 'Append must extend the buffer');
+  expect(
+    io.File('/tmp/missing.txt').existsSync() == false,
+    'Missing ephemeral file must not exist',
+  );
+
+  final copy = file.copySync('/tmp/b.txt');
+  expect(copy.readAsStringSync() == 'hello!', 'Copy must preserve contents');
+  final renamed = copy.renameSync('/tmp/c.txt');
+  expect(
+    renamed.readAsStringSync() == 'hello!',
+    'Rename must preserve contents',
+  );
+  expect(!io.File('/tmp/b.txt').existsSync(), 'Rename must remove the source');
+  final chunk = await renamed.openRead(0, 3).first;
+  expect(
+    String.fromCharCodes(chunk) == 'hel',
+    'openRead must honour start and end',
+  );
+
+  final randomAccess = io.File(
+    '/tmp/raf.txt',
+  ).openSync(mode: io.FileMode.write);
+  randomAccess.writeStringSync('abc');
+  randomAccess.setPositionSync(1);
+  randomAccess.writeStringSync('Z');
+  randomAccess.flushSync();
+  randomAccess.closeSync();
+  expect(
+    io.File('/tmp/raf.txt').readAsStringSync() == 'aZc',
+    'Random access writes must land',
+  );
+
+  final work = io.Directory('/tmp/work/deep');
+  work.createSync(recursive: true);
+  io.File('/tmp/work/deep/one.bin').writeAsBytesSync([1, 2]);
+  io.File('/tmp/work/two.bin').writeAsBytesSync([3]);
+  expect(
+    io.Directory('/tmp/work').listSync().length == 2,
+    'Shallow listing must show children',
+  );
+  expect(
+    io.Directory('/tmp/work').listSync(recursive: true).length == 3,
+    'Recursive listing must descend',
+  );
+  expectFailure(
+    () => io.Directory('/tmp/work').deleteSync(),
+    'A non-empty ephemeral directory must not be deleted without recursive',
+  );
+  io.Directory('/tmp/work').deleteSync(recursive: true);
+  expect(
+    !io.Directory('/tmp/work').existsSync(),
+    'Recursive delete must remove the tree',
+  );
+  expectFailure(
+    () => io.Directory('/tmp/work/missing').createSync(),
+    'A missing ephemeral parent must not be created without recursive',
+  );
+
+  io.File('/tmp/report.bin').writeAsBytesSync([7, 8, 9]);
+  io.File('/tmp/report.bin').renameSync('/downloads/report.bin');
+  expect(
+    io.File('/downloads/report.bin').readAsBytesSync().join(',') == '7,8,9',
+    'A download buffer must stay readable after rename',
+  );
+
+  expectFailure(
+    () => fs.writeBytes('/tmp/too-big', Uint8List(32 * 1024 * 1024 + 1)),
+    'A temporary buffer above 32 MiB must be rejected',
+  );
+  final exact = Uint8List(32 * 1024 * 1024);
+  fs.writeBytes('/tmp/exact', exact);
+  expect(
+    io.File('/tmp/exact').lengthSync() == 32 * 1024 * 1024,
+    'Exactly 32 MiB must be allowed',
+  );
+  fs.delete('/tmp/exact');
+
+  expectFailure(
+    () => fs.mkdir('/tmp/${List.filled(2100, 'd').join('/')}', recursive: true),
+    'The 2048-node budget must be enforced',
+  );
+  fs.mkdir('/tmp/after-budget', recursive: true);
+  expect(
+    fs.isDirectory('/tmp/after-budget'),
+    'A failed budget must not poison later writes',
+  );
+  for (final name in const ['a.txt', 'c.txt', 'raf.txt']) {
+    io.File('/tmp/$name').deleteSync();
+  }
+  io.File('/downloads/report.bin').deleteSync();
+
+  for (final name in const ['m1', 'm2', 'm3']) {
+    fs.writeBytes('/tmp/$name', exact);
+  }
+  expectFailure(
+    () => fs.writeBytes('/tmp/m4', [1]),
+    'The 96 MiB total budget must be enforced',
+  );
+  fs.delete('/tmp/m1');
+  fs.writeBytes('/tmp/m4', [1]);
+  expect(fs.exists('/tmp/m4'), 'Releasing memory must allow a later write');
+  for (final name in const ['m2', 'm3', 'm4']) {
+    fs.delete('/tmp/$name');
   }
 
-  for (final mode in ['failure', 'unauthorized', 'malformed']) {
-    testMode = mode.toJS;
-    expectFailure(() => fs.writeBytes('/data/existing', [9]), 'Write must fail: $mode');
-    expect(fs.readBytes('/data/existing')[0] == 1, 'Failed write must preserve cached bytes: $mode');
-    expectFailure(() => fs.writeBytes('/data/existing', [9], append: true), 'Append must fail: $mode');
-    expect(fs.readBytes('/data/existing').length == 1, 'Failed append must preserve cached length: $mode');
-    expectFailure(() => fs.mkdir('/data/new-dir'), 'Mkdir must fail: $mode');
-    expectFailure(() => fs.delete('/data/existing'), 'Delete must fail: $mode');
-    expect(fs.exists('/data/existing'), 'Failed delete must preserve cache: $mode');
-    expectFailure(() => fs.rename('/data/existing', '/data/renamed'), 'Rename must fail: $mode');
-    expect(fs.exists('/data/existing'), 'Failed rename must preserve source: $mode');
-    expectFailure(() => fs.copy('/data/remote', '/data/copied'), 'Copy must fail: $mode');
-  }
-  testMode = 'success'.toJS;
-  expect(!fs.exists('/data/new-dir'), 'Failed mkdir must not populate cache');
-  expect(!fs.exists('/data/renamed'), 'Failed rename must not populate target cache');
-  expect(!fs.exists('/data/copied'), 'Failed copy must not populate target cache');
-  fs.writeBytes('/data/saved', [4, 5]);
-  expect(fs.readBytes('/data/saved')[1] == 5, 'Acknowledged writes must populate cache');
-  fs.mkdir('/data/created');
-  expect(fs.isDirectory('/data/created'), 'Acknowledged mkdir must populate cache');
-  fs.rename('/data/existing', '/data/moved');
-  expect(fs.readBytes('/data/moved')[0] == 1, 'Acknowledged rename must preserve contents');
-  fs.delete('/data/moved');
-  expect(!fs.exists('/data/moved'), 'Acknowledged deletion must clear cache');
+  final interfaces = await io.NetworkInterface.list();
+  expect(
+    interfaces.isNotEmpty,
+    'The typed network-interface resource must answer',
+  );
+  expect(
+    interfaces.first.name == 'eth0',
+    'The typed network-interface resource must be decoded',
+  );
 }

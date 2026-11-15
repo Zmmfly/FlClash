@@ -1,0 +1,19 @@
+import 'dart:typed_data';
+
+import 'client.dart';
+
+class ApiAttachment {
+  const ApiAttachment({
+    required this.bytes,
+    required this.revision,
+    required this.readReceipt,
+    this.mediaType,
+    this.filename,
+  });
+
+  final Uint8List bytes;
+  final String revision;
+  final String? mediaType;
+  final String? filename;
+  final ApiReceipt readReceipt;
+}

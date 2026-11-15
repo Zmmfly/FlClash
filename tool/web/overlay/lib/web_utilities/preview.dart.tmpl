@@ -1,0 +1,131 @@
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_workflows/index.dart';
+import 'package:flutter/widgets.dart';
+
+import 'models.dart';
+import 'utilities.dart';
+
+class WebUtilityIconPreparation {
+  const WebUtilityIconPreparation({
+    required this.url,
+    required this.preparation,
+    required this.editVersion,
+  });
+  final String url;
+  final WebSourceConsentPreparation preparation;
+  final ApiEditVersion editVersion;
+}
+
+Future<WebUtilityIconPreparation> prepareWebUtilityIcon(
+  WebUtilities utility,
+  String url,
+) async {
+  final repository = utility.repository;
+  final baseline = await repository.readExternal('/api/v1/meta');
+  final version = repository.captureReadVersion(baseline);
+  final key = {'kind': 'icon-image', 'id': utilitySourceId(url)};
+  final receipt = await repository.queryExternal('/api/v1/sources:prepare', {
+    'expectedRevision': version.revision,
+    'purpose': 'icon-image',
+    'key': key,
+  });
+  final raw = apiObject(receipt.data, 'icon source preparation');
+  final actualKey = apiObject(raw['key'], 'icon source key');
+  if (receipt.revision != version.revision ||
+      actualKey['kind'] != key['kind'] ||
+      actualKey['id'] != key['id'] ||
+      actualKey['name'] != null && actualKey['name'] != '') {
+    throw const WebApiProtocolException(
+      'Icon preparation changed the owned resource',
+    );
+  }
+  final preparation = WebSourceConsentPreparation.decode(raw);
+  final requested = Uri.tryParse(url);
+  final port = requested?.hasPort == true
+      ? requested!.port
+      : requested?.scheme == 'https'
+      ? 443
+      : 80;
+  if (preparation.purpose != 'icon-image' ||
+      requested == null ||
+      preparation.host != requested.host.toLowerCase() ||
+      preparation.scheme != requested.scheme ||
+      preparation.port != port) {
+    throw const WebApiProtocolException(
+      'Unexpected icon source purpose or origin',
+    );
+  }
+  return WebUtilityIconPreparation(
+    url: url,
+    preparation: preparation,
+    editVersion: version,
+  );
+}
+
+Future<void> authorizeWebUtilityIcon(
+  WebUtilities utility,
+  WebUtilityIconPreparation source,
+) async {
+  final repository = utility.repository;
+  repository.requireReadVersion(source.editVersion);
+  final grant = await repository.executeExternalCommand(
+    '/api/v1/sources:authorize',
+    {
+      'preparationId': source.preparation.preparationId,
+      'urlDigest': source.preparation.urlDigest,
+      'intent': 'authorize-server-private-source',
+    },
+    (value) {
+      final data = apiObject(value, 'icon source authorization');
+      final id = utilityString(
+        data['authorizationId'],
+        'icon source authorization.id',
+      );
+      utilityTime(data['expiresAt'], 'icon source authorization.expiresAt');
+      if (!RegExp(r'^[A-Za-z0-9_-]{16,128}$').hasMatch(id)) {
+        throw const WebApiProtocolException(
+          'Invalid icon authorization identity',
+        );
+      }
+      return id;
+    },
+    editVersion: source.editVersion,
+  );
+  utility.rememberIconGrant(source.url, grant);
+}
+
+final _activeIconPreviews = Expando<bool>();
+
+Future<bool> previewWebUtilityIcon(
+  WebUtilities utility,
+  BuildContext context,
+  String url,
+) {
+  if (_activeIconPreviews[context] == true) return Future.value(false);
+  _activeIconPreviews[context] = true;
+  try {
+    return utility.repository
+        .runIntent(() async {
+          if (!context.mounted) return false;
+          await utility.registerIconPreview(url);
+          if (!context.mounted) return false;
+          final source = await prepareWebUtilityIcon(utility, url);
+          if (!context.mounted) return false;
+          if (source.preparation.requiresPrivateNetworkConfirmation) {
+            if (!await showWebSourceConsent(
+              source.preparation,
+              context: context,
+            )) {
+              return false;
+            }
+            if (!context.mounted) return false;
+            await authorizeWebUtilityIcon(utility, source);
+          }
+          return true;
+        })
+        .whenComplete(() => _activeIconPreviews[context] = null);
+  } catch (_) {
+    _activeIconPreviews[context] = null;
+    rethrow;
+  }
+}

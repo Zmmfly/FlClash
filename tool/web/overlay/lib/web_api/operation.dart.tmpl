@@ -1,0 +1,98 @@
+import 'identity.dart';
+
+enum ApiRevisionScope { configuration, cache }
+
+class ApiDraftBinding {
+  const ApiDraftBinding(
+    this.kind,
+    this.handle, {
+    this.index,
+    this.path = const [],
+  });
+
+  final ApiIdentity kind;
+  final int handle;
+  final int? index;
+  final List<Object> path;
+
+  Map<String, Object?> toJson() => {
+    'kind': kind.name,
+    'handle': handle,
+    'index': index,
+    'path': path,
+  };
+
+  factory ApiDraftBinding.fromJson(Map<String, Object?> json) =>
+      ApiDraftBinding(
+        ApiIdentity.values.byName(json['kind'] as String),
+        json['handle'] as int,
+        index: json['index'] as int?,
+        path: List<Object>.from(json['path'] as List? ?? const []),
+      );
+}
+
+class ApiPendingOperation {
+  const ApiPendingOperation({
+    required this.operationId,
+    required this.path,
+    required this.expectedRevision,
+    this.scope = ApiRevisionScope.configuration,
+    this.origin,
+    this.storeId,
+    this.body,
+    this.drafts = const [],
+  });
+
+  final String operationId;
+  final String path;
+  final String expectedRevision;
+  final ApiRevisionScope scope;
+  final String? origin;
+  final String? storeId;
+  final String? body;
+  final List<ApiDraftBinding> drafts;
+
+  Map<String, Object?> toJournal() => {
+    'operationId': operationId,
+    'path': path,
+    'expectedRevision': expectedRevision,
+    'scope': scope.name,
+    'origin': origin,
+    'storeId': storeId,
+    'drafts': [for (final binding in drafts) binding.toJson()],
+  };
+
+  factory ApiPendingOperation.fromJournal(Map<String, Object?> json) =>
+      ApiPendingOperation(
+        operationId: json['operationId'] as String,
+        path: json['path'] as String,
+        expectedRevision: json['expectedRevision'] as String,
+        scope: ApiRevisionScope.values.byName(json['scope'] as String),
+        origin: json['origin'] as String?,
+        storeId: json['storeId'] as String?,
+        drafts: [
+          for (final value in json['drafts'] as List)
+            ApiDraftBinding.fromJson(Map<String, Object?>.from(value as Map)),
+        ],
+      );
+}
+
+abstract interface class ApiOperationJournal {
+  ApiPendingOperation? read();
+  void write(ApiPendingOperation operation);
+  void clear();
+}
+
+class MemoryApiOperationJournal implements ApiOperationJournal {
+  ApiPendingOperation? _pending;
+
+  @override
+  ApiPendingOperation? read() => _pending;
+
+  @override
+  void write(ApiPendingOperation operation) =>
+      _pending = ApiPendingOperation.fromJournal(operation.toJournal());
+
+  @override
+  void clear() => _pending = null;
+}

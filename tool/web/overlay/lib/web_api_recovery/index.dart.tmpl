@@ -1,0 +1,310 @@
+import 'dart:async';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+
+Future<void> waitForWebApiRecovery(WebApiRepository repository) async {
+  if (repository.pendingOperation == null) return;
+  final done = Completer<void>();
+  runApp(
+    WebApiRecoveryApp(
+      repository: repository,
+      onResolved: () {
+        if (!done.isCompleted) done.complete();
+      },
+    ),
+  );
+  await done.future;
+}
+
+class WebApiRecoveryController extends ChangeNotifier {
+  WebApiRecoveryController(this.repository, {required this.onResolved})
+    : _sessionEpoch = repository.client.sessionEpoch {
+    _sessionSubscription = repository.sessionChanges.listen((_) {
+      if (!_disposed) notifyListeners();
+    });
+  }
+
+  final WebApiRepository repository;
+  final VoidCallback onResolved;
+  final int _sessionEpoch;
+  late final StreamSubscription<void> _sessionSubscription;
+  bool busy = false;
+  bool _disposed = false;
+  bool _completed = false;
+  String? errorCode;
+
+  ApiPendingOperation? get pending => repository.pendingOperation;
+  bool get canRecover {
+    final operation = pending;
+    return !_disposed &&
+        !busy &&
+        repository.isSessionActive &&
+        repository.client.sessionEpoch == _sessionEpoch &&
+        operation != null &&
+        operation.origin == repository.client.origin &&
+        operation.storeId == repository.client.boundStoreId;
+  }
+
+  bool get canReplay => canRecover && pending?.body != null;
+
+  Future<void> recover({bool resolve = false, bool replay = false}) async {
+    if (!canRecover || replay && !canReplay) return;
+    final operation = pending!;
+    busy = true;
+    errorCode = null;
+    notifyListeners();
+    try {
+      await repository.recoverOperation(
+        operation.operationId,
+        resolve: resolve,
+        replay: replay,
+      );
+    } on WebApiException catch (error) {
+      errorCode = error.code;
+    } catch (_) {
+      errorCode = 'request_failed';
+    } finally {
+      busy = false;
+      if (!_disposed) {
+        notifyListeners();
+        _finishIfSettled();
+      }
+    }
+  }
+
+  void acknowledge() {
+    if (_disposed || busy || pending == null) return;
+    repository.ackPendingUnrecoverable(
+      pending!.operationId,
+      intent: 'acknowledge-unrecoverable-operation',
+    );
+    errorCode = null;
+    notifyListeners();
+    _finishIfSettled();
+  }
+
+  void _finishIfSettled() {
+    if (!_completed && pending == null) {
+      _completed = true;
+      onResolved();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    unawaited(_sessionSubscription.cancel());
+    super.dispose();
+  }
+}
+
+class _RecoveryAction extends StatelessWidget {
+  const _RecoveryAction({
+    super.key,
+    required this.enabled,
+    required this.child,
+  });
+
+  final bool enabled;
+  final Widget child;
+
+  // Disabling a pressed PrismUI surface cancels its press synchronously.
+  // Keep that notification out of the previous button's rebuilding ancestor.
+  @override
+  Widget build(BuildContext context) =>
+      KeyedSubtree(key: ValueKey(enabled), child: child);
+}
+
+class WebApiRecoveryApp extends StatelessWidget {
+  const WebApiRecoveryApp({
+    super.key,
+    required this.repository,
+    required this.onResolved,
+  });
+
+  final WebApiRepository repository;
+  final VoidCallback onResolved;
+
+  ThemeData _theme(Brightness brightness) => ThemeData(
+    colorScheme: seededColorScheme(
+      seedColor: const Color(defaultPrimaryColor),
+      brightness: brightness,
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) => PrismApp(
+    debugShowCheckedModeBanner: false,
+    title: appName,
+    theme: _theme(Brightness.light),
+    darkTheme: _theme(Brightness.dark),
+    localizationsDelegates: const [
+      AppLocalizations.delegate,
+      AppUiLocalizations.delegate,
+      GlobalWidgetsLocalizations.delegate,
+    ],
+    supportedLocales: AppLocalizations.delegate.supportedLocales,
+    home: WebApiRecoveryScreen(repository: repository, onResolved: onResolved),
+  );
+}
+
+class WebApiRecoveryScreen extends StatefulWidget {
+  const WebApiRecoveryScreen({
+    super.key,
+    required this.repository,
+    required this.onResolved,
+  });
+
+  final WebApiRepository repository;
+  final VoidCallback onResolved;
+
+  @override
+  State<WebApiRecoveryScreen> createState() => _WebApiRecoveryScreenState();
+}
+
+class _WebApiRecoveryScreenState extends State<WebApiRecoveryScreen> {
+  late final WebApiRecoveryController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebApiRecoveryController(
+      widget.repository,
+      onResolved: widget.onResolved,
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _acknowledge() async {
+    if (_controller.busy || _controller.pending == null) return;
+    final operationId = _controller.pending?.operationId;
+    final l = context.appLocalizations;
+    final confirmed = await dialogs.showMessage(
+      context: context,
+      title: l.webApiAcknowledgeUnrecoverable,
+      message: TextSpan(text: l.webApiAcknowledgeUnrecoverableTip),
+      confirmText: l.webApiAcknowledgeUnrecoverable,
+      cancelText: l.webCancel,
+      destructive: true,
+    );
+    if (confirmed == true &&
+        mounted &&
+        _controller.pending?.operationId == operationId) {
+      _controller.acknowledge();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: _controller,
+    builder: (context, _) {
+      final l = context.appLocalizations;
+      final pending = _controller.pending;
+      final canAcknowledge = !_controller.busy && pending != null;
+      return Surface(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 640),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      l.webApiRecoveryTitle,
+                      style: AppTextStyle.title2.of(context, emphasized: true),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      l.webApiUnknownResultTip,
+                      style: AppTextStyle.body.of(context),
+                    ),
+                    const SizedBox(height: 12),
+                    if (pending != null)
+                      SelectableText(
+                        pending.operationId,
+                        style: AppTextStyle.footnote.of(context),
+                      ),
+                    if (!_controller.canRecover && !_controller.busy) ...[
+                      const SizedBox(height: 12),
+                      Text(l.webApiRecoveryBlockedTip),
+                    ],
+                    if (_controller.errorCode != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        l.webRequestFailed,
+                        key: const ValueKey('web-recovery-error'),
+                      ),
+                    ],
+                    const SizedBox(height: 24),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        _RecoveryAction(
+                          key: const ValueKey('web-recovery-read'),
+                          enabled: _controller.canRecover,
+                          child: OutlinedButton(
+                            onPressed: _controller.canRecover
+                                ? () => unawaited(_controller.recover())
+                                : null,
+                            child: Text(l.webApiReadReceipt),
+                          ),
+                        ),
+                        _RecoveryAction(
+                          key: const ValueKey('web-recovery-resolve'),
+                          enabled: _controller.canRecover,
+                          child: FilledButton(
+                            onPressed: _controller.canRecover
+                                ? () => unawaited(
+                                    _controller.recover(resolve: true),
+                                  )
+                                : null,
+                            child: Text(l.webApiResolveOperation),
+                          ),
+                        ),
+                        if (pending?.body != null)
+                          _RecoveryAction(
+                            key: const ValueKey('web-recovery-replay'),
+                            enabled: _controller.canReplay,
+                            child: OutlinedButton(
+                              onPressed: _controller.canReplay
+                                  ? () => unawaited(
+                                      _controller.recover(replay: true),
+                                    )
+                                  : null,
+                              child: Text(l.webApiRetrySameOperation),
+                            ),
+                          ),
+                        _RecoveryAction(
+                          key: const ValueKey('web-recovery-ack'),
+                          enabled: canAcknowledge,
+                          child: TextButton(
+                            onPressed: canAcknowledge ? _acknowledge : null,
+                            child: Text(l.webApiAcknowledgeUnrecoverable),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}

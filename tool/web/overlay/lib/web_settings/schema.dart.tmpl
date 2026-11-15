@@ -1,0 +1,219 @@
+import 'package:fl_clash/web_api/errors.dart';
+
+const Object webSettingsSchema = {
+  'runtime': {
+    'patchClashConfig': {
+      'mixed-port': 'int',
+      'socks-port': 'int',
+      'port': 'int',
+      'redir-port': 'int',
+      'tproxy-port': 'int',
+      'mode': 'string',
+      'allow-lan': 'bool',
+      'log-level': 'string',
+      'ipv6': 'bool',
+      'find-process-mode': 'string',
+      'interface-name-mode': 'string',
+      'interface-name': 'string',
+      'keep-alive-interval': 'int',
+      'keep-alive-idle': 'int',
+      'disable-keep-alive': 'bool',
+      'routing-mark': 'int',
+      'unified-delay': 'bool',
+      'tcp-concurrent': 'bool',
+      'tun': {
+        'enable': 'bool',
+        'device': 'string',
+        'stack': 'string',
+        'route-address': ['string'],
+        'mtu': 'int',
+        'congestion-controller': 'string',
+        'route-exclude-address': ['string'],
+      },
+      'dns': {
+        'enable': 'bool',
+        'listen': 'string',
+        'listen-routing-mark': 'int',
+        'prefer-h3': 'bool',
+        'use-hosts': 'bool',
+        'use-system-hosts': 'bool',
+        'respect-rules': 'bool',
+        'ipv6': 'bool',
+        'ipv6-timeout': 'int',
+        'cache-algorithm': 'string',
+        'cache-max-size': 'int',
+        'default-nameserver': ['string'],
+        'enhanced-mode': 'string',
+        'fake-ip-range': 'string',
+        'fake-ip-range6': 'string',
+        'fake-ip-filter': ['string'],
+        'fake-ip-filter-mode': 'string',
+        'fake-ip-ttl': 'int',
+        'nameserver-policy': ('map', 'string'),
+        'nameserver': ['string'],
+        'fallback': ['string'],
+        'fallback-lazy-query': 'bool',
+        'proxy-server-nameserver': ['string'],
+        'proxy-server-nameserver-policy': ('map', 'string'),
+        'direct-nameserver': ['string'],
+        'direct-nameserver-follow-policy': 'bool',
+        'fallback-filter': {
+          'geoip': 'bool',
+          'geoip-code': 'string',
+          'geosite': ['string'],
+          'ipcidr': ['string'],
+          'domain': ['string'],
+        },
+      },
+      'dns-override-keys': ['string'],
+      'tun-override': {
+        'mtu': 'int',
+        'congestion-controller': 'string',
+        'strict-route': 'bool',
+        'route-address': ['string'],
+        'route-exclude-address': ['string'],
+        'dns-hijack': ['string'],
+        'udp-timeout': 'int',
+        'disable-icmp-forwarding': 'bool',
+        'gso': 'bool',
+        'include-interface': ['string'],
+        'exclude-interface': ['string'],
+        'include-uid': ['int'],
+        'exclude-uid': ['int'],
+        'exclude-src-port': ['int'],
+        'exclude-dst-port': ['int'],
+      },
+      'tun-override-keys': ['string'],
+      'geox-url': {
+        'mmdb': 'string',
+        'asn': 'string',
+        'geoip': 'string',
+        'geosite': 'string',
+      },
+      'geodata-loader': 'string',
+      'global-ua': ('nullable', 'string'),
+      'external-controller': 'string',
+      'secret': 'string',
+      'hosts': ('map', 'string'),
+      'geo-auto-update': 'bool',
+      'geo-update-interval': 'int',
+      'test-url': 'string',
+      'general-override-keys': ['string'],
+      'mitm': {
+        'enable': 'bool',
+        'hostname': ['string'],
+        'skip-server-cert-verify': 'bool',
+        'auto-quic-block': 'bool',
+        'h2': 'bool',
+        'decrypt-untrusted': 'bool',
+        'trusted-fingerprint': ('nullable', 'string'),
+        'capture': 'bool',
+        'capture-entries': ('nullable', 'int'),
+      },
+    },
+    'appSetting': {
+      'onlyStatisticsProxy': 'bool',
+      'showNotificationStopAction': 'bool',
+      'autoLaunch': 'bool',
+      'silentLaunch': 'bool',
+      'autoRun': 'bool',
+      'openLogs': 'bool',
+      'closeConnections': 'bool',
+      'requestFeed': 'string',
+      'delayTestTimeout': 'int',
+      'autoCheckUpdate': 'bool',
+      'restoreStrategy': 'string',
+      'checkCertificate': 'bool',
+      'userAgents': ['string'],
+    },
+  },
+  'network': {
+    'networkProps': {
+      'systemProxy': 'bool',
+      'bypassDomain': ['string'],
+      'bypassPrivateRoute': 'bool',
+      'autoSetSystemDns': 'bool',
+      'appendSystemDns': 'bool',
+      'authentication': {
+        'enable': 'bool',
+        'username': 'string',
+        'password': 'string',
+      },
+    },
+    'vpnProps': {
+      'enable': 'bool',
+      'systemProxy': 'bool',
+      'ipv6': 'bool',
+      'allowBypass': 'bool',
+      'dnsHijacking': 'bool',
+      'accessControlProps': {
+        'enable': 'bool',
+        'mode': 'string',
+        'acceptList': ['string'],
+        'rejectList': ['string'],
+        'sort': 'string',
+        'isFilterSystemApp': 'bool',
+        'isFilterNonInternetApp': 'bool',
+      },
+    },
+    'excludeSSIDs': ['string'],
+  },
+  'currentProfileId': ('nullable', 'string'),
+  'dav': (
+    'nullable',
+    {
+      'uri': 'string',
+      'user': 'string',
+      'password': 'string',
+      'fileName': 'string',
+    },
+  ),
+};
+
+void validateWebSettings(Object? value) => _validate(value, webSettingsSchema);
+
+void _validate(Object? value, Object schema) {
+  switch (schema) {
+    case ('nullable', final Object nested):
+      if (value != null) _validate(value, nested);
+    case ('map', final Object nested):
+      if (value is! Map<String, Object?>) {
+        throw const WebApiProtocolException('Invalid settings map');
+      }
+      for (final item in value.values) {
+        _validate(item, nested);
+      }
+    case final Map<String, Object> fields:
+      if (value is! Map<String, Object?> ||
+          value.length != fields.length ||
+          !fields.keys.every(value.containsKey)) {
+        throw const WebApiProtocolException(
+          'Settings fields do not match the typed schema',
+        );
+      }
+      for (final entry in fields.entries) {
+        _validate(value[entry.key], entry.value);
+      }
+    case [final Object nested]:
+      if (value is! List) {
+        throw const WebApiProtocolException('Invalid settings list');
+      }
+      for (final item in value) {
+        _validate(item, nested);
+      }
+    case 'string':
+      if (value is! String) {
+        throw const WebApiProtocolException('Invalid settings string');
+      }
+    case 'bool':
+      if (value is! bool) {
+        throw const WebApiProtocolException('Invalid settings bool');
+      }
+    case 'int':
+      if (value is! int) {
+        throw const WebApiProtocolException('Invalid settings integer');
+      }
+    default:
+      throw const WebApiProtocolException('Invalid settings schema');
+  }
+}

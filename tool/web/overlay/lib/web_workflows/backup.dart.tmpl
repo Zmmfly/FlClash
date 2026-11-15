@@ -1,0 +1,256 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:fl_clash/web_api/index.dart';
+
+class WebBackupSettingsChange {
+  const WebBackupSettingsChange({
+    required this.sourceField,
+    required this.targetField,
+    required this.action,
+    required this.before,
+    required this.after,
+    required this.lossless,
+    required this.requiresConfirmation,
+  });
+  final String sourceField;
+  final String? targetField;
+  final String action;
+  final Object? before;
+  final Object? after;
+  final bool lossless;
+  final bool requiresConfirmation;
+
+  factory WebBackupSettingsChange.decode(Object? value) {
+    final data = apiObject(value, 'backup settings change');
+    final source = data['sourceField'];
+    final target = data['targetField'];
+    final action = data['action'];
+    if (source is! String ||
+        source.isEmpty ||
+        source.length > 512 ||
+        target != null && target is! String ||
+        action is! String ||
+        action.isEmpty ||
+        data['lossless'] is! bool ||
+        data['requiresConfirmation'] is! bool ||
+        !data.containsKey('before') ||
+        !data.containsKey('after')) {
+      throw const WebApiProtocolException('Invalid settings conversion change');
+    }
+    return WebBackupSettingsChange(
+      sourceField: source,
+      targetField: target as String?,
+      action: action,
+      before: data['before'],
+      after: data['after'],
+      lossless: data['lossless'] as bool,
+      requiresConfirmation: data['requiresConfirmation'] as bool,
+    );
+  }
+
+  Map<String, Object?> toJson() => {
+    'sourceField': sourceField,
+    if (targetField != null) 'targetField': targetField,
+    'action': action,
+    'before': before,
+    'after': after,
+    'lossless': lossless,
+    'requiresConfirmation': requiresConfirmation,
+  };
+}
+
+class WebBackupChange {
+  const WebBackupChange({
+    required this.kind,
+    required this.action,
+    required this.count,
+    this.id,
+    this.name,
+    this.settingsChange,
+  });
+
+  final String kind;
+  final String action;
+  final int count;
+  final String? id;
+  final String? name;
+  final WebBackupSettingsChange? settingsChange;
+}
+
+class WebBackupPreview {
+  const WebBackupPreview({
+    required this.token,
+    required this.expiresAt,
+    required this.archiveDigest,
+    required this.planDigest,
+    required this.changes,
+    required this.editVersion,
+    required this.restoreDavCredentials,
+  });
+
+  final String token;
+  final DateTime expiresAt;
+  final String archiveDigest;
+  final String planDigest;
+  final List<WebBackupChange> changes;
+  final ApiEditVersion editVersion;
+  final bool restoreDavCredentials;
+}
+
+class WebBackupWorkflows {
+  WebBackupWorkflows(this.repository) {
+    repository.registerExternalReceipt(
+      '/api/v1/backups:restore',
+      _restoreResult,
+    );
+    repository.registerExternalReceipt(
+      '/api/v1/backups:confirm',
+      _restoreResult,
+    );
+    repository.registerExternalReceipt('/api/v1/app:reset', _resetResult);
+  }
+
+  final WebApiRepository repository;
+
+  Future<Uint8List> download({
+    String format = 'flclash-v1',
+    bool includeDavCredentials = false,
+  }) async {
+    if (!['flclash-v1', 'native-v1'].contains(format))
+      throw ArgumentError.value(format, 'format');
+    return (await repository.readAttachmentExternal(
+      '/api/v1/backups?format=$format&includeDavCredentials=$includeDavCredentials',
+    )).bytes;
+  }
+
+  Future<WebBackupPreview> prepare(
+    List<int> archive, {
+    required bool override,
+    required bool onlyProfiles,
+    bool restoreDavCredentials = false,
+    required ApiEditVersion editVersion,
+  }) async {
+    final receipt = await repository.queryExternal('/api/v1/backups:prepare', {
+      'expectedRevision': editVersion.revision,
+      'archiveBase64': base64Encode(archive),
+      'strategy': override ? 'override' : 'merge',
+      'onlyProfiles': onlyProfiles,
+      'restoreDavCredentials': restoreDavCredentials,
+    });
+    if (receipt.revision != editVersion.revision) {
+      throw const WebApiException(
+        'revision_conflict',
+        'Application data changed; restart the restore preview',
+      );
+    }
+    return decodePreview(
+      receipt.data,
+      receipt: receipt,
+      restoreDavCredentials: restoreDavCredentials,
+    );
+  }
+
+  WebBackupPreview decodePreview(
+    Object? value, {
+    required ApiReceipt receipt,
+    required bool restoreDavCredentials,
+  }) {
+    final data = apiObject(value, 'backup preview');
+    final token = data['token'];
+    final expiry = data['expiresAt'];
+    if (token is! String ||
+        token.isEmpty ||
+        expiry is! String ||
+        data['requiresConfirmation'] != true) {
+      throw const WebApiProtocolException(
+        'Invalid restore confirmation preview',
+      );
+    }
+    final changes = <WebBackupChange>[];
+    for (final value in apiList(data['changes'])) {
+      final change = apiObject(value, 'backup change');
+      final kind = change['kind'];
+      final action = change['action'];
+      final name = change['name'];
+      final id = change['id'];
+      final count = apiInteger(change['count'], 'backup change.count');
+      if (kind is! String ||
+          action is! String ||
+          count < 0 ||
+          name != null && name is! String) {
+        throw const WebApiProtocolException('Invalid restore preview item');
+      }
+      changes.add(
+        WebBackupChange(
+          kind: kind,
+          action: action,
+          count: count,
+          name: name as String?,
+          settingsChange: change['settingsChange'] == null
+              ? null
+              : WebBackupSettingsChange.decode(change['settingsChange']),
+          id: id == null ? null : requireWireId(id, 'backup change.id'),
+        ),
+      );
+    }
+    return WebBackupPreview(
+      token: token,
+      expiresAt: DateTime.parse(expiry),
+      archiveDigest: _digest(data['archiveDigest']),
+      planDigest: _digest(data['planDigest']),
+      changes: List.unmodifiable(changes),
+      editVersion: repository.captureReadVersion(receipt),
+      restoreDavCredentials: restoreDavCredentials,
+    );
+  }
+
+  Future<void> confirm(WebBackupPreview preview) async {
+    await repository.executeExternalCommand(
+      '/api/v1/backups:confirm',
+      {
+        'intent': 'confirm-backup-conversion',
+        'token': preview.token,
+        'archiveDigest': preview.archiveDigest,
+        'planDigest': preview.planDigest,
+        'restoreDavCredentials': preview.restoreDavCredentials,
+      },
+      _restoreResult,
+      editVersion: preview.editVersion,
+    );
+  }
+
+  Future<void> resetApplication() async {
+    final receipt = await repository.readExternal('/api/v1/meta');
+    await repository.executeExternalCommand(
+      '/api/v1/app:reset',
+      {'intent': 'reset-application-data'},
+      _resetResult,
+      editVersion: repository.captureReadVersion(receipt),
+    );
+  }
+
+  Object _restoreResult(Object? value) {
+    final data = apiObject(value, 'restore receipt');
+    if (data['restored'] != true ||
+        apiInteger(data['profileCount'], 'restore.profileCount') < 0 ||
+        apiInteger(data['contentCount'], 'restore.contentCount') < 0) {
+      throw const WebApiProtocolException('Invalid restore receipt');
+    }
+    return data;
+  }
+
+  Object _resetResult(Object? value) {
+    final data = apiObject(value, 'reset receipt');
+    if (data['reset'] != true)
+      throw const WebApiProtocolException('Invalid reset receipt');
+    return data;
+  }
+
+  String _digest(Object? value) {
+    if (value is! String || !RegExp(r'^[0-9a-f]{64}$').hasMatch(value)) {
+      throw const WebApiProtocolException('Invalid restore preview digest');
+    }
+    return value;
+  }
+}

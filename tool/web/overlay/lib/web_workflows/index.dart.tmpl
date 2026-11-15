@@ -1,0 +1,42 @@
+import 'package:fl_clash/web_api/index.dart';
+
+import 'backup.dart';
+import 'content.dart';
+import 'external_providers.dart';
+import 'source_consent.dart';
+import 'dav.dart';
+import 'icon_sets.dart';
+import 'sources.dart';
+
+export 'backup.dart';
+export 'backup_ui.dart';
+export 'committed.dart';
+export 'content.dart';
+export 'dav.dart';
+export 'feedback.dart';
+export 'external_providers.dart';
+export 'icon_sets.dart';
+export 'metadata.dart';
+export 'resource.dart';
+export 'source_consent.dart';
+export 'sources.dart';
+export 'setup.dart';
+
+void registerWebWorkflowReceipts(WebApiRepository repository) {
+  WebContentWorkflows(repository);
+  WebBackupWorkflows(repository);
+  WebIconSetWorkflows(repository);
+  WebSourceWorkflows(repository);
+  WebDavWorkflows(repository);
+}
+
+final _externalProviderWorkflows = Expando<WebExternalProviderWorkflows>(
+  'web-provider-workflows',
+);
+
+WebExternalProviderWorkflows webExternalProviderWorkflows(
+  WebApiRepository repository,
+) => _externalProviderWorkflows[repository] ??= WebExternalProviderWorkflows(
+  repository,
+  confirmSource: showWebSourceConsent,
+);

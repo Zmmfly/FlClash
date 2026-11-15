@@ -1,2 +1,5 @@
 # freezed emits lines of trailing spaces, and generated code is never edited by hand.
 lib/**/generated/** -whitespace
+
+# Keep the upstream evaluator license byte-exact for its pinned manifest.
+core/web_api_evaluate_guest/LICENSE whitespace=-blank-at-eol

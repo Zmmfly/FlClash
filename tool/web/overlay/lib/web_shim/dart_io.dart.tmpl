@@ -1190,7 +1190,7 @@ class NetworkInterface {
     bool includeLinkLocal = false,
     InternetAddressType type = InternetAddressType.any,
   }) async {
-    WebFileSystem.instance.refreshNetworkInterfaces();
+    await WebFileSystem.instance.refreshNetworkInterfaces();
     final serverIfaces = WebFileSystem.instance.networkInterfaces;
     final result = <NetworkInterface>[];
     var idx = 1;

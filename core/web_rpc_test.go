@@ -2,63 +2,76 @@
 
 package core
 
-// WEBPANEL.md and README Web capability claims are exercised through these public routes and RPCs.
+// Retired RPC transport stays unavailable; internal dispatch and typed HTTP retain isolation coverage.
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
 	"github.com/metacubex/mihomo/constant"
 )
 
-func TestWebSlowRPCDoesNotBlockQueriesOrFileWrites(t *testing.T) {
+func TestWebSlowInternalRPCDoesNotBlockTypedQueriesOrWrites(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
 	beforeInit := isInit.Load()
 	isInit.Store(true)
 	defer isInit.Store(beforeInit)
 	s.coreEnabled.Store(true)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	finished := make(chan struct{})
+	started, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
 	method := CoreMethod("web.test.slow")
 	methodHandlers[method] = func(*MethodCall) (any, error) { close(started); <-release; return true, nil }
 	defer delete(methodHandlers, method)
 	go func() { defer close(finished); s.webRPC(&MethodCall{ID: "slow", Method: method}) }()
-	<-started
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("internal dispatch never entered")
+	}
 	fast := make(chan error, 1)
 	go func() {
 		response := s.webRPC(&MethodCall{ID: "fast", Method: coreInitializedMethod})
 		if !bytes.Contains(response, []byte(`"result":true`)) {
-			fast <- errors.New("fast query failed")
+			fast <- errors.New("fast internal query failed")
 			return
 		}
-		if w := webRequest(s, "POST", "/api/fs/write?path=/data/concurrent", "hello", cookie); w.Code != 200 {
-			fast <- errors.New("file write failed")
+		body, _ := json.Marshal(webAPITestMutation("0", "slow-rpc-concurrent", map[string]any{"profile": webAPITestProfile("parallel")}))
+		r := httptest.NewRequest("POST", "http://panel.test/api/v1/profiles:create", bytes.NewReader(body))
+		r.AddCookie(cookie)
+		r.Header.Set("Origin", "http://panel.test")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		if w.Code != 200 {
+			fast <- errors.New("parallel typed write failed: " + w.Body.String())
 			return
 		}
 		fast <- nil
 	}()
-	var err error
 	select {
-	case err = <-fast:
+	case err := <-fast:
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(2 * time.Second):
-		err = errors.New("slow RPC blocked unrelated work")
+		t.Fatal("slow internal dispatch blocked typed HTTP")
 	}
-	close(release)
-	<-finished
-	if err != nil {
-		t.Fatal(err)
+	unblock()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("internal dispatch did not finish")
 	}
 }
 
@@ -95,10 +108,14 @@ func TestWebSetupValidatesSnapshotAndKeepsPersistentHome(t *testing.T) {
 	called := false
 	setupConfig = func(params *SetupParams) error {
 		called = true
-		if params.Base == nil || webWithin(s.opts.DataDir, params.Base.Path) {
+		if params.Base != nil || params.ConfigPath == "" || webWithin(s.opts.DataDir, params.ConfigPath) {
 			return errors.New("setup did not isolate its input snapshot")
 		}
-		document, err := mergeProfileBase(params.Base)
+		data, err := os.ReadFile(params.ConfigPath)
+		if err != nil {
+			return err
+		}
+		document, err := readCandidateDocument(data)
 		if err != nil {
 			return err
 		}
@@ -159,71 +176,102 @@ func TestWebDerivedNativePathsRejectSymlinks(t *testing.T) {
 	}
 }
 
-func TestWebMkdirRootsRemainIdempotent(t *testing.T) {
+func TestWebRetiredMkdirAndSlowTypedBodyQueryIsolation(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
 	for _, p := range []string{"/data", "/tmp", "/data/.", "/tmp//"} {
-		if w := webRequest(s, "POST", "/api/fs/mkdir?path="+p, "", cookie); w.Code != 200 {
-			t.Fatalf("mkdir %s = %d %s", p, w.Code, w.Body.String())
+		if w := webRequest(s, "POST", "/api/fs/mkdir?path="+p, "", cookie); w.Code != 404 {
+			t.Fatalf("retired mkdir %s = %d", p, w.Code)
 		}
+	}
+	body, _ := json.Marshal(webAPITestMutation("0", "slow-typed-body", map[string]any{"profile": webAPITestProfile("slow")}))
+	started, release, done := make(chan struct{}), make(chan struct{}), make(chan *httptest.ResponseRecorder, 1)
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	reader := &webRPCSlowBody{reader: strings.NewReader(string(body)), started: started, release: release}
+	r := httptest.NewRequest("POST", "http://panel.test/api/v1/profiles:create", reader)
+	r.AddCookie(cookie)
+	r.Header.Set("Origin", "http://panel.test")
+	r.Header.Set("Content-Type", "application/json")
+	go func() { w := httptest.NewRecorder(); s.ServeHTTP(w, r); done <- w }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("typed body did not enter")
+	}
+	fast := make(chan int, 1)
+	go func() { fast <- webRequest(s, "GET", "/api/v1/profiles", "", cookie).Code }()
+	select {
+	case code := <-fast:
+		if code != 200 {
+			t.Fatal(code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow typed body held global query lock")
+	}
+	once.Do(func() { close(release) })
+	select {
+	case w := <-done:
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("typed body did not finish")
 	}
 }
 
-func TestWebRPCSupportsDocumentedFiftyWayDelayBatch(t *testing.T) {
+type webRPCSlowBody struct {
+	reader           *strings.Reader
+	started, release chan struct{}
+	once             sync.Once
+}
+
+func (r *webRPCSlowBody) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started); <-r.release })
+	return r.reader.Read(p)
+}
+
+func TestWebInternalDispatchFiftyWayBatchAndRetiredSocket(t *testing.T) {
 	s := newWebTestServer(t)
-	cookie := webLogin(t, s)
 	s.coreEnabled.Store(true)
-	beforeInit := isInit.Load()
+	before := isInit.Load()
 	isInit.Store(true)
-	defer isInit.Store(beforeInit)
+	defer isInit.Store(before)
 	started := make(chan struct{}, delayTestConcurrency)
 	release := make(chan struct{})
-	released := false
-	defer func() {
-		if !released {
-			close(release)
-		}
-	}()
+	done := make(chan []byte, delayTestConcurrency)
+	var once sync.Once
+	defer once.Do(func() { close(release) })
 	method := CoreMethod("web.test.delayBatch")
 	methodHandlers[method] = func(*MethodCall) (any, error) { started <- struct{}{}; <-release; return true, nil }
 	defer delete(methodHandlers, method)
-	server := httptest.NewServer(s)
-	defer server.Close()
-	conn, _, err := webDial(t, server, cookie, server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	for i := 0; i < delayTestConcurrency; i++ {
-		data, _ := json.Marshal(MethodCall{ID: fmt.Sprint(i), Method: method})
-		if err := wsutil.WriteClientMessage(conn, ws.OpText, data); err != nil {
-			t.Fatal(err)
-		}
+		go func() { done <- s.webRPC(&MethodCall{ID: "batch", Method: method}) }()
 	}
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
 	for i := 0; i < delayTestConcurrency; i++ {
 		select {
 		case <-started:
-		case <-timer.C:
-			t.Fatal("normal 50-way batch exhausted RPC capacity")
+		case <-time.After(2 * time.Second):
+			t.Fatal("internal 50-way batch did not enter")
 		}
 	}
-	data, _ := json.Marshal(MethodCall{ID: "control", Method: coreInitializedMethod})
-	if err := wsutil.WriteClientMessage(conn, ws.OpText, data); err != nil {
-		t.Fatal(err)
+	control := s.webRPC(&MethodCall{ID: "control", Method: coreInitializedMethod})
+	if !bytes.Contains(control, []byte(`"result":true`)) {
+		t.Fatal("batch blocked internal control")
 	}
-	answer, _, err := wsutil.ReadServerData(conn)
-	if err != nil || !bytes.Contains(answer, []byte("control")) {
-		t.Fatalf("batch blocked control query: %s %v", answer, err)
-	}
-	close(release)
-	released = true
+	once.Do(func() { close(release) })
 	for i := 0; i < delayTestConcurrency; i++ {
-		answer, _, err := wsutil.ReadServerData(conn)
-		if err != nil || bytes.Contains(answer, []byte("error")) {
-			t.Fatalf("batch reply lost: %s %v", answer, err)
+		select {
+		case reply := <-done:
+			if !bytes.Contains(reply, []byte(`"result":true`)) {
+				t.Fatal("batch internal response failed")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("internal batch did not finish")
 		}
+	}
+	cookie := webLogin(t, s)
+	if w := webRequest(s, "GET", "/ws/core", "", cookie); w.Code != 404 {
+		t.Fatal("retired RPC websocket returned", w.Code)
 	}
 }

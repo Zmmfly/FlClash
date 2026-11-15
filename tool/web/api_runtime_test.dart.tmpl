@@ -1,0 +1,496 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:js_interop';
+import 'dart:typed_data';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:rust_api/rust_api.dart';
+
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_shim/web_core_bridge.dart';
+import 'package:fl_clash/web_runtime/facade.dart';
+import 'package:fl_clash/web_runtime/runtime.dart';
+
+@JS('eval')
+external JSAny? _evaluate(JSString source);
+
+class _RuntimeTransport implements ApiTransport {
+  final requests = <ApiRequest>[];
+  late FutureOr<ApiResponse> Function(ApiRequest) respond;
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    return respond(request);
+  }
+
+  @override
+  void close() {}
+}
+
+ApiResponse _answer(String revision, Object? data, {String? operationId}) =>
+    ApiResponse(
+      200,
+      jsonEncode({
+        'revision': revision,
+        'data': data,
+        if (operationId != null) 'operationId': operationId,
+      }),
+    );
+
+Map<String, Object?> _meta(String revision) => {
+  'storeId': 'runtime-test-store',
+  'schemaVersion': 1,
+  'revision': revision,
+};
+
+Future<(WebApiRepository, WebRuntimeBinding)> _binding(
+  _RuntimeTransport transport,
+) async {
+  final repo = WebApiRepository(
+    transport: transport,
+    journal: MemoryApiOperationJournal(),
+  );
+  await repo.initialize();
+  return (repo, WebRuntimeBinding.configure(repo));
+}
+
+void main() {
+  test(
+    'runtime contract keeps the browser IPC correlation and explicit typed HTTP mapping',
+    () async {
+      final transport = _RuntimeTransport();
+      transport.respond = (request) => switch (request.path) {
+        '/api/v1/meta' => _answer('0', _meta('0')),
+        '/api/v1/runtime/connections/count' => _answer('0', 4),
+        '/api/v1/runtime/proxies:delay' => _answer('0', {
+          'name': 'P',
+          'url': 'https://example.test/',
+          'value': 12,
+        }),
+        _ => throw StateError('Unexpected path ${request.path}'),
+      };
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      final count = await webRuntimeDispatchFrame({
+        'id': 'correlation',
+        'method': 'connection.count',
+      }, binding: binding);
+      expect(count, {'id': 'correlation', 'result': 4});
+      final delay = await webRuntimeDispatchFrame({
+        'id': 'delay-id',
+        'method': 'proxy.testDelay',
+        'arguments': {
+          'proxy-name': 'P',
+          'test-url': 'https://example.test/',
+          'timeout': 1000,
+        },
+      }, binding: binding);
+      expect(delay['id'], 'delay-id');
+      final sent = jsonDecode(transport.requests.last.body!) as Map;
+      expect(sent, {
+        'proxyName': 'P',
+        'testUrl': 'https://example.test/',
+        'timeoutMillis': 1000,
+      });
+      expect(sent.containsKey('method'), false);
+      final before = transport.requests.length;
+      for (final method in [
+        'core.crash',
+        'not.a.method',
+        'message',
+        'shutdown',
+      ]) {
+        final result = await webRuntimeDispatchFrame({
+          'id': method,
+          'method': method,
+        }, binding: binding);
+        expect(result['id'], method);
+        expect((result['error'] as Map)['code'], 'unsupported');
+      }
+      expect(transport.requests.length, before);
+    },
+  );
+
+  test(
+    'runtime contract uses the shared identity namespace for full-width MITM IDs',
+    () async {
+      const wire = '9223372036854775807';
+      final transport = _RuntimeTransport();
+      transport.respond = (request) {
+        if (request.path == '/api/v1/meta') return _answer('0', _meta('0'));
+        if (request.path.startsWith('/api/v1/runtime/mitm/captures?')) {
+          return _answer('0', {
+            'capturing': true,
+            'exchanges': [
+              {'id': wire, 'method': 'GET'},
+            ],
+          });
+        }
+        if (request.path == '/api/v1/runtime/mitm/capture?id=$wire')
+          return _answer('0', {'id': wire});
+        throw StateError(request.path);
+      };
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      final profileHandle = repo.identities.decode(ApiIdentity.profile, wire);
+      final response = await webRuntimeDispatchFrame({
+        'id': 'list',
+        'method': 'mitm.exchanges',
+        'arguments': {'id': '00000000-0000-0000-0000-000000000001'},
+      }, binding: binding);
+      final local =
+          (((response['result'] as Map)['exchanges'] as List).single
+                  as Map)['id']
+              as int;
+      expect(local, isNot(profileHandle));
+      expect(local.abs(), lessThan(9007199254740992));
+      expect(repo.identities.encode(ApiIdentity.mitmExchange, local), wire);
+      final detail = await webRuntimeDispatchFrame({
+        'id': 'detail',
+        'method': 'mitm.exchange',
+        'arguments': {'id': local},
+      }, binding: binding);
+      expect((detail['result'] as Map)['id'], local);
+    },
+  );
+
+  test(
+    'runtime contract rejects unregistered paths and never emits them to HTTP',
+    () async {
+      final transport = _RuntimeTransport();
+      transport.respond = (_) => _answer('0', _meta('0'));
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      final before = transport.requests.length;
+      final response = await webRuntimeDispatchFrame({
+        'id': 'path',
+        'method': 'proxy.convert',
+        'arguments': {'path': '/data/auth/credentials.json'},
+      }, binding: binding);
+      expect((response['error'] as Map)['code'], 'unsupported_source');
+      expect(transport.requests.length, before);
+      final plain = webRuntimeSources.profileHandle(
+        repo.identities.decode(ApiIdentity.profile, '9007199254740993'),
+      );
+      expect(
+        () => webRuntimeSources.editVersion(plain),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'runtime contract binds every base and editor candidate to its actual read version',
+    () async {
+      var revision = '1';
+      final transport = _RuntimeTransport();
+      transport.respond = (request) {
+        if (request.path == '/api/v1/meta')
+          return _answer(revision, _meta(revision));
+        if (request.path.endsWith('/base'))
+          return _answer(revision, {
+            'config': {},
+            'digest': 'digest-$revision',
+            'match-rules': [],
+            'proxies': 0,
+            'proxy-groups': 0,
+            'rules': 0,
+          });
+        if (request.path == '/api/v1/runtime:apply') {
+          final body = jsonDecode(request.body!) as Map;
+          expect(body['expectedRevision'], '1');
+          expect(body['profileId'], '9007199254740993');
+          return ApiResponse(
+            409,
+            jsonEncode({
+              'error': {'code': 'revision_conflict', 'message': 'changed'},
+              'revision': '2',
+            }),
+          );
+        }
+        throw StateError(request.path);
+      };
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      final id = repo.identities.decode(
+        ApiIdentity.profile,
+        '9007199254740993',
+      );
+      final internal = webRuntimeSources.profileHandle(id);
+      final original = await binding.profileBaseResource(internal);
+      final candidate = webRuntimeSources.editorBuffer(
+        'proxies: []',
+        editVersion: original.editVersion,
+        profileId: id,
+      );
+      revision = '2';
+      await binding.receiveEvent({
+        'type': 'commit',
+        'storeId': 'runtime-test-store',
+        'revision': '2',
+        'operationId': 'other-session-operation',
+      });
+      final newer = await binding.profileBaseResource(internal);
+      expect(newer.handle, isNot(original.handle));
+      expect(webRuntimeSources.editVersion(original.handle).revision, '1');
+      expect(webRuntimeSources.editVersion(candidate).revision, '1');
+      await expectLater(
+        binding.applyProfile(
+          sourceHandle: original.handle,
+          candidateHandle: candidate,
+          selectedMap: {},
+          options: {},
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            anyOf('revision_conflict', 'edit_conflict'),
+          ),
+        ),
+      );
+      final freshStatusRequests = transport.requests.where(
+        (request) => request.path == '/api/v1/runtime/state',
+      );
+      expect(freshStatusRequests, isEmpty);
+    },
+  );
+
+  test(
+    'runtime contract log and route watches are event subscriptions, not HTTP mutations',
+    () async {
+      final transport = _RuntimeTransport();
+      transport.respond = (request) => request.path == '/api/v1/meta'
+          ? _answer('0', _meta('0'))
+          : _answer('0', {'core-epoch': 1, 'route-version': 2});
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      await webRuntimeDispatchFrame({
+        'id': 'log',
+        'method': 'log.start',
+      }, binding: binding);
+      await webRuntimeDispatchFrame({
+        'id': 'watch',
+        'method': 'route.watch',
+        'arguments': {'watch': true},
+      }, binding: binding);
+      expect(binding.subscribeFrame()['type'], 'subscribe');
+      expect(binding.topics, containsAll(['log', 'route']));
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        true,
+      );
+      final event = await binding.receiveEvent({
+        'type': 'route',
+        'data': {'core-epoch': 1, 'route-version': 2},
+      });
+      expect(event, {
+        'method': 'message',
+        'arguments': [
+          {
+            'type': 'routeChanged',
+            'data': {'core-epoch': 1, 'route-version': 2},
+          },
+        ],
+      });
+    },
+  );
+
+  test(
+    'runtime contract IpcServer sends only typed subscriptions on the real browser socket port',
+    () async {
+      _evaluate(
+        r'''
+      window.__runtimeSocketFrames = [];
+      window.__flclashWeb = window.__flclashWeb || {};
+      window.__flclashWeb.CoreWebSocket = class {
+        constructor(url) {
+          this.readyState = 1;
+          if (!url.endsWith('/ws/v1/events')) throw new Error('Wrong event endpoint');
+          setTimeout(() => this.onopen && this.onopen({}), 0);
+        }
+        send(text) { window.__runtimeSocketFrames.push(JSON.parse(text)); }
+        close() { this.readyState = 3; }
+      };
+    '''
+            .toJS,
+      );
+      final transport = _RuntimeTransport();
+      transport.respond = (request) => request.path == '/api/v1/meta'
+          ? _answer('0', _meta('0'))
+          : _answer('0', 9);
+      final (repo, _) = await _binding(transport);
+      addTearDown(repo.close);
+      final server = await IpcServer.bind(address: 'runtime-test-ipc');
+      addTearDown(server.close);
+      final connected = Completer<void>();
+      final response = Completer<Map<String, Object?>>();
+      final subscription = server.events().listen((event) {
+        if (event.kind == IpcEventKind.connected && !connected.isCompleted)
+          connected.complete();
+        if (event.kind == IpcEventKind.message && !response.isCompleted)
+          response.complete(
+            Map<String, Object?>.from(
+              jsonDecode(utf8.decode(event.payload)) as Map,
+            ),
+          );
+      });
+      addTearDown(subscription.cancel);
+      WebCoreBridge.instance.notifyProcessStarted('runtime-test-ipc', 42);
+      await connected.future.timeout(const Duration(seconds: 2));
+      server.send(
+        message: Uint8List.fromList(
+          utf8.encode(
+            jsonEncode({'id': 'ipc-request', 'method': 'connection.count'}),
+          ),
+        ),
+      );
+      expect(await response.future.timeout(const Duration(seconds: 2)), {
+        'id': 'ipc-request',
+        'result': 9,
+      });
+      expect(
+        (_evaluate(
+                  'window.__runtimeSocketFrames.every(frame => frame.type === "subscribe" && frame.method === undefined)'
+                      .toJS,
+                )
+                as JSBoolean)
+            .toDart,
+        true,
+      );
+      expect(transport.requests.last.path, '/api/v1/runtime/connections/count');
+    },
+  );
+
+  for (final corruption in [
+    'initialOperation',
+    'initialAction',
+    'initialRevision',
+    'initialPhase',
+    'pollOperation',
+    'pollAction',
+    'pollRevision',
+    'pollEnvelope',
+  ]) {
+    test(
+      'runtime contract rejects foreign receipt/state provenance $corruption',
+      () async {
+        final transport = _RuntimeTransport();
+        String? originalOperation;
+        Map<String, Object?> initial() => {
+          'operationId': corruption == 'initialOperation'
+              ? 'foreign-operation-0001'
+              : originalOperation,
+          'action': corruption == 'initialAction'
+              ? 'clear-dns-cache'
+              : 'reset-traffic',
+          'desiredRevision': corruption == 'initialRevision' ? '2' : '1',
+          'phase': corruption == 'initialPhase' ? 'applied' : 'pending',
+        };
+        transport.respond = (request) {
+          if (request.path == '/api/v1/meta') return _answer('0', _meta('0'));
+          if (request.path == '/api/v1/runtime/state') return _answer('0', {});
+          if (request.path == '/api/v1/runtime/traffic:reset') {
+            final payload = jsonDecode(request.body!) as Map;
+            originalOperation = payload['operationId'] as String;
+            return _answer('1', initial(), operationId: originalOperation);
+          }
+          if (request.path == '/api/v1/operations/$originalOperation') {
+            return _answer('1', initial(), operationId: originalOperation);
+          }
+          if (request.path == '/api/v1/runtime/operations/$originalOperation') {
+            return _answer(
+              '1',
+              {
+                'operationId': corruption == 'pollOperation'
+                    ? 'foreign-operation-0002'
+                    : originalOperation,
+                'action': corruption == 'pollAction'
+                    ? 'clear-dns-cache'
+                    : 'reset-traffic',
+                'desiredRevision': corruption == 'pollRevision' ? '2' : '1',
+                'phase': 'applied',
+                'result': {'unexpectedSuccess': true},
+              },
+              operationId: corruption == 'pollEnvelope'
+                  ? 'foreign-operation-0003'
+                  : null,
+            );
+          }
+          throw StateError(request.path);
+        };
+        final (repo, binding) = await _binding(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          binding.command('traffic:reset', {}),
+          throwsA(isA<WebApiException>()),
+        );
+        expect(
+          transport.requests.where(
+            (request) => request.path == '/api/v1/runtime/traffic:reset',
+          ),
+          hasLength(1),
+        );
+        if (corruption.startsWith('initial')) {
+          expect(
+            transport.requests.where(
+              (request) =>
+                  request.path.startsWith('/api/v1/runtime/operations/'),
+            ),
+            isEmpty,
+          );
+        }
+      },
+    );
+  }
+
+  test(
+    'runtime contract recovers Unknown with the original pending operation and never remints it',
+    () async {
+      final transport = _RuntimeTransport();
+      String? originalOperation;
+      transport.respond = (request) {
+        if (request.path == '/api/v1/meta') return _answer('0', _meta('0'));
+        if (request.path == '/api/v1/runtime/state') return _answer('0', {});
+        if (request.path == '/api/v1/runtime/traffic:reset') {
+          originalOperation =
+              (jsonDecode(request.body!) as Map)['operationId'] as String;
+          return const ApiResponse(503, '{}');
+        }
+        if (request.path == '/api/v1/operations/$originalOperation')
+          return _answer('1', {
+            'operationId': originalOperation,
+            'action': 'reset-traffic',
+            'desiredRevision': '1',
+            'phase': 'pending',
+          }, operationId: originalOperation);
+        if (request.path == '/api/v1/runtime/operations/$originalOperation')
+          return _answer('1', {
+            'operationId': originalOperation,
+            'action': 'reset-traffic',
+            'desiredRevision': '1',
+            'phase': 'applied',
+            'result': {'confirmed': true},
+          });
+        throw StateError(request.path);
+      };
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      expect(await binding.command('traffic:reset', {}), {'confirmed': true});
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/runtime/traffic:reset',
+        ),
+        hasLength(1),
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/operations/$originalOperation',
+        ),
+        hasLength(1),
+      );
+      expect(repo.pendingOperation, isNull);
+    },
+  );
+}

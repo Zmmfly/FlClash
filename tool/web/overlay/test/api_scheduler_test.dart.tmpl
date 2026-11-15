@@ -1,0 +1,362 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_scheduler/index.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _profile = '9223372036854775807';
+const _flight = 'scheduler-0123456789abcdef0123456789abcdef';
+
+Map<String, Object?> _target({String phase = 'due'}) => {
+  'kind': 'profile',
+  'id': _profile,
+  'enabled': true,
+  'missingContent': false,
+  'phase': phase,
+  'failures': 0,
+  'requiresApply': false,
+  'confirmationRequired': false,
+};
+
+class _SchedulerHTTP implements ApiTransport {
+  final requests = <ApiRequest>[];
+  String revision = '17';
+  bool running = false;
+  bool safeMode = false;
+  bool closed = false;
+  bool dropTriggerResponse = false;
+  bool fakeUpdatedReceipt = false;
+  String targetPhase = 'due';
+  List<Object?>? targetOverride;
+  Completer<void>? statusGate;
+  Completer<void>? statusStarted;
+  Completer<void>? triggerGate;
+  Completer<void>? triggerStarted;
+  Map<String, Object?>? receipt;
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    if (request.path == '/api/v1/meta') {
+      return _ok({
+        'storeId': 'scheduler-fixture-store',
+        'schemaVersion': 1,
+        'revision': revision,
+      });
+    }
+    if (request.path.startsWith('/api/v1/operations/')) {
+      return ApiResponse(200, jsonEncode(receipt));
+    }
+    if (request.path == '/api/v1/scheduler' && request.method == 'GET') {
+      statusStarted?.complete();
+      statusStarted = null;
+      await statusGate?.future;
+      return _ok({
+        'running': running,
+        'started': true,
+        'closed': closed,
+        'safeMode': safeMode,
+        if (running) 'flightId': _flight,
+        'targets': targetOverride ?? [_target(phase: targetPhase)],
+      });
+    }
+    if (request.path != '/api/v1/scheduler:trigger' ||
+        request.method != 'POST') {
+      throw StateError('Unexpected scheduler request');
+    }
+    final body = Map<String, Object?>.from(jsonDecode(request.body!) as Map);
+    if (body['expectedRevision'] != revision) {
+      return ApiResponse(
+        409,
+        jsonEncode({
+          'revision': revision,
+          'error': {
+            'code': 'revision_conflict',
+            'message': 'synthetic conflict',
+          },
+        }),
+      );
+    }
+    triggerStarted?.complete();
+    await triggerGate?.future;
+    revision = (int.parse(revision) + 1).toString();
+    running = true;
+    receipt = {
+      'revision': revision,
+      'operationId': body['operationId'],
+      'data': {
+        'flightId': _flight,
+        'coalesced': false,
+        'phase': fakeUpdatedReceipt ? 'updated' : 'accepted',
+      },
+    };
+    if (dropTriggerResponse) {
+      return ApiResponse(
+        503,
+        jsonEncode({
+          'error': {'code': 'synthetic_drop'},
+        }),
+      );
+    }
+    return ApiResponse(200, jsonEncode(receipt));
+  }
+
+  ApiResponse _ok(Object? data) =>
+      ApiResponse(200, jsonEncode({'revision': revision, 'data': data}));
+
+  @override
+  void close() {}
+}
+
+void main() {
+  late _SchedulerHTTP http;
+  late WebApiRepository repository;
+  late WebSchedulerService scheduler;
+  late MemoryApiOperationJournal journal;
+
+  setUp(() async {
+    http = _SchedulerHTTP();
+    journal = MemoryApiOperationJournal();
+    repository = WebApiRepository(transport: http, journal: journal);
+    scheduler = WebSchedulerService(repository);
+    await repository.initialize();
+  });
+  tearDown(() async {
+    await repository.close();
+  });
+
+  test(
+    'api-scheduler-contract: timer hints one typed flight, not client downloads',
+    () async {
+      http.statusGate = Completer<void>();
+      final first = scheduler.hintDue();
+      final second = scheduler.hintDue();
+      http.statusGate!.complete();
+      final results = await Future.wait([first, second]);
+      expect(results.every((status) => status.running), isTrue);
+      final posts = http.requests
+          .where((request) => request.method == 'POST')
+          .toList();
+      expect(posts, hasLength(1));
+      expect(posts.single.path, '/api/v1/scheduler:trigger');
+      final body = Map<String, Object?>.from(
+        jsonDecode(posts.single.body!) as Map,
+      );
+      expect(body.keys.toSet(), {'intent', 'expectedRevision', 'operationId'});
+      expect(body['expectedRevision'], '17');
+      expect(body['intent'], 'run-due-updates');
+      expect(repository.pendingOperation, isNull);
+      expect(
+        http.requests.every(
+          (request) => {
+            '/api/v1/meta',
+            '/api/v1/scheduler',
+            '/api/v1/scheduler:trigger',
+          }.contains(request.path),
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'api-scheduler-contract: accepted receipt is never runtime updated',
+    () async {
+      final original = await scheduler.status();
+      final accepted = await scheduler.trigger(original);
+      expect(accepted.flightId, _flight);
+      expect(accepted.coalesced, isFalse);
+      expect(original.targets.single.id, _profile);
+      expect(original.targets.single.requiresApply, isFalse);
+      expect(http.requests.where((r) => r.method == 'POST'), hasLength(1));
+    },
+  );
+
+  test(
+    'api-scheduler-contract: stale read sends original CAS and never rebases',
+    () async {
+      final original = await scheduler.status();
+      http.revision = '18';
+      await expectLater(
+        scheduler.trigger(original),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      final posts = http.requests.where((r) => r.method == 'POST').toList();
+      expect(posts, hasLength(1));
+      expect((jsonDecode(posts.single.body!) as Map)['expectedRevision'], '17');
+      expect(repository.pendingOperation, isNull);
+    },
+  );
+
+  test(
+    'api-scheduler-contract: unknown trigger recovers receipt without a redo',
+    () async {
+      final original = await scheduler.status();
+      http.dropTriggerResponse = true;
+      await expectLater(
+        scheduler.trigger(original),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final operation = repository.pendingOperation!;
+      await repository.recoverOperation(operation.operationId);
+      expect(repository.pendingOperation, isNull);
+      expect(http.requests.where((r) => r.method == 'POST'), hasLength(1));
+      expect(
+        http.requests.last.path,
+        '/api/v1/operations/${operation.operationId}',
+      );
+    },
+  );
+
+  test(
+    'api-scheduler-contract: preinitialize registration recovers reload journal',
+    () async {
+      final original = await scheduler.status();
+      http.dropTriggerResponse = true;
+      await expectLater(
+        scheduler.trigger(original),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final operationId = repository.pendingOperation!.operationId;
+      await repository.close();
+      repository = WebApiRepository(transport: http, journal: journal);
+      registerWebSchedulerReceipts(repository);
+      await repository.initialize();
+      expect(repository.pendingOperation, isNull);
+      expect(http.requests.where((r) => r.method == 'POST'), hasLength(1));
+      expect(
+        http.requests.any((r) => r.path == '/api/v1/operations/$operationId'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'api-scheduler-contract: logout invalidates a late accepted response',
+    () async {
+      final original = await scheduler.status();
+      http.triggerStarted = Completer<void>();
+      http.triggerGate = Completer<void>();
+      final trigger = scheduler.trigger(original);
+      final expectation = expectLater(
+        trigger,
+        throwsA(isA<WebApiSessionException>()),
+      );
+      await http.triggerStarted!.future;
+      repository.endSession();
+      http.triggerGate!.complete();
+      await expectation;
+      expect(repository.isSessionActive, isFalse);
+    },
+  );
+
+  test(
+    'api-scheduler-contract: new session never joins a previous session hint',
+    () async {
+      final entered = Completer<void>();
+      final previousGate = Completer<void>();
+      http.statusStarted = entered;
+      http.statusGate = previousGate;
+      final previous = scheduler.hintDue();
+      final rejected = expectLater(
+        previous,
+        throwsA(isA<WebApiSessionException>()),
+      );
+      await entered.future;
+      repository.endSession();
+      repository.beginSession();
+      await repository.initialize();
+      http.statusGate = null;
+      final current = await scheduler.hintDue();
+      expect(current.running, isTrue);
+      previousGate.complete();
+      await rejected;
+      expect(http.requests.where((r) => r.method == 'POST'), hasLength(1));
+    },
+    timeout: const Timeout(Duration(seconds: 30)),
+  );
+
+  for (final phase in ['blocked', 'unknown', 'backoff', 'disabled', 'idle']) {
+    test('api-scheduler-contract: $phase is a read-only timer hint', () async {
+      http.targetPhase = phase;
+      await scheduler.hintDue();
+      expect(http.requests.where((r) => r.method == 'POST'), isEmpty);
+    });
+  }
+
+  test(
+    'api-scheduler-contract: SafeMode and active server flights never trigger',
+    () async {
+      http.safeMode = true;
+      await scheduler.hintDue();
+      http.safeMode = false;
+      http.running = true;
+      await scheduler.hintDue();
+      expect(http.requests.where((r) => r.method == 'POST'), isEmpty);
+    },
+  );
+
+  test(
+    'api-scheduler-contract: exact opaque geo identity stays a decimal string',
+    () async {
+      final opaque = ((BigInt.one << 256) - BigInt.one).toString();
+      http.targetOverride = [
+        {..._target(), 'kind': 'geo', 'id': opaque, 'name': 'MMDB'},
+      ];
+      final result = await scheduler.status();
+      expect(result.targets.single.id, opaque);
+    },
+  );
+
+  for (final invalid in <Object?>[
+    {..._target(), 'id': 9007199254740992},
+    {..._target(), 'kind': 'method'},
+    {..._target(), 'phase': 'updated'},
+    {..._target(), 'enabled': 'true'},
+    {..._target(), 'id': '9223372036854775808'},
+    {..._target(), 'nextAttempt': 'not-a-time'},
+  ]) {
+    test(
+      'api-scheduler-contract: rejects malformed typed status ${jsonEncode(invalid)}',
+      () async {
+        http.targetOverride = [invalid];
+        await expectLater(
+          scheduler.status(),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(http.requests.where((r) => r.method == 'POST'), isEmpty);
+      },
+    );
+  }
+
+  test(
+    'api-scheduler-contract: duplicate target identities fail closed',
+    () async {
+      http.targetOverride = [_target(), _target()];
+      await expectLater(
+        scheduler.status(),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'api-scheduler-contract: fake updated acknowledgement remains unknown',
+    () async {
+      final original = await scheduler.status();
+      http.fakeUpdatedReceipt = true;
+      await expectLater(
+        scheduler.trigger(original),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      expect(repository.pendingOperation, isNotNull);
+    },
+  );
+}

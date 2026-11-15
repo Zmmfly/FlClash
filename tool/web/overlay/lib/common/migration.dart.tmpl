@@ -1,0 +1,12 @@
+import 'package:fl_clash/common/preferences.dart';
+import 'package:fl_clash/models/models.dart';
+
+class Migration {
+  static const currentVersion = 1;
+  static const upgradeVersion = 4;
+
+  Future<Config> run() async =>
+      Config.realFromJson(await preferences.getConfigMap());
+}
+
+final migration = Migration();

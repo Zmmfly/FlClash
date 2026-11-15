@@ -1,0 +1,603 @@
+import 'dart:async';
+
+import 'package:collection/collection.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+import 'presentation.dart';
+import 'schema.dart';
+
+enum WebSettingsSection {
+  app,
+  window,
+  vpn,
+  network,
+  theme,
+  currentProfile,
+  dav,
+  hotkeys,
+  proxiesStyle,
+  patch,
+  excludeSSIDs,
+}
+
+class WebSettingsFailure {
+  const WebSettingsFailure(this.code, this.message, {this.operationId});
+  final String code;
+  final String message;
+  final String? operationId;
+}
+
+class WebSettingsCommittedRefreshException extends WebApiException {
+  const WebSettingsCommittedRefreshException()
+    : super(
+        'settings_committed_refresh_failed',
+        'Settings committed, but canonical state could not be refreshed',
+      );
+}
+
+class WebSettingsData {
+  const WebSettingsData(this.config);
+  final Config config;
+
+  factory WebSettingsData.decode(Object? value, ApiModelCodec codec) {
+    validateWebSettings(value);
+    try {
+      final object = apiObject(value);
+      final runtime = apiObject(object['runtime']);
+      final network = apiObject(object['network']);
+      final patch = apiObject(runtime['patchClashConfig']);
+      if (!const {'always', 'off'}.contains(patch['find-process-mode']) ||
+          !const {
+            'clear',
+            'follow',
+            'custom',
+          }.contains(patch['interface-name-mode'])) {
+        throw const WebApiProtocolException('Unknown typed settings enum');
+      }
+      _settingsKeys(
+        patch['dns-override-keys'],
+        DnsOverrideKey.values.map((key) => key.path),
+      );
+      _settingsKeys(
+        patch['tun-override-keys'],
+        TunOverrideKey.values.map((key) => key.path),
+      );
+      _settingsKeys(
+        patch['general-override-keys'],
+        GeneralOverrideKey.values.map((key) => key.path),
+      );
+      final tunJSON = apiObject(patch['tun']);
+      final overrideJSON = apiObject(patch['tun-override']);
+      for (final section in [tunJSON, overrideJSON]) {
+        final mtu = section['mtu'] as int;
+        if (mtu < minTunMtu ||
+            mtu > maxTunMtu ||
+            !congestionControllers.contains(section['congestion-controller'])) {
+          throw const WebApiProtocolException('Invalid typed TUN settings');
+        }
+      }
+      final dns = Dns.fromJson(apiObject(patch['dns']));
+      final tun = Tun.fromJson(tunJSON);
+      final tunOverride = ProfileTun.fromJson(overrideJSON);
+      final app = AppSettingProps.fromJson(apiObject(runtime['appSetting']));
+      final profile = object['currentProfileId'];
+      final dav = object['dav'];
+      final clash = PatchClashConfig.fromJson(
+        patch,
+      ).copyWith(dns: dns, tun: tun, tunOverride: tunOverride);
+      return WebSettingsData(
+        Config(
+          themeProps: defaultThemeProps,
+          appSettingProps: app,
+          patchClashConfig: clash,
+          networkProps: NetworkProps.fromJson(
+            apiObject(network['networkProps']),
+          ),
+          vpnProps: VpnProps.fromJson(apiObject(network['vpnProps'])),
+          excludeSSIDs: List<String>.from(network['excludeSSIDs'] as List),
+          currentProfileId: profile == null
+              ? null
+              : codec.id(ApiIdentity.profile, profile),
+          davProps: dav == null ? null : _dav(apiObject(dav)),
+        ),
+      );
+    } catch (_) {
+      throw const WebApiProtocolException(
+        'Server settings contain unsupported typed values',
+      );
+    }
+  }
+}
+
+void _settingsKeys(Object? value, Iterable<String> allowed) {
+  final keys = List<String>.from(value as List);
+  final names = allowed.toSet();
+  if (keys.toSet().length != keys.length ||
+      keys.any((key) => !names.contains(key))) {
+    throw const WebApiProtocolException(
+      'Unknown or duplicate typed override key',
+    );
+  }
+}
+
+DAVProps _dav(Map<String, Object?> value) => DAVProps(
+  uri: value['uri'] as String,
+  user: value['user'] as String,
+  password: value['password'] as String,
+  fileName: value['fileName'] as String,
+);
+
+class WebSettingsController {
+  WebSettingsController({
+    required this.repository,
+    WebSettingsPresentationStore? presentation,
+    this.onFailure,
+  }) : presentation = presentation ?? WebSettingsPresentationStore() {
+    repository.registerExternalReceipt('settings', _decode);
+    repository.registerExternalReceipt('settings:selected-map', (value) {
+      final object = apiObject(value);
+      repository.codec.id(ApiIdentity.profile, object['profileId']);
+      if (object['groupName'] is! String ||
+          (object['proxyName'] != null && object['proxyName'] is! String)) {
+        throw const WebApiProtocolException('Invalid selected-map receipt');
+      }
+      return object;
+    });
+    _repositorySubscription = repository.changes.listen((_) => _invalidate());
+    _sessionSubscription = repository.sessionChanges.listen((_) {
+      _epoch++;
+      _loaded = false;
+      _version = null;
+      _publish(this.presentation.merge(Config.realFromJson(null)));
+    });
+  }
+
+  final WebApiRepository repository;
+  final WebSettingsPresentationStore presentation;
+  final void Function(WebSettingsFailure failure)? onFailure;
+  final _changes = StreamController<Config>.broadcast(sync: true);
+  late final StreamSubscription<void> _repositorySubscription;
+  late final StreamSubscription<void> _sessionSubscription;
+  Config _config = Config.realFromJson(null);
+  Future<void> _queue = Future<void>.value();
+  Future<Config>? _loading;
+  bool _loaded = false;
+  bool _busy = false;
+  bool _reloadRequested = false;
+  bool _closed = false;
+  int _epoch = 0;
+  WebSettingsFailure? _failure;
+  ApiEditVersion? _version;
+  final _baselines = Expando<Config>('settings-read-baselines');
+
+  Config get config => _config;
+  bool get isLoaded => _loaded;
+  Stream<Config> get changes => _changes.stream;
+  WebSettingsFailure? get failure => _failure;
+
+  ApiEditVersion captureEditVersion() {
+    final version = _version;
+    if (version == null) {
+      throw const WebApiProtocolException('Read settings before editing');
+    }
+    return version;
+  }
+
+  WebSettingsData _decode(Object? value) =>
+      WebSettingsData.decode(value, repository.codec);
+
+  Future<Config> load({bool refresh = false}) {
+    if (_closed) return Future.error(const WebApiSessionException());
+    if (_loaded && !refresh) return Future.value(_config);
+    return _loading ??= _load().whenComplete(() => _loading = null);
+  }
+
+  Future<Config> _load() async {
+    await repository.initialize();
+    final value = await _fetch();
+    _loaded = true;
+    _publish(value);
+    return value;
+  }
+
+  Future<Config> _fetch() async {
+    final epoch = _epoch;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final pending = repository.pendingOperation;
+      if (pending != null) {
+        throw WebApiPendingOperationException(pending.operationId);
+      }
+      final receipt = await repository.readExternal('/api/v1/settings');
+      if (_closed || epoch != _epoch) throw const WebApiSessionException();
+      if (repository.pendingOperation case final pending?) {
+        throw WebApiPendingOperationException(pending.operationId);
+      }
+      if (compareApiRevisions(receipt.revision, repository.revision!) < 0) {
+        continue;
+      }
+      final data = _decode(receipt.data);
+      final version = repository.captureReadVersion(receipt);
+      final config = presentation.merge(data.config);
+      _version = version;
+      _baselines[version] = config;
+      return config;
+    }
+    throw const WebApiProtocolException(
+      'Settings changed during refresh; retry',
+    );
+  }
+
+  void _invalidate() {
+    if (!_loaded || _closed) return;
+    _reloadRequested = true;
+    if (_busy || repository.pendingOperation != null) return;
+    unawaited(
+      _enqueue(() async {
+        _reloadRequested = false;
+        _publish(await _fetch());
+      }).catchError((Object _) {}),
+    );
+  }
+
+  void _publish(Config value) {
+    _config = value;
+    if (!_closed) _changes.add(value);
+  }
+
+  Future<void> _enqueue(Future<void> Function() action) {
+    final done = Completer<void>();
+    final epoch = _epoch;
+    _queue = _queue.then((_) async {
+      if (_closed || epoch != _epoch) {
+        done.completeError(const WebApiSessionException());
+        return;
+      }
+      _busy = true;
+      try {
+        await action();
+        _failure = null;
+        done.complete();
+      } catch (error, stack) {
+        _report(error);
+        if (repository.pendingOperation == null && repository.isSessionActive) {
+          try {
+            _publish(await _fetch());
+          } catch (_) {}
+        }
+        done.completeError(error, stack);
+      } finally {
+        _busy = false;
+        if (_reloadRequested && repository.pendingOperation == null) {
+          _invalidate();
+        }
+      }
+    });
+    return done.future;
+  }
+
+  void _report(Object error) {
+    final operationId = switch (error) {
+      WebApiUnknownCommitException(:final operationId) => operationId,
+      WebApiPendingOperationException(:final operationId) => operationId,
+      _ => null,
+    };
+    final code = error is WebApiException
+        ? error.code
+        : 'settings_update_failed';
+    final failure = WebSettingsFailure(
+      code,
+      error is WebSettingsCommittedRefreshException
+          ? 'Settings committed, but refreshed values could not be published. Retry refresh ($code).'
+          : operationId == null
+          ? 'Settings were not published. Server state will be refreshed ($code).'
+          : 'Settings are awaiting an operation receipt. Recover before making another change ($code).',
+      operationId: operationId,
+    );
+    _failure = failure;
+    try {
+      onFailure?.call(failure);
+    } catch (_) {}
+  }
+
+  Future<void> set(
+    WebSettingsSection section,
+    Object? value, {
+    ApiEditVersion? editVersion,
+  }) {
+    final baseline = editVersion == null ? _config : _baselines[editVersion];
+    final version = editVersion ?? _version;
+    return _enqueue(() async {
+      if (baseline == null) {
+        throw const WebApiProtocolException(
+          'Settings edit baseline is not available',
+        );
+      }
+      await _commit(
+        section,
+        _encode(section, _section(baseline, section)),
+        _encode(section, value),
+        version,
+      );
+    });
+  }
+
+  Future<void> update<T>(
+    WebSettingsSection section,
+    T Function(T value) builder,
+  ) => _enqueue(() async {
+    final value = _section(_config, section) as T;
+    await _commit(
+      section,
+      _encode(section, value),
+      _encode(section, builder(value)),
+      _version,
+    );
+  });
+
+  Future<void> _commit(
+    WebSettingsSection section,
+    Object? before,
+    Object? next,
+    ApiEditVersion? version,
+  ) async {
+    if (const DeepCollectionEquality().equals(before, next)) return;
+    if (!_loaded) {
+      throw const WebApiProtocolException(
+        'Load authoritative settings before editing',
+      );
+    }
+    Map<String, Object?>? local;
+    String? route;
+    var payload = <String, Object?>{};
+    switch (section) {
+      case WebSettingsSection.app:
+        final changes = _diff(apiObject(before), apiObject(next));
+        local = {
+          for (final key in webBrowserAppKeys)
+            if (changes.containsKey(key)) key: changes[key],
+        };
+        final server = {
+          for (final key in webServerAppKeys)
+            if (changes.containsKey(key)) key: changes[key],
+        };
+        if (server.isNotEmpty) {
+          route = 'runtime';
+          payload = {
+            'patch': {'appSetting': server},
+          };
+        }
+      case WebSettingsSection.patch:
+        route = 'runtime';
+        payload = {
+          'patch': {
+            'patchClashConfig': _diff(
+              apiObject(before),
+              apiObject(next),
+              path: 'patch',
+            ),
+          },
+        };
+      case WebSettingsSection.network:
+        route = 'network';
+        payload = {
+          'patch': {
+            'networkProps': _diff(
+              apiObject(before),
+              apiObject(next),
+              path: 'network',
+            ),
+          },
+        };
+      case WebSettingsSection.vpn:
+        route = 'network';
+        payload = {
+          'patch': {
+            'vpnProps': _diff(apiObject(before), apiObject(next), path: 'vpn'),
+          },
+        };
+      case WebSettingsSection.excludeSSIDs:
+        route = 'network';
+        payload = {
+          'patch': {'excludeSSIDs': next},
+        };
+      case WebSettingsSection.currentProfile:
+        route = 'current-profile';
+        final id = next as int?;
+        payload = {
+          'currentProfileId': id == null
+              ? null
+              : repository.codec.wireId(ApiIdentity.profile, id),
+        };
+      case WebSettingsSection.dav:
+        route = 'dav';
+        payload = {
+          'dav': next == null
+              ? null
+              : _diff(
+                  before == null ? const {} : apiObject(before),
+                  apiObject(next),
+                ),
+        };
+      case WebSettingsSection.window:
+      case WebSettingsSection.theme:
+      case WebSettingsSection.hotkeys:
+      case WebSettingsSection.proxiesStyle:
+        local = section == WebSettingsSection.hotkeys
+            ? {'hotKeyActions': next}
+            : _diff(apiObject(before), apiObject(next));
+    }
+    Config value = _config;
+    if (route != null) {
+      if (version == null) {
+        throw const WebApiProtocolException('Read settings before editing');
+      }
+      await repository.executeExternalCommand(
+        '/api/v1/settings:$route',
+        payload,
+        _decode,
+        editVersion: version,
+      );
+      try {
+        value = await _fetch();
+        _reloadRequested = false;
+      } catch (_) {
+        throw const WebSettingsCommittedRefreshException();
+      }
+    }
+    if (local != null && local.isNotEmpty) {
+      value = _local(value, section, local);
+      presentation.save(value);
+    }
+    _publish(value);
+  }
+
+  Future<void> selectMap({
+    required int profileId,
+    required String groupName,
+    required String? proxyName,
+    required ApiEditVersion editVersion,
+  }) => _enqueue(() async {
+    await repository.executeExternalCommand(
+      '/api/v1/settings:selected-map',
+      {
+        'profileId': repository.codec.wireId(ApiIdentity.profile, profileId),
+        'groupName': groupName,
+        'proxyName': proxyName,
+      },
+      (value) => apiObject(value),
+      editVersion: editVersion,
+    );
+  });
+
+  Future<void> recover(String operationId, {bool resolve = false}) async {
+    await repository.recoverOperation(operationId, resolve: resolve);
+    await load(refresh: true);
+  }
+
+  Future<void> savePresentation(Config value) async {
+    presentation.save(value);
+  }
+
+  Future<void> clearPresentation() async {
+    presentation.clear();
+    if (_loaded) _publish(await _fetch());
+  }
+
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    await _repositorySubscription.cancel();
+    await _sessionSubscription.cancel();
+    await _changes.close();
+  }
+}
+
+Object? _section(Config value, WebSettingsSection section) => switch (section) {
+  WebSettingsSection.app => value.appSettingProps,
+  WebSettingsSection.window => value.windowProps,
+  WebSettingsSection.vpn => value.vpnProps,
+  WebSettingsSection.network => value.networkProps,
+  WebSettingsSection.theme => value.themeProps,
+  WebSettingsSection.currentProfile => value.currentProfileId,
+  WebSettingsSection.dav => value.davProps,
+  WebSettingsSection.hotkeys => value.hotKeyActions,
+  WebSettingsSection.proxiesStyle => value.proxiesStyleProps,
+  WebSettingsSection.patch => value.patchClashConfig,
+  WebSettingsSection.excludeSSIDs => value.excludeSSIDs,
+};
+
+Object? _encode(WebSettingsSection section, Object? value) {
+  if (section == WebSettingsSection.currentProfile) return value;
+  if (section == WebSettingsSection.dav) {
+    final dav = value as DAVProps?;
+    return dav == null
+        ? null
+        : {
+            'uri': dav.uri,
+            'user': dav.user,
+            'password': dav.password,
+            'fileName': dav.fileName,
+          };
+  }
+  if (value is List<String>) return value;
+  if (value is List<HotKeyAction>) {
+    return [for (final key in value) settingsJson(key)];
+  }
+  return settingsJson(value);
+}
+
+const _nested = {
+  'patch.tun',
+  'patch.dns',
+  'patch.dns.fallback-filter',
+  'patch.tun-override',
+  'patch.geox-url',
+  'patch.mitm',
+  'network.authentication',
+  'vpn.accessControlProps',
+};
+const _nullable = {
+  'patch.global-ua',
+  'patch.mitm.trusted-fingerprint',
+  'patch.mitm.capture-entries',
+};
+
+Map<String, Object?> _diff(
+  Map<String, Object?> before,
+  Map<String, Object?> next, {
+  String path = '',
+}) => {
+  for (final entry in next.entries)
+    if (!const DeepCollectionEquality().equals(before[entry.key], entry.value))
+      entry.key: _nested.contains('$path.${entry.key}')
+          ? _diff(
+              apiObject(before[entry.key]),
+              apiObject(entry.value),
+              path: '$path.${entry.key}',
+            )
+          : _nullable.contains('$path.${entry.key}')
+          ? {'value': entry.value}
+          : entry.value,
+};
+
+Config _local(
+  Config value,
+  WebSettingsSection section,
+  Map<String, Object?> patch,
+) => switch (section) {
+  WebSettingsSection.app => value.copyWith(
+    appSettingProps: AppSettingProps.fromJson({
+      ...settingsJson(value.appSettingProps),
+      ...patch,
+    }),
+  ),
+  WebSettingsSection.window => value.copyWith(
+    windowProps: WindowProps.fromJson({
+      ...settingsJson(value.windowProps),
+      ...patch,
+    }),
+  ),
+  WebSettingsSection.theme => value.copyWith(
+    themeProps: ThemeProps.fromJson({
+      ...settingsJson(value.themeProps),
+      ...patch,
+    }),
+  ),
+  WebSettingsSection.proxiesStyle => value.copyWith(
+    proxiesStyleProps: ProxiesStyleProps.fromJson({
+      ...settingsJson(value.proxiesStyleProps),
+      ...patch,
+    }),
+  ),
+  WebSettingsSection.hotkeys => value.copyWith(
+    hotKeyActions: [
+      for (final item in patch['hotKeyActions'] as List)
+        HotKeyAction.fromJson(apiObject(item)),
+    ],
+  ),
+  _ => throw const WebApiProtocolException(
+    'Server settings cannot enter browser presentation',
+  ),
+};

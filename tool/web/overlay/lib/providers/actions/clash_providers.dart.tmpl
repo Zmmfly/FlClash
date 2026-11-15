@@ -1,0 +1,157 @@
+part of '../action.dart';
+
+@Riverpod(keepAlive: true)
+class ClashProvidersAction extends _$ClashProvidersAction {
+  @override
+  void build() {}
+
+  Future<ClashProvider> putProvider(
+    ClashProvider provider, {
+    ClashProvider? previous,
+    List<int>? content,
+    bool refresh = false,
+    ApiEditVersion? editVersion,
+  }) async {
+    final repository = database.repository;
+    final bound = repository.identities.isBound(
+      ApiIdentity.clashProvider,
+      provider.id,
+    );
+    final version =
+        editVersion ??
+        (bound
+            ? repository.captureEditVersion(
+                ApiIdentity.clashProvider,
+                previous ?? provider,
+              )
+            : repository.captureCreateVersion(ApiIdentity.clashProvider));
+    final canonical = await WebContentWorkflows(repository, confirmSource: showWebSourceConsent).saveRuleProvider(
+      provider,
+      bytes: content,
+      refresh:
+          refresh ||
+          provider.isRemote && (!bound || provider.url != previous?.url),
+      editVersion: version,
+    );
+    await applyIfReferenced(ProviderKind.rule, {
+      canonical.label,
+      ?previous?.label,
+    }, force: content != null || refresh);
+    return canonical;
+  }
+
+  Future<bool> syncRemote(ClashProvider provider) async {
+    final version = database.repository.captureEditVersion(
+      ApiIdentity.clashProvider,
+      provider,
+    );
+    final canonical = await WebContentWorkflows(
+      database.repository,
+    ).refreshRuleProvider(provider, editVersion: version);
+    if (canonical == provider) return true;
+    await applyIfReferenced(ProviderKind.rule, {canonical.label}, force: true);
+    return false;
+  }
+
+  Future<ClashProvider> prepare(ClashProvider provider) async => provider;
+
+  Future<void> delProvider(
+    ClashProvider provider, {
+    ApiEditVersion? editVersion,
+  }) async {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(
+          ApiIdentity.clashProvider,
+          provider,
+        );
+    await database.repository.deleteCatalog(database.repository.providers, [
+      provider.id,
+    ], editVersion: version);
+  }
+
+  Future<List<Profile>> profilesUsing(ClashProvider provider) {
+    return profilesReferencing(ProviderKind.rule, provider.label);
+  }
+
+  Future<List<Profile>> profilesReferencing(
+    ProviderKind kind,
+    String name,
+  ) async {
+    final ids = switch (kind) {
+      ProviderKind.proxy => await database.proxyGroupsDao.profileIdsUsing(name),
+      ProviderKind.rule => await database.rulesDao.profileIdsUsingRuleProvider(
+        name,
+      ),
+    };
+    return [
+      for (final profile in ref.read(profilesProvider))
+        if (ids.contains(profile.id) ||
+            kind == ProviderKind.rule &&
+                profile.type == ProfileType.custom &&
+                profile.overrides.ruleSets.contains(name))
+          profile,
+    ];
+  }
+
+  Future<bool> _isReferenced(
+    int profileId,
+    ProviderKind kind,
+    Set<String> labels,
+  ) async {
+    return switch (kind) {
+      ProviderKind.proxy =>
+        (await database.proxyGroupsDao.query(profileId).get()).any(
+          (group) => group.use?.any(labels.contains) ?? false,
+        ),
+      ProviderKind.rule =>
+        (ref
+                    .read(profilesProvider)
+                    .getProfile(profileId)
+                    ?.overrides
+                    .ruleSets
+                    .any(labels.contains) ??
+                false) ||
+            (await database.rulesDao.queryProfileRules(profileId).get()).any(
+              (rule) => rule.ruleSets.any(labels.contains),
+            ),
+    };
+  }
+
+  /// [force] reapplies a provider whose content changed under the same path,
+  /// which leaves the generated config unchanged.
+  Future<void> applyIfReferenced(
+    ProviderKind kind,
+    Set<String> labels, {
+    bool force = false,
+  }) => _applyIf(
+    (profileId) => _isReferenced(profileId, kind, labels),
+    force: force,
+  );
+
+  Future<void> applyIfProxiesNamed(Set<String> names) => _applyIf(
+    (profileId) async => (await database.proxyGroupsDao.query(profileId).get())
+        .any((group) => group.proxies?.any(names.contains) ?? false),
+  );
+
+  Future<void> _applyIf(
+    Future<bool> Function(int profileId) isReferenced, {
+    bool force = false,
+  }) async {
+    if (!await _currentUses(isReferenced)) {
+      return;
+    }
+    ref
+        .read(setupActionProvider.notifier)
+        .applyProfileDebounce(silence: true, force: force);
+  }
+
+  Future<bool> _currentUses(
+    Future<bool> Function(int profileId) isReferenced,
+  ) async {
+    final profile = ref.read(currentProfileProvider);
+    return profile != null &&
+        profile.type == ProfileType.custom &&
+        await isReferenced(profile.id);
+  }
+}

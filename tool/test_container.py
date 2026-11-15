@@ -8,6 +8,7 @@ unless --skip-image is explicit, a disposable authenticated image smoke test.
 import argparse
 import base64
 import copy
+import hashlib
 import http.client
 import json
 import os
@@ -20,7 +21,6 @@ import tempfile
 import time
 import uuid
 from http.cookies import SimpleCookie
-from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +78,8 @@ class ContainerCheck:
         data.mkdir(mode=0o700)
         auth = directory / 'auth'
         auth.mkdir(mode=0o700)
+        state = directory / 'state'
+        state.mkdir(mode=0o700)
         secret_dir = directory / 'secrets'
         secret_dir.mkdir(mode=0o700)
         secret_file = secret_dir / 'web_password'
@@ -88,6 +90,7 @@ class ContainerCheck:
         if os.getuid() == 0:
             os.chown(data, uid, gid)
             os.chown(auth, uid, gid)
+            os.chown(state, uid, gid)
             os.chown(secret_file, uid, gid)
         require(secret_file.stat().st_mode & 0o777 == 0o600,
                 'Temporary password secret must have mode 0600')
@@ -139,6 +142,7 @@ class ContainerCheck:
         environment = service.get('environment', {})
         require(environment.get('FLCLASH_DATA_DIR') == '/data' and
                 environment.get('FLCLASH_WEB_AUTH_FILE') == '/auth/credentials.json' and
+                environment.get('FLCLASH_WEB_API_STORE_DIR') == '/state' and
                 environment.get('FLCLASH_WEB_PASSWORD_FILE') == '/run/secrets/web_password' and
                 environment.get('FLCLASH_WEB_LISTEN') == '0.0.0.0:8080',
                 'Compose container data, secret, and listen paths must match their contract')
@@ -154,7 +158,12 @@ class ContainerCheck:
         require(len(auth_mounts) == 1 and auth_mounts[0].get('type') == 'bind' and
                 Path(auth_mounts[0]['source']).resolve() == self.directory / 'auth' and
                 auth_mounts[0].get('bind', {}).get('create_host_path') is False,
-                'Relative ./auth must persist credentials separately from the exposed data directory')
+                'Relative ./auth must persist credentials separately from the managed data directory')
+        state_mounts = [mount for mount in service.get('volumes', []) if mount.get('target') == '/state']
+        require(len(state_mounts) == 1 and state_mounts[0].get('type') == 'bind' and
+                Path(state_mounts[0]['source']).resolve() == self.directory / 'state' and
+                state_mounts[0].get('bind', {}).get('create_host_path') is False,
+                'Relative ./state must privately persist the API authority outside data and auth')
         require(Path(config['secrets']['web_password']['file']).resolve() ==
                 self.directory / 'secrets/web_password',
                 'Relative secret file must resolve inside the disposable project')
@@ -169,6 +178,7 @@ class ContainerCheck:
             port['published'] = '0'
             port['host_ip'] = '127.0.0.1'
         config['name'] = self.project
+        service['environment']['FLCLASH_WEB_SAFE_MODE'] = 'true'
         self.runtime_file.write_text(json.dumps(config), encoding='utf-8')
         self.compose(['config', '--quiet'], file=self.runtime_file)
         self.config = config
@@ -257,9 +267,28 @@ class ContainerCheck:
         require(uid == str(self.uid) and uid != '0', 'Running container must have the selected non-root UID')
         print('PASS: Docker healthcheck, login page, and effective non-root runtime hardening')
 
-    def request(self, method, path, body=None, cookie=None, headers=None):
+    def evaluator_licenses(self):
+        guest = ROOT / 'core/web_api_evaluate_guest'
+        manifest_bytes = (guest / 'manifest.json').read_bytes()
+        manifest = json.loads(manifest_bytes)
+        expected = dict(manifest['licenses'])
+        require(set(expected) == {'LICENSE', 'LICENSE.wasi-libc', 'LICENSE.musl', 'LICENSE.compiler-rt'},
+                'The embedded evaluator must account for every bundled runtime license')
+        expected['manifest.json'] = hashlib.sha256(manifest_bytes).hexdigest()
+        for name, digest in expected.items():
+            require(hashlib.sha256((guest / name).read_bytes()).hexdigest() == digest,
+                    'An evaluator license does not match its source manifest')
+            packaged = self.compose(['exec', '-T', SERVICE, 'cat',
+                                     '/usr/share/licenses/flclash/evaluator/' + name],
+                                    file=self.runtime_file).stdout
+            require(hashlib.sha256(packaged).hexdigest() == digest,
+                    'The image must preserve the embedded evaluator license and provenance bytes')
+        print('PASS: embedded evaluator licenses and provenance are present in the runtime image')
+
+    def request(self, method, path, body=None, cookie=None, headers=None, include_origin=True):
         request_headers = dict(headers or {})
-        request_headers['Origin'] = f'http://127.0.0.1:{self.port}'
+        if include_origin:
+            request_headers['Origin'] = f'http://127.0.0.1:{self.port}'
         if cookie:
             request_headers['Cookie'] = cookie
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
@@ -270,6 +299,17 @@ class ContainerCheck:
             return response.status, response.headers, content
         finally:
             connection.close()
+
+    def api(self, method, path, value=None, cookie=None, include_origin=True):
+        status, _, body = self.request(
+            method, path, body=None if value is None else json.dumps(value), cookie=cookie,
+            headers={'Content-Type': 'application/json'}, include_origin=include_origin)
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            raise SmokeFailure('A typed API response was not JSON; body withheld') from None
+        require(isinstance(data, dict), 'Typed APIs must return an object envelope')
+        return status, data, body
 
     def login(self, password=None):
         body = json.dumps({'username': self.username, 'password': password if password is not None else self.password})
@@ -288,25 +328,27 @@ class ContainerCheck:
         return f'{morsel.key}={morsel.value}'
 
     def require_idle(self, cookie):
-        status, _, body = self.request('GET', '/api/fs/snapshot', cookie=cookie)
-        require(status == 200 and json.loads(body).get('isListening') is False,
-                'Container smoke test must never start the core listener')
+        status, envelope, _ = self.api('GET', '/api/v1/runtime/listener', cookie=cookie)
+        data = envelope.get('data', {})
+        require(status == 200 and data.get('enabled') is False and data.get('safeMode') is True,
+                'Disposable API smoke must have immutable server safe mode and no proxy listeners')
 
     def authentication_and_persistence(self):
         for method, path, body in (
-            ('GET', '/api/fs/snapshot', None),
-            ('POST', '/api/http-proxy', b'{}'),
-            ('GET', '/ws/core', None),
+            ('GET', '/api/v1/meta', None),
+            ('GET', '/api/v1/rules?scope=global', None),
+            ('POST', '/api/v1/rules:create', b'{}'),
+            ('GET', '/ws/v1/events', None),
             ('GET', '/api/auth/session', None),
             ('POST', '/api/auth/credentials', b'{}'),
         ):
             headers = {'Content-Type': 'application/json'}
-            if path == '/ws/core':
+            if path == '/ws/v1/events':
                 headers.update(Connection='Upgrade', Upgrade='websocket',
                                **{'Sec-WebSocket-Version': '13',
                                   'Sec-WebSocket-Key': base64.b64encode(secrets.token_bytes(16)).decode()})
             require(self.request(method, path, body=body, headers=headers)[0] == 401,
-                    'Unauthenticated filesystem, proxy, WS and session requests must be rejected')
+                    'Unauthenticated business APIs, events and account requests must be rejected')
         status, headers, _ = self.request('GET', '/')
         require(status == 303 and headers.get('Location') == '/login',
                 'Unauthenticated pages must redirect to /login')
@@ -314,20 +356,91 @@ class ContainerCheck:
         require(status == 401 and not headers.get('Set-Cookie'),
                 'Wrong credentials must not create a session')
         cookie = self.authenticated_cookie()
-        require(self.request('GET', '/api/auth/session', cookie=cookie)[0] == 200,
-                'Login session must authorize same-origin API requests')
         self.require_idle(cookie)
-        filename = 'container-smoke-' + uuid.uuid4().hex + '.txt'
-        virtual = '/data/' + filename
-        query = '?path=' + quote(virtual, safe='')
-        payload = b'FlClash container persistence smoke\n' + secrets.token_bytes(32)
-        status, _, body = self.request('POST', '/api/fs/write' + query, body=payload, cookie=cookie,
-                                       headers={'Content-Type': 'application/octet-stream'})
-        require(status == 200 and json.loads(body).get('ok') is True, 'Authenticated VFS write must succeed')
-        status, _, body = self.request('GET', '/api/fs/read' + query, cookie=cookie)
-        require(status == 200 and body == payload, 'Authenticated VFS read must return exact written bytes')
-        require((self.directory / 'data' / filename).read_bytes() == payload,
-                'VFS writes must reach the disposable bind-mounted data directory')
+        for method, path in (
+            ('GET', '/api/fs/snapshot'),
+            ('GET', '/api/fs/read?path=%2Fstate%2Fresources.db'),
+            ('GET', '/api/fs/read?path=%2Fauth%2Fcredentials.json'),
+            ('GET', '/api/fs/stat?path=%2Fdata%2Fdatabase.sqlite'),
+            ('GET', '/ws/core'),
+            ('POST', '/api/fs/write?path=%2Fdata%2Fdatabase.sqlite'),
+            ('POST', '/api/fs/delete?path=%2Fstate%2Fresources.db'),
+            ('POST', '/api/fs/rename'),
+            ('POST', '/api/fs/copy'),
+            ('POST', '/api/http-proxy'),
+            ('POST', '/api/v1/query'),
+            ('POST', '/api/v1/execute'),
+        ):
+            require(self.request(method, path, body=b'{}' if method == 'POST' else None,
+                                 cookie=cookie, headers={'Content-Type': 'application/json'})[0] == 404,
+                    'Legacy filesystem, generic SQL/HTTP and native RPC tunnels must not be exposed')
+        status, headers, body = self.request('GET', '/sqlite3.wasm', cookie=cookie)
+        require(status == 404 or (status == 200 and
+                'text/html' in headers.get('Content-Type', '') and not body.startswith(b'\0asm')),
+                'Web resources must not expose the legacy browser SQLite engine')
+        status, meta, _ = self.api('GET', '/api/v1/meta', cookie=cookie)
+        require(status == 200 and isinstance(meta.get('revision'), str),
+                'API authority must return a canonical revision string')
+        revision = meta['revision']
+        store_id = meta.get('data', {}).get('storeId')
+        require(isinstance(store_id, str) and bool(store_id), 'API store identity must be durable and nonempty')
+        status, listed, _ = self.api('GET', '/api/v1/rules?scope=global', cookie=cookie)
+        require(status == 200 and listed.get('data') == [], 'Disposable store must begin with no global rules')
+        operation = 'container-rule-' + uuid.uuid4().hex
+        rule = {'profileId': None, 'ruleAction': 'DOMAIN_SUFFIX',
+                'content': uuid.uuid4().hex + '.invalid', 'ruleTarget': 'DIRECT',
+                'noResolve': False, 'src': False}
+        creation = {'expectedRevision': revision, 'operationId': operation, 'rule': rule}
+        status, _, _ = self.api('POST', '/api/v1/rules:create', creation, cookie=cookie, include_origin=False)
+        require(status == 403, 'Business mutations must require the browser origin boundary')
+        invalid = copy.deepcopy(creation)
+        invalid['rule']['sql'] = 'DELETE FROM profiles'
+        status, _, _ = self.api('POST', '/api/v1/rules:create', invalid, cookie=cookie)
+        require(status == 400, 'Business DTO validation must reject SQL/unknown fields before a transaction')
+        status, blocked, _ = self.api('POST', '/api/v1/runtime/listener:set-enabled',
+                                      {'expectedRevision': revision,
+                                       'operationId': 'blocked-start-' + uuid.uuid4().hex,
+                                       'enabled': True}, cookie=cookie)
+        require(status == 409 and blocked.get('error', {}).get('code') == 'safe_mode',
+                'Server safe mode must reject listener effects before queuing an intent')
+        status, created, original_receipt = self.api('POST', '/api/v1/rules:create', creation, cookie=cookie)
+        require(status == 200 and created.get('revision') != revision,
+                'Creating a typed rule must commit exactly one new revision')
+        canonical = created.get('data', {})
+        identity = canonical.get('id')
+        require(isinstance(identity, str) and identity.isascii() and identity.isdecimal() and
+                not identity.startswith('0') and canonical.get('content') == rule['content'],
+                'The server must allocate a canonical decimal-string rule identity')
+        status, _, replay = self.api('POST', '/api/v1/rules:create', creation, cookie=cookie)
+        require(status == 200 and replay == original_receipt, 'Repeating a successful operation must replay its receipt')
+        second_cookie = self.authenticated_cookie()
+        stale = copy.deepcopy(creation)
+        stale['operationId'] = 'stale-rule-' + uuid.uuid4().hex
+        stale['rule']['content'] = 'stale-' + uuid.uuid4().hex + '.invalid'
+        status, conflict, _ = self.api('POST', '/api/v1/rules:create', stale, cookie=second_cookie)
+        require(status == 409 and conflict.get('error', {}).get('code') == 'revision_conflict',
+                'A second browser must not overwrite state using an obsolete revision')
+        changed_rule = dict(rule, content='updated-' + uuid.uuid4().hex + '.invalid')
+        status, changed, _ = self.api('POST', '/api/v1/rules:update',
+                                      {'expectedRevision': created['revision'],
+                                       'operationId': 'update-rule-' + uuid.uuid4().hex,
+                                       'id': identity, 'rule': changed_rule}, cookie=cookie)
+        require(status == 200 and changed.get('data', {}).get('content') == changed_rule['content'],
+                'Updating a typed rule must return its canonical server value')
+        final_revision = changed.get('revision')
+        status, listed, _ = self.api('GET', '/api/v1/rules?scope=global', cookie=cookie)
+        require(status == 200 and listed.get('revision') == final_revision and
+                len(listed.get('data', [])) == 1 and listed['data'][0]['id'] == identity and
+                listed['data'][0]['content'] == changed_rule['content'],
+                'Rejected and replayed mutations must not create extra rows')
+        database = self.directory / 'state/resources.db'
+        require(database.is_file() and database.stat().st_mode & 0o777 == 0o600 and
+                database.stat().st_uid == self.uid and
+                (self.directory / 'state').stat().st_mode & 0o777 == 0o700,
+                'The non-root API database must persist privately outside managed data')
+        require(not (self.directory / 'data/database.sqlite').exists() and
+                not (self.directory / 'data/shared_preferences.json').exists(),
+                'Business API writes must not create a browser SQLite or preferences-file mirror')
         bootstrap_password = self.password
         cookie = self.change_credentials(cookie)
         old_container = self.container_id()
@@ -340,14 +453,27 @@ class ContainerCheck:
                                     headers={'Content-Type': 'application/json'})
         require(status == 401, 'Bootstrap credentials must not override persisted account changes after restart')
         cookie = self.authenticated_cookie()
-        status, _, body = self.request('GET', '/api/fs/read' + query, cookie=cookie)
-        require(status == 200 and body == payload, 'Data must survive container force-recreation')
+        status, meta, _ = self.api('GET', '/api/v1/meta', cookie=cookie)
+        require(status == 200 and meta.get('data', {}).get('storeId') == store_id and
+                meta.get('revision') == final_revision,
+                'Store identity and committed revision must survive container force-recreation')
+        status, listed, _ = self.api('GET', '/api/v1/rules?scope=global', cookie=cookie)
+        require(status == 200 and len(listed.get('data', [])) == 1 and
+                listed['data'][0]['id'] == identity and
+                listed['data'][0]['content'] == changed_rule['content'],
+                'Canonical business records must survive force-recreation')
+        status, _, receipt = self.api('GET', '/api/v1/operations/' + operation, cookie=cookie)
+        require(status == 200 and receipt == original_receipt,
+                'Idempotency receipts must survive process replacement')
+        status, _, replay = self.api('POST', '/api/v1/rules:create', creation, cookie=cookie)
+        require(status == 200 and replay == original_receipt,
+                'Receipt replay must precede CAS even after a later update and process restart')
         self.require_idle(cookie)
         require(self.request('POST', '/api/auth/logout', cookie=cookie)[0] == 204,
                 'Authenticated logout must return HTTP 204')
-        require(self.request('GET', '/api/auth/session', cookie=cookie)[0] == 401,
-                'Logout must invalidate the server-side session')
-        print('PASS: protected APIs/WS, persisted credential updates, filesystem, recreation, and logout')
+        require(self.request('GET', '/api/v1/meta', cookie=cookie)[0] == 401,
+                'Logout must revoke access to business APIs')
+        print('PASS: typed APIs, strict DTOs, CAS/replay, private persistence, recreation, credentials, and logout')
 
     def change_credentials(self, cookie):
         status, _, body = self.request('GET', '/api/auth/session', cookie=cookie)
@@ -381,8 +507,8 @@ class ContainerCheck:
         status, _, body = self.request('GET', '/api/auth/session', cookie=current)
         require(status == 200 and json.loads(body).get('username') == new_username,
                 'Updated credentials must authenticate with the new account name')
-        require(self.request('GET', '/api/fs/read?path=%2Fauth%2Fcredentials.json', cookie=current)[0] == 400,
-                'Persistent account storage must stay outside the virtual filesystem')
+        require(self.request('GET', '/api/fs/read?path=%2Fauth%2Fcredentials.json', cookie=current)[0] == 404,
+                'Retired filesystem routes must not expose persistent account storage')
         return current
 
     def cleanup(self):
@@ -416,6 +542,7 @@ def main():
             check.no_credentials()
             container = check.start()
             check.runtime_security(container)
+            check.evaluator_licenses()
             check.authentication_and_persistence()
     except SmokeFailure as error:
         failure = str(error)

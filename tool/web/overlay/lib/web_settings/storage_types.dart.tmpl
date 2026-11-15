@@ -1,0 +1,20 @@
+abstract interface class WebSettingsStorage {
+  String? read(String key);
+  void write(String key, String value);
+  void remove(String key);
+}
+
+class MemoryWebSettingsStorage implements WebSettingsStorage {
+  final values = <String, String>{};
+  @override
+  String? read(String key) => values[key];
+  @override
+  void write(String key, String value) {
+    values[key] = value;
+  }
+
+  @override
+  void remove(String key) {
+    values.remove(key);
+  }
+}

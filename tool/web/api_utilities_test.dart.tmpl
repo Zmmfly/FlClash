@@ -1,0 +1,983 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:js_interop';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/providers/ip_quality.dart' as quality_provider;
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/providers/providers.dart';
+import 'package:fl_clash/state.dart';
+import 'package:fl_clash/views/profiles/custom/icon.dart';
+import 'package:fl_clash/views/about.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:fl_clash/web_workflows/source_consent.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_shim/vfs.dart';
+import 'package:fl_clash/web_utilities/index.dart';
+import 'package:fl_clash/widgets/widgets.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+final _png = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+);
+const _url = 'https://icons.example.test/icon.png';
+
+Map<String, Object?> _release() => {
+  'provider': 'github',
+  'repository': 'chen08209/FlClash',
+  'tagName': 'v9.2.3',
+  'version': '9.2.3',
+  'name': 'Release',
+  'body': 'Plain notes https://untrusted.test/never-open',
+  'publishedAt': '2026-01-01T00:00:00Z',
+  'checkedAt': '2026-01-02T00:00:00Z',
+  'releaseUrl': 'https://github.com/chen08209/FlClash/releases/tag/v9.2.3',
+  'updatePolicy': 'server-image',
+  'assets': [
+    {
+      'name': 'FlClash-9.2.3-android.apk',
+      'size': 123,
+      'url':
+          'https://github.com/chen08209/FlClash/releases/download/v9.2.3/FlClash-9.2.3-android.apk',
+    },
+  ],
+};
+
+Map<String, Object?> _image(String url, [Uint8List? bytes]) => {
+  'bytes': base64Encode(bytes ?? _png),
+  'size': (bytes ?? _png).length,
+  'mediaType': 'image/png',
+  'sha256': crypto.sha256.convert(bytes ?? _png).toString(),
+  'sourceId': utilitySourceId(url),
+};
+
+ApiResponse _reply(
+  Object? data, {
+  String revision = '0',
+  String? operationId,
+}) => ApiResponse(
+  200,
+  jsonEncode({'revision': revision, 'data': data, 'operationId': ?operationId}),
+);
+
+ApiResponse _error(String code, {int status = 400, String revision = '0'}) =>
+    ApiResponse(
+      status,
+      jsonEncode({
+        'revision': revision,
+        'error': {'code': code, 'message': code},
+      }),
+    );
+
+class _Server {
+  var cacheRevision = 0;
+  var configurationRevision = '0';
+  String qualityCheckedAt = '2026-01-02T00:00:00Z';
+  final preparations = <Map<String, Object?>>[];
+  final authorizations = <Map<String, Object?>>[];
+  final receipts = <String, ApiResponse>{};
+  final registered = <String>{_url};
+  Map<String, Object?> release = _release();
+  Completer<ApiResponse>? imageReply;
+  Completer<void>? registerGate;
+  bool dropRegisterResponse = false;
+  bool failImage = false;
+  int imageFetches = 0;
+
+  Future<ApiResponse> send(ApiRequest request) async {
+    final data = request.body == null
+        ? <String, Object?>{}
+        : Map<String, Object?>.from(jsonDecode(request.body!) as Map);
+    if (request.path == '/api/v1/meta') {
+      return _reply({
+        'storeId': 'utility-fixture',
+        'schemaVersion': 1,
+        'revision': configurationRevision,
+      }, revision: configurationRevision);
+    }
+    if (request.path.startsWith('/api/v1/icon-cache?')) {
+      return _reply([], revision: '$cacheRevision');
+    }
+    if (request.path.startsWith('/api/v1/cache-operations/')) {
+      return receipts[request.path.split('/').last] ??
+          _error('not_found', status: 404);
+    }
+    if (request.path == '/api/v1/app/release') return _reply(release);
+    if (request.path == '/api/v1/ip-quality:lookup') {
+      return _reply({
+        'ip': data['ip'],
+        'checkedAt': qualityCheckedAt,
+        'quality': {
+          'ip': data['ip'],
+          'source': 'ipQuery',
+          'type': 'hosting',
+          'organization': 'Fixture',
+          'asn': 123,
+          'isProxy': true,
+          'isVpn': false,
+          'isTor': false,
+          'isAbuser': false,
+        },
+      });
+    }
+    if (request.path == '/api/v1/sources:prepare') {
+      final preparation = <String, Object?>{
+        'preparationId':
+            'utility-preparation-${preparations.length.toString().padLeft(24, '0')}',
+        'urlDigest': List.filled(64, 'a').join(),
+        'purpose': 'icon-image',
+        'key': data['key'],
+        'networkView': 'server',
+        'scheme': 'http',
+        'host': 'lan.test',
+        'port': 80,
+        'addresses': ['10.20.30.40'],
+        'requiresPrivateNetworkConfirmation': true,
+        'expiresAt': DateTime.now()
+            .toUtc()
+            .add(const Duration(minutes: 5))
+            .toIso8601String(),
+      };
+      preparations.add(preparation);
+      return _reply(preparation, revision: configurationRevision);
+    }
+    if (request.path == '/api/v1/sources:authorize') {
+      authorizations.add(data);
+      if (data['expectedRevision'] != configurationRevision) {
+        return _error(
+          'revision_conflict',
+          status: 409,
+          revision: configurationRevision,
+        );
+      }
+      if (data['preparationId'] != preparations.last['preparationId'] ||
+          data['urlDigest'] != preparations.last['urlDigest'] ||
+          data['intent'] != 'authorize-server-private-source') {
+        return _error(
+          'source_preparation_invalid',
+          status: 409,
+          revision: configurationRevision,
+        );
+      }
+      return _reply(
+        {
+          'authorizationId': 'utility-image-grant-fixture-00001',
+          'expiresAt': DateTime.now()
+              .toUtc()
+              .add(const Duration(hours: 1))
+              .toIso8601String(),
+        },
+        revision: configurationRevision,
+        operationId: data['operationId'] as String,
+      );
+    }
+    if (request.path == '/api/v1/icon-images:load') {
+      imageFetches++;
+      if (imageReply != null) return imageReply!.future;
+      if (failImage) return _error('invalid_icon_image', status: 422);
+      final url = data['url'] as String;
+      if (url.contains('lan.test') &&
+          data['authorizationId'] != 'utility-image-grant-fixture-00001') {
+        return _error('source_authorization_required', status: 403);
+      }
+      return _reply(_image(url), revision: configurationRevision);
+    }
+    if (request.path == '/api/v1/icon-images:register') {
+      if (registerGate != null) await registerGate!.future;
+      final operation = data['operationId'] as String;
+      if (receipts[operation] case final receipt?) return receipt;
+      if (data['expectedRevision'] != '$cacheRevision') {
+        return _error(
+          'revision_conflict',
+          status: 409,
+          revision: '$cacheRevision',
+        );
+      }
+      if (data['intent'] != 'preview-icon') {
+        return _error('icon_preview_intent_required');
+      }
+      final url = data['url'] as String;
+      registered.add(url);
+      cacheRevision++;
+      final receipt = _reply(
+        {'url': url, 'sourceId': utilitySourceId(url), 'lastAccessed': '100'},
+        revision: '$cacheRevision',
+        operationId: operation,
+      );
+      receipts[operation] = receipt;
+      if (dropRegisterResponse) {
+        dropRegisterResponse = false;
+        throw TimeoutException('response lost');
+      }
+      return receipt;
+    }
+    throw StateError(
+      'Unexpected or generic relay request: ${request.method} ${request.path}',
+    );
+  }
+}
+
+class _Transport implements ApiTransport {
+  _Transport(this.server);
+  final _Server server;
+  final requests = <ApiRequest>[];
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    requests.add(request);
+    return server.send(request);
+  }
+
+  @override
+  void close() {}
+}
+
+({WebApiRepository repository, WebUtilities utility, _Transport transport})
+_fixture([_Server? server]) {
+  final transport = _Transport(server ?? _Server());
+  final repository = WebApiRepository(
+    transport: transport,
+    journal: MemoryApiOperationJournal(),
+  );
+  final utility = WebUtilities(repository);
+  addTearDown(() async {
+    await utility.close();
+    await repository.close();
+  });
+  return (repository: repository, utility: utility, transport: transport);
+}
+
+Widget _host(Widget child) => PrismApp(
+  navigatorKey: rootNavigatorKey,
+  locale: const Locale('en'),
+  theme: ThemeData(
+    colorScheme: seededColorScheme(
+      seedColor: const Color(0xff007aff),
+      brightness: Brightness.light,
+    ),
+  ),
+  localizationsDelegates: const [
+    AppLocalizations.delegate,
+    AppUiLocalizations.delegate,
+    GlobalWidgetsLocalizations.delegate,
+  ],
+  supportedLocales: AppLocalizations.delegate.supportedLocales,
+  builder: (context, child) {
+    globalState.measure = MeasureScope.of(context);
+    return ViewScope(
+      size: MediaQuery.sizeOf(context),
+      isMobile: false,
+      child: child!,
+    );
+  },
+  home: IconTheme(
+    data: const IconThemeData(size: 32),
+    child: Center(child: child),
+  ),
+);
+
+@JS('globalThis.fetch')
+external JSFunction get _globalFetch;
+@JS('globalThis.fetch')
+external set _globalFetch(JSFunction value);
+
+extension type _UtilityFetchOptions(JSObject _) implements JSObject {
+  external JSString get method;
+  external JSString? get body;
+}
+
+class _BrowserUtilityFixture {
+  _BrowserUtilityFixture(this.server) : original = _globalFetch {
+    _globalFetch = fetch.toJS;
+  }
+  final _Server server;
+  final JSFunction original;
+  final requests = <ApiRequest>[];
+
+  JSPromise<JSAny?> fetch(JSString input, JSObject options) {
+    final path = input.toDart;
+    if (!path.startsWith('/api/v1/')) {
+      return original.callAsFunction(null, input, options) as JSPromise<JSAny?>;
+    }
+    final parsed = _UtilityFetchOptions(options);
+    final request = ApiRequest(
+      method: parsed.method.toDart,
+      path: path,
+      body: parsed.body?.toDart,
+    );
+    requests.add(request);
+    return server
+        .send(request)
+        .then<JSAny?>(
+          (response) => {
+            'status': response.status,
+            'text': (() => Future<JSString>.value(
+              response.body.toJS,
+            ).toJS).toJS,
+          }.jsify(),
+        )
+        .toJS;
+  }
+
+  void close() => _globalFetch = original;
+}
+
+class _UtilityIconSets extends IconSets {
+  _UtilityIconSets(this.rows);
+  final List<IconSet> rows;
+  @override
+  Stream<List<IconSet>> build() => Stream.value(rows);
+}
+
+class _PickerResult {
+  String? value;
+  bool popped = false;
+}
+
+Future<void> _pumpBrowser(WidgetTester tester) async {
+  for (var frame = 0; frame < 10; frame++) {
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump(const Duration(milliseconds: 50));
+  }
+}
+
+Future<({_PickerResult result, _BrowserUtilityFixture browser})>
+_openPrivatePicker(WidgetTester tester, _Server server) async {
+  tester.view.physicalSize = const Size(1400, 1000);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+  final browser = _BrowserUtilityFixture(server);
+  webApiRepository.beginSession();
+  await tester.runAsync(webApiRepository.initialize);
+  final container = ProviderContainer(
+    overrides: [
+      iconSetsProvider.overrideWith(
+        () => _UtilityIconSets(const [
+          IconSet(
+            id: 1,
+            name: 'Private set',
+            icons: [
+              IconSetIcon(
+                name: 'Private.png',
+                url: 'http://lan.test/private.png',
+              ),
+            ],
+          ),
+        ]),
+      ),
+    ],
+  );
+  ProviderSubscription<AsyncValue<List<IconSet>>>? iconSetsHold;
+  await tester.runAsync(() async {
+    iconSetsHold = container.listen(iconSetsProvider, (_, _) {});
+    await container.read(iconSetsProvider.future);
+  });
+  globalState.container = container;
+  container
+      .read(viewSizeProvider.notifier)
+      .update((_) => const Size(1400, 1000));
+  final result = _PickerResult();
+  await tester.pumpWidget(
+    UncontrolledProviderScope(
+      container: container,
+      child: _host(
+        Builder(
+          builder: (context) => TextButton(
+            onPressed: () async {
+              result.value = await Navigator.of(context).push<String>(
+                PageRouteBuilder<String>(
+                  pageBuilder: (_, _, _) => const IconPickerView(),
+                ),
+              );
+              result.popped = true;
+            },
+            child: const Text('open picker'),
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.tap(find.text('open picker'));
+  await tester.runAsync(() => webApiRepository.iconRecords(query: ''));
+  await _pumpBrowser(tester);
+  addTearDown(() async {
+    await tester.pumpWidget(const SizedBox.shrink());
+    iconSetsHold?.close();
+    container.dispose();
+    webApiRepository.endSession();
+    browser.close();
+  });
+  return (result: result, browser: browser);
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  late TestExceptionReporter exceptionReporter;
+  setUpAll(() async {
+    exceptionReporter = reportTestException;
+    reportTestException = (details, description) {
+      printOnFailure(details.toString());
+      exceptionReporter(details, description);
+    };
+    registerWebUtilityReceipts(webApiRepository);
+    expect(webUtilities.repository, same(webApiRepository));
+    await Future<void>.value();
+  });
+  tearDownAll(() => reportTestException = exceptionReporter);
+
+  test(
+    'utility typed release validates fixed repository and never trusts metadata URL fields',
+    () async {
+      final f = _fixture();
+      final release = await f.utility.latestRelease();
+      expect(release.releaseUrl.host, 'github.com');
+      expect(
+        release.assets.single.url.path,
+        '/chen08209/FlClash/releases/download/v9.2.3/FlClash-9.2.3-android.apk',
+      );
+      expect(
+        f.utility.releasePageForUpdate(release.toUpdateResult()),
+        release.releaseUrl,
+      );
+      f.transport.server.release['releaseUrl'] =
+          'https://attacker.test/install';
+      await expectLater(
+        f.utility.latestRelease(),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(
+        f.transport.requests.where(
+          (r) => r.path.contains('http-proxy') || r.path.contains('/api/fs'),
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'utility release rejects asset URL and body URL navigation injection',
+    () {
+      final release = _release();
+      (release['assets'] as List).single['url'] =
+          'https://evil.test/client.apk';
+      expect(
+        () => WebUtilityRelease.decode(release),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      final f = _fixture();
+      expect(
+        () => f.utility.releasePageForUpdate({
+          'tag_name': 'v9.2.3',
+          'web_release_url': 'javascript:alert(1)',
+          'web_update_policy': 'server-image',
+        }),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'utility IP lookup sends only explicit IP and server checkedAt, without cache put or FS',
+    () async {
+      final f = _fixture();
+      final vfs = WebFileSystem.instance;
+      final before = vfs
+          .list('/tmp', recursive: true)
+          .map((node) => node.path)
+          .toList();
+      final result = await f.utility.lookupIpQuality('8.8.8.8', refresh: true);
+      expect(result.quality.ip, '8.8.8.8');
+      expect(result.checkedAt, DateTime.utc(2026, 1, 2));
+      final query = f.transport.requests.singleWhere(
+        (r) => r.path.endsWith('ip-quality:lookup'),
+      );
+      expect(jsonDecode(query.body!), {'ip': '8.8.8.8', 'refresh': true});
+      expect(
+        f.transport.requests.any(
+          (r) => r.path.contains('ip-quality-cache:put'),
+        ),
+        isFalse,
+      );
+      expect(
+        vfs.list('/tmp', recursive: true).map((node) => node.path).toList(),
+        before,
+      );
+      expect(vfs.list('/downloads', recursive: true), isEmpty);
+    },
+  );
+
+  test(
+    'utility image memory route deduplicates concurrent reads without request journal or files',
+    () async {
+      final server = _Server()..imageReply = Completer<ApiResponse>();
+      final f = _fixture(server);
+      final a = f.utility.loadIcon(_url);
+      final b = f.utility.loadIcon(_url);
+      await Future<void>.delayed(Duration.zero);
+      server.imageReply!.complete(_reply(_image(_url)));
+      final images = await Future.wait([a, b]);
+      expect(images[0].bytes, _png);
+      expect(images[0].sourceId.length, greaterThan(70));
+      expect(images[0].sourceId, images[1].sourceId);
+      expect(server.imageFetches, 1);
+      expect(f.repository.pendingOperation, isNull);
+      expect(WebFileSystem.instance.list('/tmp', recursive: true), isEmpty);
+      expect(
+        WebFileSystem.instance.list('/downloads', recursive: true),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'utility image hash, size and opaque full SHA remain validated in Chrome',
+    () {
+      final image = _image(_url);
+      image['sourceId'] = 9007199254740992;
+      expect(
+        () => WebUtilityImage.decode(image, _url),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      image['sourceId'] = utilitySourceId(_url);
+      image['size'] = _png.length + 1;
+      expect(
+        () => WebUtilityImage.decode(image, _url),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      image['size'] = _png.length;
+      image['sha256'] = List.filled(64, '0').join();
+      expect(
+        () => WebUtilityImage.decode(image, _url),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'utility registration lost response recovers the original cache receipt before reads',
+    () async {
+      final server = _Server()..dropRegisterResponse = true;
+      final f = _fixture(server);
+      await expectLater(
+        f.utility.registerIconPreview(_url),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final pending = f.repository.pendingOperation!;
+      expect(pending.scope, ApiRevisionScope.cache);
+      expect(pending.body, isNotNull);
+      await expectLater(
+        f.utility.loadIcon(_url),
+        throwsA(isA<WebApiPendingOperationException>()),
+      );
+      expect(server.imageFetches, 0);
+      await f.repository.recoverOperation(pending.operationId);
+      expect(f.repository.pendingOperation, isNull);
+      expect((await f.utility.loadIcon(_url)).bytes, _png);
+      expect(server.cacheRevision, 1);
+      expect(
+        f.transport.requests.any(
+          (r) => r.path == '/api/v1/cache-operations/${pending.operationId}',
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'utility registration two sessions retain cache CAS and do not change config revision',
+    () async {
+      final server = _Server();
+      final a = _fixture(server);
+      final b = _fixture(server);
+      await a.repository.iconRecords(query: '');
+      await b.repository.iconRecords(query: '');
+      await a.utility.registerIconPreview(_url);
+      await expectLater(
+        b.utility.registerIconPreview('https://icons.example.test/other.png'),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(a.repository.revision, '0');
+      expect(b.repository.revision, '0');
+      expect(server.cacheRevision, 1);
+    },
+  );
+
+  test(
+    'utility query waits for prior registered intent and cannot publish after logout',
+    () async {
+      final server = _Server()..registerGate = Completer<void>();
+      final f = _fixture(server);
+      final registration = f.utility.registerIconPreview(_url);
+      final image = f.utility.loadIcon(_url);
+      await Future<void>.delayed(Duration.zero);
+      expect(server.imageFetches, 0);
+      server.registerGate!.complete();
+      await registration;
+      await image;
+      server.imageReply = Completer<ApiResponse>();
+      final stale = f.utility.loadIcon('https://icons.example.test/stale.png');
+      await Future<void>.delayed(Duration.zero);
+      f.repository.endSession();
+      server.imageReply!.complete(
+        _reply(_image('https://icons.example.test/stale.png')),
+      );
+      await expectLater(stale, throwsA(isA<WebApiSessionException>()));
+      expect(f.repository.pendingOperation, isNull);
+    },
+  );
+
+  testWidgets(
+    'utility native IP provider entry uses server checkedAt and refresh without client cache mutation',
+    (tester) async {
+      final server = _Server()
+        ..qualityCheckedAt = DateTime.now().toUtc().toIso8601String();
+      final browser = _BrowserUtilityFixture(server);
+      webApiRepository.beginSession();
+      await tester.runAsync(webApiRepository.initialize);
+      final container = ProviderContainer();
+      final provider = quality_provider.ipQualityProvider('8.8.8.8');
+      ProviderSubscription<AsyncValue<IpQuality>>? hold;
+      addTearDown(() {
+        hold?.close();
+        container.dispose();
+        webApiRepository.endSession();
+        browser.close();
+      });
+      final first = await tester.runAsync(() async {
+        hold = container.listen(provider, (_, _) {});
+        return container.read(provider.future);
+      });
+      expect(first!.ip, '8.8.8.8');
+      await tester.runAsync(() async {
+        container.invalidate(provider);
+        return container.read(provider.future);
+      });
+      final queries = browser.requests
+          .where((r) => r.path == '/api/v1/ip-quality:lookup')
+          .toList();
+      expect(queries, hasLength(2));
+      expect(jsonDecode(queries.last.body!)['refresh'], isTrue);
+      expect(
+        browser.requests.any(
+          (r) => r.path.startsWith('/api/v1/ip-quality-cache'),
+        ),
+        isFalse,
+      );
+      expect(WebFileSystem.instance.list('/tmp', recursive: true), isEmpty);
+    },
+  );
+
+  testWidgets(
+    'utility icon preserves PrismUI empty loading error retry and successful image states without FS',
+    (tester) async {
+      final f = _fixture();
+      webApiRepository.beginSession();
+      addTearDown(webApiRepository.endSession);
+      readRemoteIcon = (src) => Stream.fromFuture(f.utility.iconBytes(src));
+      addTearDown(() => readRemoteIcon = null);
+      await tester.pumpWidget(
+        _host(const CommonTargetIcon(src: '', fallback: Text('empty'))),
+      );
+      expect(find.text('empty'), findsOneWidget);
+      f.transport.server.failImage = true;
+      await tester.pumpWidget(
+        _host(
+          const CommonTargetIcon(
+            key: ValueKey('first'),
+            src: _url,
+            fallback: Text('fallback'),
+          ),
+        ),
+      );
+      expect(find.text('fallback'), findsNothing);
+      await _pumpBrowser(tester);
+      expect(find.text('fallback'), findsOneWidget);
+      f.transport.server.failImage = false;
+      await tester.pumpWidget(
+        _host(
+          const CommonTargetIcon(
+            key: ValueKey('retry'),
+            src: _url,
+            fallback: Text('fallback'),
+          ),
+        ),
+      );
+      await _pumpBrowser(tester);
+      expect(find.byType(Image), findsOneWidget);
+      expect(WebFileSystem.instance.list('/tmp', recursive: true), isEmpty);
+      expect(
+        WebFileSystem.instance.list('/downloads', recursive: true),
+        isEmpty,
+      );
+      expect(
+        f.transport.requests.every((r) => r.path.startsWith('/api/v1/')),
+        isTrue,
+      );
+    },
+  );
+
+  testWidgets(
+    'utility IconPicker private selection cancel makes zero authorization requests',
+    (tester) async {
+      final server = _Server();
+      final picker = await _openPrivatePicker(tester, server);
+      expect(
+        find.text('Private'),
+        findsOneWidget,
+        reason: find
+            .byType(Text)
+            .evaluate()
+            .map((element) => (element.widget as Text).data)
+            .join(' | '),
+      );
+      expect(server.preparations, isEmpty);
+      expect(server.authorizations, isEmpty);
+      await tester.tap(find.text('Private'));
+      await _pumpBrowser(tester);
+      expect(find.byType(WebSourceConsentDialog), findsOneWidget);
+      expect(server.preparations, hasLength(1));
+      expect(server.authorizations, isEmpty);
+      await tester.tap(find.text(currentAppLocalizations.cancel));
+      await _pumpBrowser(tester);
+      expect(server.authorizations, isEmpty);
+      expect(picker.result.popped, isFalse);
+      expect(find.byType(IconPickerView), findsOneWidget);
+      expect(
+        picker.browser.requests.any(
+          (r) => r.path.contains('http-proxy') || r.path.contains('/api/fs'),
+        ),
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets(
+    'utility IconPicker private confirm authorizes the same preparation and original config version',
+    (tester) async {
+      final server = _Server();
+      final picker = await _openPrivatePicker(tester, server);
+      await tester.tap(find.text('Private'));
+      await _pumpBrowser(tester);
+      final preparation = server.preparations.single;
+      await tester.tap(find.text(currentAppLocalizations.confirm));
+      await _pumpBrowser(tester);
+      expect(server.authorizations, hasLength(1));
+      final command = server.authorizations.single;
+      expect(command['preparationId'], preparation['preparationId']);
+      expect(command['urlDigest'], preparation['urlDigest']);
+      expect(command['expectedRevision'], '0');
+      expect(command['intent'], 'authorize-server-private-source');
+      expect(picker.result.popped, isTrue);
+      expect(picker.result.value, 'http://lan.test/private.png');
+    },
+  );
+
+  testWidgets(
+    'utility IconPicker cannot authorize an expired session after consent opens',
+    (tester) async {
+      final server = _Server();
+      final picker = await _openPrivatePicker(tester, server);
+      await tester.tap(find.text('Private'));
+      await _pumpBrowser(tester);
+      expect(find.byType(WebSourceConsentDialog), findsOneWidget);
+      webApiRepository.endSession();
+      await tester.tap(find.text(currentAppLocalizations.confirm));
+      await _pumpBrowser(tester);
+      expect(server.authorizations, isEmpty);
+      expect(picker.result.popped, isFalse);
+      expect(find.byType(IconPickerView), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'utility IconPicker never refreshes a stale consent baseline to bypass config CAS',
+    (tester) async {
+      final server = _Server();
+      final picker = await _openPrivatePicker(tester, server);
+      await tester.tap(find.text('Private'));
+      await _pumpBrowser(tester);
+      server.configurationRevision = '1';
+      await webApiRepository.handleCommitEvent({'revision': '1'});
+      await tester.tap(find.text(currentAppLocalizations.confirm));
+      await _pumpBrowser(tester);
+      expect(server.authorizations.single['expectedRevision'], '0');
+      expect(picker.result.popped, isFalse);
+      expect(find.byType(IconPickerView), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'utility About manual check uses typed release and never offers native installation',
+    (tester) async {
+      final server = _Server();
+      final browser = _BrowserUtilityFixture(server);
+      webApiRepository.beginSession();
+      await tester.runAsync(webApiRepository.initialize);
+      globalState.packageInfo = PackageInfo(
+        appName: 'FlClash',
+        packageName: 'flclash-fixture',
+        version: '0.0.1',
+        buildNumber: '1',
+      );
+      globalState.appEnv = 'stable';
+      final container = ProviderContainer();
+      globalState.container = container;
+      addTearDown(() {
+        container.dispose();
+        webApiRepository.endSession();
+        browser.close();
+      });
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(const AboutView()),
+        ),
+      );
+      await tester.tap(find.text(currentAppLocalizations.checkUpdate));
+      await _pumpBrowser(tester);
+      expect(
+        browser.requests.any(
+          (r) => r.path == '/api/v1/app/release' && r.method == 'GET',
+        ),
+        isTrue,
+      );
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is SelectableText &&
+              (widget.textSpan?.toPlainText() ?? widget.data ?? '').contains(
+                currentAppLocalizations.webUpdateDeploymentHint,
+              ),
+        ),
+        findsOneWidget,
+      );
+      expect(find.text(currentAppLocalizations.goDownload), findsOneWidget);
+      expect(
+        browser.requests.any(
+          (r) =>
+              r.path.contains('/api/fs') ||
+              r.path.contains('http-proxy') ||
+              r.body?.contains('savePath') == true,
+        ),
+        isFalse,
+      );
+      Navigator.of(rootNavigatorKey.currentContext!).pop();
+      await _pumpBrowser(tester);
+      await tester.pump(const Duration(seconds: 1));
+    },
+  );
+
+  testWidgets(
+    'utility automatic update check uses the same typed release without persistent or native effects',
+    (tester) async {
+      final server = _Server();
+      final browser = _BrowserUtilityFixture(server);
+      webApiRepository.beginSession();
+      await tester.runAsync(webApiRepository.initialize);
+      globalState.packageInfo = PackageInfo(
+        appName: 'FlClash',
+        packageName: 'flclash-fixture',
+        version: '0.0.1',
+        buildNumber: '1',
+      );
+      final container = ProviderContainer(
+        overrides: [
+          appSettingProvider.overrideWithBuild(
+            (_, _) => const AppSettingProps(autoCheckUpdate: true),
+          ),
+        ],
+      );
+      globalState.container = container;
+      final hold = container.listen(appSettingProvider, (_, _) {});
+      addTearDown(() {
+        hold.close();
+        container.dispose();
+        webApiRepository.endSession();
+        browser.close();
+      });
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(const Text('automatic')),
+        ),
+      );
+      final check = container
+          .read(commonActionProvider.notifier)
+          .autoCheckUpdate();
+      await _pumpBrowser(tester);
+      expect(
+        browser.requests.any(
+          (r) => r.path == '/api/v1/app/release' && r.method == 'GET',
+        ),
+        isTrue,
+      );
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is SelectableText &&
+              (widget.textSpan?.toPlainText() ?? widget.data ?? '').contains(
+                currentAppLocalizations.webUpdateDeploymentHint,
+              ),
+        ),
+        findsOneWidget,
+      );
+      Navigator.of(rootNavigatorKey.currentContext!).pop();
+      await _pumpBrowser(tester);
+      expect(await check, isTrue);
+      expect(
+        browser.requests.any(
+          (r) => r.path.contains('settings:') || r.path.contains('http-proxy'),
+        ),
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets(
+    'utility Web install entry only explains server image deployment and never invokes native installation',
+    (tester) async {
+      await AppLocalizations.load(const Locale('en'));
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      await tester.pumpWidget(_host(const Text('panel')));
+      final action = container.read(commonActionProvider.notifier);
+      final shown = action.installUpdate();
+      await _pumpBrowser(tester);
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is SelectableText &&
+              (widget.textSpan?.toPlainText() ?? widget.data ?? '').contains(
+                currentAppLocalizations.webUpdateDeploymentHint,
+              ),
+        ),
+        findsOneWidget,
+        reason: find
+            .byType(RichText)
+            .evaluate()
+            .map((element) => (element.widget as RichText).text.toPlainText())
+            .join(' | '),
+      );
+      final context = rootNavigatorKey.currentContext!;
+      Navigator.of(context).pop();
+      await tester.pump();
+      await shown;
+      expect(
+        WebFileSystem.instance.list('/downloads', recursive: true),
+        isEmpty,
+      );
+    },
+  );
+}

@@ -1,0 +1,721 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/providers/config.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_settings/controller.dart';
+import 'package:fl_clash/web_settings/presentation.dart';
+import 'package:fl_clash/web_settings/providers.dart';
+import 'package:fl_clash/web_settings/storage_types.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _wireProfile = '9007199254740993';
+
+Map<String, Object?> _data() {
+  final config = Config.realFromJson(null);
+  final app = settingsJson(config.appSettingProps);
+  return {
+    'runtime': {
+      'patchClashConfig': settingsJson(config.patchClashConfig),
+      'appSetting': {for (final key in webServerAppKeys) key: app[key]},
+    },
+    'network': {
+      'networkProps': settingsJson(config.networkProps),
+      'vpnProps': settingsJson(config.vpnProps),
+      'excludeSSIDs': <String>[],
+    },
+    'currentProfileId': _wireProfile,
+    'dav': null,
+  };
+}
+
+class _DeniedStorage implements WebSettingsStorage {
+  @override
+  String? read(String key) =>
+      throw StateError('Synthetic local storage denied');
+  @override
+  void write(String key, String value) =>
+      throw StateError('Synthetic local storage denied');
+  @override
+  void remove(String key) => throw StateError('Synthetic local storage denied');
+}
+
+class _SettingsBackend {
+  final data = _data();
+  final receipts = <String, ApiResponse>{};
+  final bodies = <String, String>{};
+  String revision = '0';
+
+  void advance() => revision = (BigInt.parse(revision) + BigInt.one).toString();
+  ApiResponse ok(Object? data, {String? operationId}) => ApiResponse(
+    200,
+    jsonEncode({
+      'revision': revision,
+      'data': data,
+      'operationId': ?operationId,
+    }),
+  );
+  ApiResponse error(int status, String code) => ApiResponse(
+    status,
+    jsonEncode({
+      'revision': revision,
+      'error': {'code': code, 'message': code},
+    }),
+  );
+}
+
+class _SettingsTransport implements ApiTransport {
+  _SettingsTransport(this.backend);
+  final _SettingsBackend backend;
+  final requests = <ApiRequest>[];
+  Completer<void>? postStarted;
+  Completer<void>? replyGate;
+  bool dropAfterCommit = false;
+  bool failRefreshAfterCommit = false;
+  bool failNextSettingsRead = false;
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    if (request.method == 'GET') {
+      if (request.path == '/api/v1/meta') {
+        return backend.ok({
+          'storeId': 'settings-test-store',
+          'schemaVersion': 1,
+          'revision': backend.revision,
+        });
+      }
+      if (request.path == '/api/v1/settings') {
+        if (failNextSettingsRead) {
+          failNextSettingsRead = false;
+          return backend.error(503, 'synthetic_refresh_failed');
+        }
+        return backend.ok(backend.data);
+      }
+      if (request.path.startsWith('/api/v1/operations/')) {
+        return backend.receipts[request.path.split('/').last] ??
+            backend.error(404, 'operation_not_found');
+      }
+      throw StateError('Unexpected settings GET path');
+    }
+    final body = apiObject(jsonDecode(request.body!));
+    final id = body['operationId'] as String;
+    if (backend.receipts[id] case final receipt?) {
+      return backend.bodies[id] == request.body
+          ? receipt
+          : backend.error(409, 'operation_conflict');
+    }
+    if (body['expectedRevision'] != backend.revision) {
+      return backend.error(409, 'revision_conflict');
+    }
+    final section = request.path.split(':').last;
+    switch (section) {
+      case 'runtime':
+      case 'network':
+        _merge(
+          backend.data[section] as Map<String, Object?>,
+          apiObject(body['patch']),
+        );
+      case 'current-profile':
+        expect(body['currentProfileId'], anyOf(isNull, isA<String>()));
+        backend.data['currentProfileId'] = body['currentProfileId'];
+      case 'dav':
+        final patch = body['dav'];
+        if (patch == null) {
+          backend.data['dav'] = null;
+        } else {
+          final dav = apiObject(
+            backend.data['dav'] ??
+                {
+                  'uri': '',
+                  'user': '',
+                  'password': '',
+                  'fileName': 'backup.zip',
+                },
+          );
+          _merge(dav, apiObject(patch));
+          backend.data['dav'] = dav;
+        }
+      default:
+        throw StateError('Unexpected settings mutation route');
+    }
+    backend.advance();
+    final response = backend.ok(backend.data, operationId: id);
+    backend.receipts[id] = response;
+    backend.bodies[id] = request.body!;
+    if (failRefreshAfterCommit) {
+      failRefreshAfterCommit = false;
+      failNextSettingsRead = true;
+    }
+    postStarted?.complete();
+    postStarted = null;
+    final gate = replyGate;
+    replyGate = null;
+    if (gate != null) await gate.future;
+    if (dropAfterCommit) {
+      dropAfterCommit = false;
+      throw StateError('Synthetic response loss after durable commit');
+    }
+    return response;
+  }
+
+  void _merge(Map<String, Object?> destination, Map<String, Object?> patch) {
+    for (final entry in patch.entries) {
+      final next = entry.value;
+      if (next is Map<String, Object?> &&
+          next.length == 1 &&
+          next.containsKey('value')) {
+        destination[entry.key] = next['value'];
+      } else if (next is Map<String, Object?> &&
+          destination[entry.key] is Map<String, Object?>) {
+        _merge(destination[entry.key] as Map<String, Object?>, next);
+      } else {
+        destination[entry.key] = next;
+      }
+    }
+  }
+
+  @override
+  void close() {}
+}
+
+Future<
+  (
+    WebApiRepository,
+    WebSettingsController,
+    _SettingsTransport,
+    MemoryWebSettingsStorage,
+    List<WebSettingsFailure>,
+  )
+>
+_fixture(_SettingsBackend backend, {ApiOperationJournal? journal}) async {
+  final transport = _SettingsTransport(backend);
+  final repository = WebApiRepository(
+    transport: transport,
+    journal: journal ?? MemoryApiOperationJournal(),
+  );
+  final storage = MemoryWebSettingsStorage();
+  final failures = <WebSettingsFailure>[];
+  final settings = WebSettingsController(
+    repository: repository,
+    presentation: WebSettingsPresentationStore(storage: storage),
+    onFailure: failures.add,
+  );
+  await settings.load();
+  addTearDown(() async {
+    await settings.close();
+    await repository.close();
+  });
+  return (repository, settings, transport, storage, failures);
+}
+
+void main() {
+  test(
+    'api-settings-contract: server and browser fields exhaust AppSettingProps',
+    () {
+      expect({
+        ...webServerAppKeys,
+        ...webBrowserAppKeys,
+      }, settingsJson(const AppSettingProps()).keys.toSet());
+      expect(webServerAppKeys.intersection(webBrowserAppKeys), isEmpty);
+    },
+  );
+
+  test(
+    'api-settings-contract: Config and browser presentation models have no unclassified field',
+    () {
+      final config = Config.realFromJson(null);
+      expect(settingsJson(config).keys.toSet(), {
+        'currentProfileId',
+        'hotKeyActions',
+        'appSettingProps',
+        'davProps',
+        'networkProps',
+        'vpnProps',
+        'themeProps',
+        'proxiesStyleProps',
+        'windowGeometry',
+        'patchClashConfig',
+        'excludeSSIDs',
+      });
+      final browser = browserPresentation(config);
+      expect(
+        apiObject(browser['themeProps']).keys.toSet(),
+        settingsJson(config.themeProps).keys.toSet(),
+      );
+      expect(
+        apiObject(browser['windowGeometry']).keys.toSet(),
+        settingsJson(config.windowProps).keys.toSet(),
+      );
+      expect(
+        apiObject(browser['proxiesStyleProps']).keys.toSet(),
+        settingsJson(config.proxiesStyleProps).keys.toSet(),
+      );
+    },
+  );
+
+  test(
+    'api-settings-contract: provider changes only after receipt, including WS before HTTP',
+    () async {
+      final backend = _SettingsBackend();
+      final (repository, settings, transport, _, _) = await _fixture(backend);
+      final container = ProviderContainer(
+        overrides: [webSettingsControllerProvider.overrideWithValue(settings)],
+      );
+      addTearDown(container.dispose);
+      final hold = container.listen(patchClashConfigProvider, (_, _) {});
+      addTearDown(hold.close);
+      final started = Completer<void>();
+      final gate = Completer<void>();
+      transport.postStarted = started;
+      transport.replyGate = gate;
+      final saved = container
+          .read(patchClashConfigProvider.notifier)
+          .updateAsync((value) => value.copyWith(mode: Mode.global));
+      await started.future;
+      expect(container.read(patchClashConfigProvider).mode, Mode.rule);
+      final operation = repository.pendingOperation!;
+      await repository.handleCommitEvent({
+        'revision': backend.revision,
+        'operationId': operation.operationId,
+      });
+      expect(container.read(patchClashConfigProvider).mode, Mode.rule);
+      gate.complete();
+      await saved;
+      expect(container.read(patchClashConfigProvider).mode, Mode.global);
+      final body = apiObject(
+        jsonDecode(
+          transport.requests
+              .firstWhere((request) => request.method == 'POST')
+              .body!,
+        ),
+      );
+      expect(body['patch'], {
+        'patchClashConfig': {'mode': 'global'},
+      });
+    },
+  );
+
+  test(
+    'api-settings-contract: synchronous facade queues rather than reporting immediate success',
+    () async {
+      final backend = _SettingsBackend();
+      final (_, settings, transport, _, _) = await _fixture(backend);
+      final container = ProviderContainer(
+        overrides: [webSettingsControllerProvider.overrideWithValue(settings)],
+      );
+      addTearDown(container.dispose);
+      final hold = container.listen(networkSettingProvider, (_, _) {});
+      addTearDown(hold.close);
+      final started = Completer<void>();
+      final gate = Completer<void>();
+      transport.postStarted = started;
+      transport.replyGate = gate;
+      final published = settings.changes.firstWhere(
+        (value) =>
+            !value.networkProps.appendSystemDns &&
+            !value.networkProps.systemProxy,
+      );
+      container.read(networkSettingProvider.notifier).value = container
+          .read(networkSettingProvider)
+          .copyWith(systemProxy: false);
+      expect(container.read(networkSettingProvider).systemProxy, isTrue);
+      await started.future;
+      expect(container.read(networkSettingProvider).systemProxy, isTrue);
+      gate.complete();
+      await published;
+      expect(container.read(networkSettingProvider).systemProxy, isFalse);
+    },
+  );
+
+  test(
+    'api-settings-contract: two sessions use original CAS and refetch on a rejected edit',
+    () async {
+      final backend = _SettingsBackend();
+      final (_, one, _, _, _) = await _fixture(backend);
+      final (secondRepository, two, _, _, failures) = await _fixture(backend);
+      final original = two.config.patchClashConfig;
+      final version = two.captureEditVersion();
+      await one.update<PatchClashConfig>(
+        WebSettingsSection.patch,
+        (value) => value.copyWith(mode: Mode.global),
+      );
+      final refreshed = two.changes.firstWhere(
+        (value) => value.patchClashConfig.mode == Mode.global,
+      );
+      await secondRepository.handleCommitEvent({'revision': backend.revision});
+      await refreshed;
+      await expectLater(
+        two.set(
+          WebSettingsSection.patch,
+          original.copyWith(ipv6: true),
+          editVersion: version,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(two.config.patchClashConfig.mode, Mode.global);
+      expect(two.config.patchClashConfig.ipv6, isFalse);
+      expect(failures.single.code, 'revision_conflict');
+    },
+  );
+
+  test(
+    'api-settings-contract: lost response blocks authority and reload recovers receipt without payload journal',
+    () async {
+      final backend = _SettingsBackend();
+      final journal = MemoryApiOperationJournal();
+      final (repository, settings, transport, storage, failures) =
+          await _fixture(backend, journal: journal);
+      transport.dropAfterCommit = true;
+      const dav = DAVProps(
+        uri: 'https://dav.invalid/?token=private-uri-token',
+        user: 'private-user',
+        password: 'private-dav-password',
+        fileName: 'private.zip',
+      );
+      await expectLater(
+        settings.set(WebSettingsSection.dav, dav),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      expect(settings.config.davProps, isNull);
+      expect(failures.single.code, 'commit_unknown');
+      final operation = repository.pendingOperation!;
+      expect(journal.read()!.body, isNull);
+      expect(
+        jsonEncode(journal.read()!.toJournal()),
+        isNot(contains('private')),
+      );
+      expect(jsonEncode(storage.values), isNot(contains('private')));
+      final reloadedTransport = _SettingsTransport(backend);
+      final reloadedRepository = WebApiRepository(
+        transport: reloadedTransport,
+        journal: journal,
+      );
+      final reloaded = WebSettingsController(
+        repository: reloadedRepository,
+        presentation: WebSettingsPresentationStore(storage: storage),
+      );
+      addTearDown(() async {
+        await reloaded.close();
+        await reloadedRepository.close();
+      });
+      await reloaded.load();
+      expect(reloadedRepository.pendingOperation, isNull);
+      expect(reloaded.config.davProps, dav);
+      expect(backend.receipts.keys, [operation.operationId]);
+      expect(jsonEncode(storage.values), isNot(contains('private')));
+    },
+  );
+
+  test(
+    'api-settings-contract: decimal profile identity uses shared namespaced handle codec',
+    () async {
+      final backend = _SettingsBackend();
+      final (repository, settings, transport, _, _) = await _fixture(backend);
+      final id = settings.config.currentProfileId!;
+      expect(id, lessThan(9007199254740991));
+      expect(repository.codec.wireId(ApiIdentity.profile, id), _wireProfile);
+      await settings.set(WebSettingsSection.currentProfile, null);
+      await settings.set(WebSettingsSection.currentProfile, id);
+      final body = apiObject(
+        jsonDecode(
+          transport.requests
+              .lastWhere((request) => request.method == 'POST')
+              .body!,
+        ),
+      );
+      expect(body['currentProfileId'], _wireProfile);
+      expect(
+        webProfilePresentationKey('settings-test-store', _wireProfile),
+        'flclash.presentation.profile.settings-test-store.$_wireProfile',
+      );
+    },
+  );
+
+  test(
+    'api-settings-contract: presentation persistence excludes all credentials and server authority',
+    () async {
+      final backend = _SettingsBackend();
+      final (_, settings, transport, storage, _) = await _fixture(backend);
+      await settings.update<ThemeProps>(
+        WebSettingsSection.theme,
+        (value) => value.copyWith(pureBlack: true),
+      );
+      await settings.update<AppSettingProps>(
+        WebSettingsSection.app,
+        (value) => value.copyWith(sidebarExpanded: false),
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+      await settings.update<AppSettingProps>(
+        WebSettingsSection.app,
+        (value) => value.copyWith(checkCertificate: false),
+      );
+      final server = settings.config.copyWith(
+        davProps: const DAVProps(
+          uri: 'https://secret.invalid/?token=dav-token',
+          user: 'dav-user',
+          password: 'dav-password',
+        ),
+        patchClashConfig: settings.config.patchClashConfig.copyWith(
+          secret: 'controller-secret',
+        ),
+        networkProps: settings.config.networkProps.copyWith(
+          authentication: const AuthenticationProps(
+            enable: true,
+            username: 'inbound-user',
+            password: 'inbound-password',
+          ),
+        ),
+      );
+      settings.presentation.save(server);
+      final stored = storage.values.values.single;
+      for (final forbidden in [
+        'dav-token',
+        'dav-user',
+        'dav-password',
+        'controller-secret',
+        'inbound-user',
+        'inbound-password',
+        'currentProfileId',
+        'networkProps',
+        'vpnProps',
+        'patchClashConfig',
+        'checkCertificate',
+      ]) {
+        expect(stored, isNot(contains(forbidden)), reason: forbidden);
+      }
+      expect(stored, contains('pureBlack'));
+      expect(stored, contains('sidebarExpanded'));
+      final document = apiObject(jsonDecode(stored));
+      document['serverAuthority'] = {'credential': 'injected-secret'};
+      (document['appSettingProps']
+              as Map<String, Object?>)['checkCertificate'] =
+          true;
+      (document['themeProps'] as Map<String, Object?>)['secret'] =
+          'injected-secret';
+      storage.values['flclash.presentation.v1'] = jsonEncode(document);
+      expect(
+        jsonEncode(settings.presentation.read()),
+        isNot(contains('injected-secret')),
+      );
+      expect(
+        jsonEncode(settings.presentation.read()),
+        isNot(contains('checkCertificate')),
+      );
+    },
+  );
+
+  test(
+    'api-settings-contract: storage implementation persists only the browser projection',
+    () {
+      final store = WebSettingsPresentationStore();
+      addTearDown(store.clear);
+      store.save(
+        Config.realFromJson(null).copyWith(
+          davProps: const DAVProps(
+            uri: 'https://dav.invalid/?secret=private',
+            user: 'private-user',
+            password: 'private-password',
+          ),
+        ),
+      );
+      final raw = store.storage.read('flclash.presentation.v1')!;
+      expect(raw, isNot(contains('private')));
+      expect(raw, isNot(contains('davProps')));
+    },
+  );
+
+  test(
+    'api-settings-contract: committed refresh failure is not misreported as uncommitted',
+    () async {
+      final backend = _SettingsBackend();
+      final (_, settings, transport, _, failures) = await _fixture(backend);
+      transport.failRefreshAfterCommit = true;
+      await expectLater(
+        settings.update<PatchClashConfig>(
+          WebSettingsSection.patch,
+          (value) => value.copyWith(mode: Mode.global),
+        ),
+        throwsA(isA<WebSettingsCommittedRefreshException>()),
+      );
+      expect(backend.revision, '1');
+      expect(settings.config.patchClashConfig.mode, Mode.global);
+      expect(failures.single.code, 'settings_committed_refresh_failed');
+    },
+  );
+
+  test(
+    'api-settings-contract: unfold persistence uses store and exact decimal profile namespace',
+    () {
+      final storage = MemoryWebSettingsStorage();
+      final store = WebSettingsPresentationStore(storage: storage);
+      store.saveProfileUnfoldSet('store-one', _wireProfile, {'Select', 'Auto'});
+      expect(store.readProfileUnfoldSet('store-one', _wireProfile), {
+        'Select',
+        'Auto',
+      });
+      expect(store.readProfileUnfoldSet('store-two', _wireProfile), isEmpty);
+      expect(
+        storage.values.keys.single,
+        'flclash.presentation.profile.store-one.$_wireProfile',
+      );
+      expect(
+        () => store.saveProfileUnfoldSet('store-one', '01', {'Select'}),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(
+        () => store.saveProfileUnfoldSet('store-one', '-1', {'Select'}),
+        throwsA(anything),
+      );
+    },
+  );
+
+  test(
+    'api-settings-contract: unavailable browser storage cannot keep session credentials alive',
+    () async {
+      final backend = _SettingsBackend();
+      backend.data['dav'] = {
+        'uri': 'https://dav.invalid/',
+        'user': 'private',
+        'password': 'private',
+        'fileName': 'backup.zip',
+      };
+      final repository = WebApiRepository(
+        transport: _SettingsTransport(backend),
+        journal: MemoryApiOperationJournal(),
+      );
+      final settings = WebSettingsController(
+        repository: repository,
+        presentation: WebSettingsPresentationStore(storage: _DeniedStorage()),
+      );
+      addTearDown(() async {
+        await settings.close();
+        await repository.close();
+      });
+      await settings.load();
+      expect(settings.config.davProps, isNotNull);
+      repository.endSession();
+      expect(settings.config.davProps, isNull);
+      expect(settings.config.currentProfileId, isNull);
+    },
+  );
+
+  test(
+    'api-settings-contract: server enums and override selections never use native salvage defaults',
+    () async {
+      final backend = _SettingsBackend();
+      final (_, settings, _, _, _) = await _fixture(backend);
+      final mutations = <void Function(Map<String, Object?>)>[
+        (data) {
+          final runtime = data['runtime'] as Map<String, Object?>;
+          (runtime['appSetting'] as Map<String, Object?>)['requestFeed'] =
+              'private-invalid-enum';
+        },
+        (data) =>
+            (((data['runtime'] as Map<String, Object?>)['patchClashConfig']
+                        as Map<String, Object?>)['dns']
+                    as Map<String, Object?>)['cache-algorithm'] =
+                'private-invalid-enum',
+        (data) =>
+            ((data['runtime'] as Map<String, Object?>)['patchClashConfig']
+                as Map<String, Object?>)['dns-override-keys'] = [
+              'private-invalid-enum',
+            ],
+        (data) =>
+            ((data['runtime'] as Map<String, Object?>)['patchClashConfig']
+                as Map<String, Object?>)['general-override-keys'] = [
+              'ipv6',
+              'ipv6',
+            ],
+        (data) =>
+            (((data['runtime'] as Map<String, Object?>)['patchClashConfig']
+                        as Map<String, Object?>)['tun']
+                    as Map<String, Object?>)['mtu'] =
+                0,
+        (data) =>
+            (((data['runtime'] as Map<String, Object?>)['patchClashConfig']
+                        as Map<String, Object?>)['tun']
+                    as Map<String, Object?>)['congestion-controller'] =
+                '',
+      ];
+      for (final mutate in mutations) {
+        backend.data.clear();
+        backend.data.addAll(_data());
+        mutate(backend.data);
+        backend.advance();
+        await expectLater(
+          settings.load(refresh: true),
+          throwsA(
+            isA<WebApiProtocolException>().having(
+              (error) => error.toString(),
+              'sanitized',
+              isNot(contains('private-invalid-enum')),
+            ),
+          ),
+        );
+        expect(settings.config.patchClashConfig.tun.mtu, 9000);
+        expect(settings.config.patchClashConfig.mode, Mode.rule);
+      }
+    },
+  );
+
+  test(
+    'api-settings-contract: malformed browser presentation is discarded without native salvage',
+    () {
+      final storage = MemoryWebSettingsStorage();
+      storage.write(
+        'flclash.presentation.v1',
+        jsonEncode({
+          'version': 1,
+          'themeProps': {
+            'textScale': {'enable': true, 'scale': 'private-invalid-local'},
+          },
+        }),
+      );
+      final store = WebSettingsPresentationStore(storage: storage);
+      expect(store.read(), isEmpty);
+      store.save(Config.realFromJson(null));
+      expect(
+        storage.values.values.single,
+        isNot(contains('private-invalid-local')),
+      );
+    },
+  );
+
+  test(
+    'api-settings-contract: unknown server fields fail closed and logout clears authority',
+    () async {
+      final backend = _SettingsBackend();
+      final (repository, settings, _, _, _) = await _fixture(backend);
+      backend.data['dav'] = {
+        'uri': 'https://dav.invalid/',
+        'user': 'private',
+        'password': 'private',
+        'fileName': 'b.zip',
+      };
+      await settings.load(refresh: true);
+      expect(settings.config.davProps, isNotNull);
+      backend.data['readonlyAuthority'] = true;
+      await expectLater(
+        settings.load(refresh: true),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      repository.endSession();
+      expect(settings.config.davProps, isNull);
+      expect(settings.config.currentProfileId, isNull);
+      expect(settings.isLoaded, isFalse);
+    },
+  );
+}

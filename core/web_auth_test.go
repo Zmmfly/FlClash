@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gobwas/ws/wsutil"
 )
 
 func webLoginAs(t *testing.T, s *WebServer, username, password string) *http.Cookie {
@@ -54,12 +56,13 @@ func TestWebCredentialsUsernamePasswordAndCombinedUpdates(t *testing.T) {
 			second := webLogin(t, s)
 			server := httptest.NewServer(s)
 			defer server.Close()
-			connection, _, err := webDial(t, server, second, server.URL)
+			connection, err := webRuntimeDialEvents(t, &webRuntimeTestRig{server: server}, second, server.URL)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer connection.Close()
 			connection.SetDeadline(time.Now().Add(3 * time.Second))
+			webRuntimeSubscribe(t, connection, `{"type":"subscribe","topics":[]}`)
 			before, err := os.ReadFile(s.opts.AuthFile)
 			if err != nil {
 				t.Fatal(err)
@@ -77,8 +80,7 @@ func TestWebCredentialsUsernamePasswordAndCombinedUpdates(t *testing.T) {
 					t.Fatal("old session remained valid")
 				}
 			}
-			buffer := make([]byte, 1)
-			if _, err := connection.Read(buffer); err == nil {
+			if _, _, err := wsutil.ReadServerData(connection); err == nil || os.IsTimeout(err) {
 				t.Fatal("old websocket remained connected")
 			}
 			oldLogin := webRequest(s, "POST", "/api/auth/login", `{"username":"admin","password":"correct horse"}`, nil)
@@ -338,6 +340,13 @@ func TestWebConcurrentCredentialChangesAndLoginSnapshot(t *testing.T) {
 		first := webLogin(t, s)
 		second := webLogin(t, s)
 		started, release := make(chan struct{}), make(chan struct{})
+		var released atomic.Bool
+		unblock := func() {
+			if released.CompareAndSwap(false, true) {
+				close(release)
+			}
+		}
+		defer unblock()
 		var blocked atomic.Bool
 		s.derivePassword = func(password string, salt []byte) []byte {
 			if password == "correct horse" && blocked.CompareAndSwap(false, true) {
@@ -348,20 +357,24 @@ func TestWebConcurrentCredentialChangesAndLoginSnapshot(t *testing.T) {
 		}
 		firstResult := make(chan *httptest.ResponseRecorder, 1)
 		go func() { firstResult <- webChangeRequest(s, first, "correct horse", "winner", "winner password") }()
-		<-started
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("password hash did not reach its barrier")
+		}
 		if w := webRequest(s, "GET", "/api/auth/session", "", second); w.Code != 200 {
 			t.Fatal("slow hash held global session lock")
 		}
-		if w := webRequest(s, "GET", "/api/fs/stat?path=/data", "", second); w.Code != 200 {
-			t.Fatal("slow hash blocked filesystem requests")
+		if w := webRequest(s, "GET", "/api/v1/meta", "", second); w.Code != 200 {
+			t.Fatal("slow hash blocked typed metadata reads")
 		}
 		secondResult := make(chan *httptest.ResponseRecorder, 1)
 		go func() { secondResult <- webChangeRequest(s, second, "correct horse", "loser", "loser password") }()
-		close(release)
-		if response := <-firstResult; response.Code != 200 {
+		unblock()
+		if response := webAuthAwaitResponse(t, firstResult); response.Code != 200 {
 			t.Fatal(response.Body.String())
 		}
-		if response := <-secondResult; response.Code != 401 {
+		if response := webAuthAwaitResponse(t, secondResult); response.Code != 401 {
 			t.Fatalf("concurrent stale session accepted: %d", response.Code)
 		}
 		webLoginAs(t, s, "winner", "winner password")
@@ -370,6 +383,13 @@ func TestWebConcurrentCredentialChangesAndLoginSnapshot(t *testing.T) {
 		s := newWebTestServer(t)
 		cookie := webLogin(t, s)
 		started, release := make(chan struct{}), make(chan struct{})
+		var released atomic.Bool
+		unblock := func() {
+			if released.CompareAndSwap(false, true) {
+				close(release)
+			}
+		}
+		defer unblock()
 		var blocked atomic.Bool
 		s.derivePassword = func(password string, salt []byte) []byte {
 			if password == "correct horse" && blocked.CompareAndSwap(false, true) {
@@ -382,12 +402,16 @@ func TestWebConcurrentCredentialChangesAndLoginSnapshot(t *testing.T) {
 		go func() {
 			result <- webRequest(s, "POST", "/api/auth/login", `{"username":"admin","password":"correct horse"}`, nil)
 		}()
-		<-started
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("password hash did not reach its barrier")
+		}
 		if w := webChangeRequest(s, cookie, "correct horse", "renamed-admin", ""); w.Code != 200 {
 			t.Fatal(w.Body.String())
 		}
-		close(release)
-		response := <-result
+		unblock()
+		response := webAuthAwaitResponse(t, result)
 		if response.Code != 401 || len(response.Result().Cookies()) != 0 {
 			t.Fatal("login minted a valid session from an old credential snapshot")
 		}
@@ -398,6 +422,13 @@ func TestWebConcurrentCredentialChangesAndLoginSnapshot(t *testing.T) {
 		cookie := webLogin(t, s)
 		before, _ := os.ReadFile(s.opts.AuthFile)
 		started, release := make(chan struct{}), make(chan struct{})
+		var released atomic.Bool
+		unblock := func() {
+			if released.CompareAndSwap(false, true) {
+				close(release)
+			}
+		}
+		defer unblock()
 		var blocked atomic.Bool
 		s.derivePassword = func(password string, salt []byte) []byte {
 			if blocked.CompareAndSwap(false, true) {
@@ -408,12 +439,16 @@ func TestWebConcurrentCredentialChangesAndLoginSnapshot(t *testing.T) {
 		}
 		result := make(chan *httptest.ResponseRecorder, 1)
 		go func() { result <- webChangeRequest(s, cookie, "correct horse", "new-admin", "new password") }()
-		<-started
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("password hash did not reach its barrier")
+		}
 		if w := webRequest(s, "POST", "/api/auth/logout", "", cookie); w.Code != 204 {
 			t.Fatal(w.Code)
 		}
-		close(release)
-		if w := <-result; w.Code != 401 {
+		unblock()
+		if w := webAuthAwaitResponse(t, result); w.Code != 401 {
 			t.Fatal("revoked session changed credentials")
 		}
 		after, _ := os.ReadFile(s.opts.AuthFile)
@@ -436,4 +471,15 @@ func TestWebCredentialsHashUsesSaltedPBKDF2(t *testing.T) {
 	if bytes.Equal(s.auth.salt, other.auth.salt) || bytes.Equal(s.auth.hash, other.auth.hash) {
 		t.Fatal("password KDF salt was reused")
 	}
+}
+
+func webAuthAwaitResponse(t *testing.T, result <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case response := <-result:
+		return response
+	case <-time.After(3 * time.Second):
+		t.Fatal("authentication operation did not settle")
+	}
+	return nil
 }

@@ -1,0 +1,362 @@
+import 'dart:async';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/state.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/widgets/widgets.dart';
+import 'package:flutter/widgets.dart';
+
+import 'dav.dart';
+import 'source_consent.dart';
+import 'setup.dart';
+
+Future<T?> runWebWorkflow<T>(
+  Future<T> Function() task, {
+  required WebApiRepository repository,
+  FutureOr<void> Function()? onReload,
+}) async {
+  try {
+    return await task();
+  } on WebApiException catch (error, stack) {
+    if (error.code == 'source_authorization_cancelled') return null;
+    try {
+      await showWebWorkflowFailure(
+        error,
+        repository: repository,
+        onReload: onReload,
+      );
+    } catch (_) {
+      Error.throwWithStackTrace(error, stack);
+    }
+    return null;
+  } catch (error, stack) {
+    return globalState.safeRun<T>(
+      () => Error.throwWithStackTrace(error, stack),
+    );
+  }
+}
+
+String webWorkflowLogCode(WebApiException error) =>
+    const {
+      'revision_conflict',
+      'source_revision_conflict',
+      'edit_snapshot_mismatch',
+      'commit_unknown',
+      'committed_refresh_failed',
+      'settings_committed_refresh_failed',
+      'operation_pending',
+      'session_changed',
+      'source_authorization_required',
+      'source_authorization_cancelled',
+      'dav_effect_unknown',
+      'dav_unresolved_upload',
+      'effect_unknown',
+      'invalid_api_response',
+      'operation_context_mismatch',
+      'read_baseline_required',
+    }.contains(error.code)
+    ? error.code
+    : 'api_error';
+
+String webWorkflowFailureMessage(WebApiException error, AppLocalizations l) {
+  if (_conflict(error)) return l.webApiConflictTip;
+  if (_committed(error)) return l.webApiCommittedRefreshTip;
+  if (_operationId(error) != null ||
+      _runtimeOperationId(error) != null ||
+      error is WebDavUncertainException)
+    return l.webApiUnknownResultTip;
+  if (error is WebApiSessionException) return l.webSessionError;
+  if (error.code == 'source_authorization_cancelled') return l.cancel;
+  return l.webRequestFailed;
+}
+
+bool _conflict(WebApiException error) => const {
+  'revision_conflict',
+  'source_revision_conflict',
+  'edit_snapshot_mismatch',
+}.contains(error.code);
+
+bool _committed(WebApiException error) => const {
+  'committed_refresh_failed',
+  'settings_committed_refresh_failed',
+}.contains(error.code);
+
+String? _operationId(WebApiException error) => switch (error) {
+  WebApiUnknownCommitException(:final operationId) => operationId,
+  WebApiPendingOperationException(:final operationId) => operationId,
+  _ => null,
+};
+
+String? _runtimeOperationId(WebApiException error) {
+  final details = error.details;
+  if (details is! Map ||
+      error.code != 'effect_unknown' && details['phase'] != 'unknown')
+    return null;
+  final value = details['operationId'];
+  if (value is! String) return null;
+  try {
+    return requireApiOperationId(value);
+  } on WebApiException {
+    return null;
+  }
+}
+
+/// No raw server message, payload, source URL or credential is rendered/logged.
+Future<void> showWebWorkflowFailure(
+  WebApiException error, {
+  required WebApiRepository repository,
+  FutureOr<void> Function()? onReload,
+}) => dialogs.showCommonDialog<void>(
+  child: WebWorkflowFailureDialog(
+    error: error,
+    repository: repository,
+    onReload: onReload,
+  ),
+);
+
+class WebWorkflowFailureDialog extends StatefulWidget {
+  const WebWorkflowFailureDialog({
+    super.key,
+    required this.error,
+    required this.repository,
+    this.onReload,
+  });
+
+  final WebApiException error;
+  final WebApiRepository repository;
+  final FutureOr<void> Function()? onReload;
+
+  @override
+  State<WebWorkflowFailureDialog> createState() =>
+      _WebWorkflowFailureDialogState();
+}
+
+class _WebWorkflowFailureDialogState extends State<WebWorkflowFailureDialog> {
+  late WebApiException _error;
+  bool _busy = false;
+  bool _resolved = false;
+  bool _knownCommitted = false;
+  bool _effectFailed = false;
+  bool _readFailed = false;
+  bool? _remoteMatches;
+
+  @override
+  void initState() {
+    super.initState();
+    _error = widget.error;
+  }
+
+  bool get _unknown =>
+      _operationId(_error) != null ||
+      _runtimeOperationId(_error) != null ||
+      _error is WebDavUncertainException;
+
+  Future<void> _resolveRuntime(String id) async {
+    final receipt = await widget.repository.readExternal(
+      '/api/v1/runtime/operations/${Uri.encodeComponent(requireApiOperationId(id))}',
+    );
+    final data = apiObject(receipt.data, 'runtime effect');
+    if (data['operationId'] != id ||
+        data['action'] is! String ||
+        !const {
+          'pending',
+          'applying',
+          'applied',
+          'failed',
+          'unknown',
+        }.contains(data['phase'])) {
+      throw const WebApiProtocolException(
+        'Runtime recovery changed its operation',
+      );
+    }
+    requireApiRevision(data['desiredRevision']);
+    if (data['phase'] == 'applied') {
+      final result = data['result'];
+      final fallback =
+          result is Map && result['actualConfig'] == 'default-fallback';
+      _resolved = true;
+      _knownCommitted = !fallback;
+      _effectFailed = fallback;
+    } else if (data['phase'] == 'failed') {
+      _resolved = true;
+      _effectFailed = true;
+    }
+  }
+
+  Future<void> _resolve() async {
+    final operationId = _operationId(_error);
+    final runtimeId = _runtimeOperationId(_error);
+    if (_busy ||
+        operationId == null &&
+            runtimeId == null &&
+            _error is! WebDavUncertainException)
+      return;
+    setState(() => _busy = true);
+    try {
+      if (_error case final WebDavUncertainException error) {
+        final summary = (await error.workflows.summaries())
+            .where((job) => job.operationId == error.job.operationId)
+            .firstOrNull;
+        if (summary == null) return;
+        if (summary.phase == 'unknown' && summary.action == 'backup') {
+          final observation = await error.workflows.reconcile(
+            summary.asUncertainJob(),
+          );
+          if (observation.phase != 'succeeded' ||
+              observation.result['reconciliationOf'] != summary.operationId) {
+            throw const WebApiProtocolException(
+              'DAV observation changed its target',
+            );
+          }
+          _remoteMatches = observation.result['remoteMatches'] == true;
+        } else if (summary.phase == 'succeeded') {
+          _resolved = true;
+          _knownCommitted = true;
+        } else if (summary.phase == 'failed') {
+          _resolved = true;
+          _effectFailed = true;
+        }
+        return;
+      }
+      if (runtimeId != null) {
+        await _resolveRuntime(runtimeId);
+        return;
+      }
+      final pendingPath = widget.repository.pendingOperation?.path;
+      final receipt = await widget.repository.recoverOperation(
+        operationId!,
+        resolve: true,
+      );
+      if (pendingPath?.startsWith('/api/v1/dav') == true) {
+        final dav = WebDavWorkflows(
+          widget.repository,
+          confirmSource: showWebSourceConsent,
+        );
+        _error = WebDavUncertainException(dav, dav.decodeJob(receipt.data));
+        return;
+      }
+      if (pendingPath?.startsWith('/api/v1/runtime') == true) {
+        // An immutable admission receipt is not evidence of an applied effect.
+        final data = apiObject(receipt.data);
+        if (data['operationId'] != operationId)
+          throw const WebApiProtocolException(
+            'Runtime admission identity changed',
+          );
+        _error = WebApiException(
+          'effect_unknown',
+          'Read the admitted runtime effect',
+          details: {'operationId': operationId},
+        );
+        return;
+      }
+      _resolved = true;
+      _knownCommitted = true;
+    } on WebApiException catch (error) {
+      if (error.code == 'operation_not_committed' &&
+          widget.repository.pendingOperation == null) {
+        _resolved = true;
+        _knownCommitted = false;
+      } else if (error is WebApiUnknownCommitException ||
+          error is WebApiPendingOperationException) {
+        // A reconciliation admission can itself be unknown; expose its journal.
+        _error = error;
+      } else {
+        _readFailed = true;
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _reload() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _readFailed = false;
+    });
+    try {
+      final reload = widget.onReload;
+      if (reload != null) {
+        await reload();
+      } else {
+        await widget.repository.onReconnect();
+      }
+      if (mounted) Navigator.of(context).pop();
+    } catch (_) {
+      if (mounted) setState(() => _readFailed = true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = context.appLocalizations;
+    final permissionRetry = _error is WebSetupSourceConsentRequired
+        ? (_error as WebSetupSourceConsentRequired).retry
+        : null;
+    final needsResolution = _unknown && !_resolved && _remoteMatches == null;
+    final committed = _committed(_error) || _knownCommitted;
+    final hasReload = committed || _conflict(_error) || _resolved;
+    final message = permissionRetry != null
+        ? l.webServerNetworkRedirectTip
+        : _remoteMatches != null
+        ? (_remoteMatches!
+              ? l.webDavRemoteMatchesTip
+              : l.webDavRemoteDiffersTip)
+        : _effectFailed
+        ? l.webRequestFailed
+        : needsResolution
+        ? l.webApiUnknownResultTip
+        : committed
+        ? l.webApiCommittedRefreshTip
+        : _conflict(_error) || _resolved
+        ? l.webApiConflictTip
+        : l.webRequestFailed;
+    return PopGuard(
+      onPop: (_) => !_busy,
+      child: AlertDialog(
+        title: _conflict(_error) ? l.webApiConflictTitle : l.tip,
+        actions: [
+          TextButton(
+            onPressed: _busy ? null : () => Navigator.of(context).pop(),
+            child: Text(l.close),
+          ),
+          if (permissionRetry != null)
+            TextButton(
+              onPressed: _busy
+                  ? null
+                  : () {
+                      Navigator.of(context).pop();
+                      // Release the current setup scheduler before queuing its explicit retry.
+                      unawaited(permissionRetry());
+                    },
+              child: Text(l.webServerNetworkTitle),
+            )
+          else if (needsResolution)
+            TextButton(
+              onPressed: _busy ? null : _resolve,
+              child: Text(l.webApiResolveOperation),
+            )
+          else if (hasReload)
+            TextButton(
+              onPressed: _busy ? null : _reload,
+              child: Text(l.webApiReload),
+            ),
+        ],
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          spacing: 12,
+          children: [
+            Text(message),
+            if (_readFailed) Text(l.webRequestFailed),
+            if (_busy) const ActivityIndicator(size: 16),
+          ],
+        ),
+      ),
+    );
+  }
+}

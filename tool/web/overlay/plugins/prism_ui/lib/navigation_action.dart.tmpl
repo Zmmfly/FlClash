@@ -1,0 +1,63 @@
+import 'package:flutter/widgets.dart';
+import 'package:prism_ui/common_button.dart';
+import 'package:prism_ui/icons/icons.dart';
+import 'package:prism_ui/loading.dart';
+import 'package:prism_ui/typography.dart';
+
+class NavigationAction {
+  const NavigationAction({
+    required this.glyph,
+    required this.label,
+    this.onPressed,
+    this.isLoading = false,
+  });
+
+  final Glyph glyph;
+  final String label;
+  final VoidCallback? onPressed;
+  final bool isLoading;
+
+  NavigationAction withOnPressed(VoidCallback? callback) => NavigationAction(
+    glyph: glyph,
+    label: label,
+    onPressed: callback,
+    isLoading: isLoading,
+  );
+}
+
+class NavigationActionRow extends StatelessWidget {
+  const NavigationActionRow({super.key, required this.action});
+
+  final NavigationAction action;
+
+  static double heightOf(BuildContext context) =>
+      48 +
+      MediaQuery.textScalerOf(context).scale(AppTextStyle.subheadline.size) -
+      AppTextStyle.subheadline.size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: heightOf(context),
+      child: Align(
+        alignment: AlignmentDirectional.centerEnd,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: TextButton.icon(
+            // Avoid layout-phase state updates when the shared button changes enabledness.
+            key: ValueKey(action.onPressed != null && !action.isLoading),
+            onPressed: action.isLoading ? null : action.onPressed,
+            icon: action.isLoading
+                ? const ActivityIndicator(size: 20)
+                : GlyphIcon(action.glyph, size: 20),
+            label: Text(
+              action.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

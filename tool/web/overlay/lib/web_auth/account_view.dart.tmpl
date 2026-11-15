@@ -42,10 +42,9 @@ class _WebAccountViewState extends State<WebAccountView> {
   String? _username;
   String? _error;
   bool _loading = true;
-  bool _busy = false;
   bool _modalOpen = false;
 
-  bool get _locked => _busy || _modalOpen;
+  bool get _locked => _modalOpen;
 
   @override
   void initState() {
@@ -84,48 +83,11 @@ class _WebAccountViewState extends State<WebAccountView> {
     }
   }
 
-  Future<void> _logout() async {
-    if (_locked) return;
-    setState(() {
-      _modalOpen = true;
-      _error = null;
-    });
-    try {
-      final l = context.appLocalizations;
-      final confirmed = await dialogs.showMessage(
-        context: context,
-        title: l.webLogout,
-        message: TextSpan(text: l.webLogoutConfirm),
-        confirmText: l.webLogout,
-        cancelText: l.webCancel,
-        destructive: true,
-      );
-      if (confirmed != true || !mounted) return;
-      setState(() => _busy = true);
-      await widget.client.logout();
-      widget.client.redirectAfterAuth(updated: false);
-    } catch (error) {
-      if (mounted) {
-        setState(
-          () => _error = webAuthErrorMessage(context.appLocalizations, error),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _modalOpen = false;
-        });
-      }
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final l = context.appLocalizations;
     return Scaffold(
       title: l.webAccount,
-      isLoading: _busy,
       body: NullStatusSwitcher(
         isLoading: _loading,
         child: ListView(
@@ -163,19 +125,6 @@ class _WebAccountViewState extends State<WebAccountView> {
                     leading: const GlyphIcon(AppGlyphs.key),
                     title: Text(l.webChangeCredentials),
                     onTap: _locked ? null : _edit,
-                  ),
-                ],
-              ),
-              generateSection(
-                items: [
-                  ListItem(
-                    key: const ValueKey('web-log-out'),
-                    leading: const GlyphIcon(AppGlyphs.lockOpen),
-                    title: Text(
-                      l.webLogout,
-                      style: TextStyle(color: context.colorScheme.destructive),
-                    ),
-                    onTap: _locked ? null : _logout,
                   ),
                 ],
               ),

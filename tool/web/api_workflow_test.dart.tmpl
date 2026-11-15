@@ -1,0 +1,3164 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/database/database.dart' as db;
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/providers/action.dart';
+import 'package:fl_clash/providers/config.dart';
+import 'package:fl_clash/providers/database.dart';
+import 'package:fl_clash/providers/state.dart';
+import 'package:fl_clash/state.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/views/profiles/edit.dart';
+import 'package:fl_clash/views/proxies/providers.dart';
+import 'package:fl_clash/pages/editor.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/web_runtime/runtime.dart';
+import 'package:fl_clash/web_workflows/index.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/web_settings/presentation.dart';
+import 'package:yaml/yaml.dart' as source_yaml;
+
+class _Transport implements ApiTransport {
+  final requests = <ApiRequest>[];
+  var sent = Completer<ApiRequest>();
+  var response = Completer<ApiResponse>();
+  ApiResponse? recovery;
+  String revision = '0';
+  final stored = <Map<String, Object?>>[];
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    if (request.path == '/api/v1/meta') {
+      return _reply({
+        'storeId': 'fixture-store',
+        'schemaVersion': 23,
+        'revision': revision,
+      }, revision: revision);
+    }
+    if (request.method == 'GET' &&
+        Uri.parse(request.path).path == '/api/v1/profiles') {
+      return _reply(stored, revision: revision);
+    }
+    if (request.path.startsWith('/api/v1/operations/') && recovery != null)
+      return recovery!;
+    if (request.path.startsWith('/api/v1/content/profile/')) {
+      final bytes = utf8.encode('proxies: []');
+      return _reply({
+        'key': {'kind': 'profile', 'id': request.path.split('/').last},
+        'mediaType': 'application/yaml',
+        'sha256': crypto.sha256.convert(bytes).toString(),
+        'size': bytes.length,
+        'bytes': base64Encode(bytes),
+        'encrypted': false,
+      }, revision: revision);
+    }
+    if (!sent.isCompleted) sent.complete(request);
+    return response.future;
+  }
+
+  @override
+  void close() {}
+}
+
+ApiResponse _reply(
+  Object? data, {
+  String revision = '0',
+  String? operationId,
+}) => ApiResponse(
+  200,
+  jsonEncode({
+    'revision': revision,
+    if (operationId != null) 'operationId': operationId,
+    'data': data,
+  }),
+);
+
+Map<String, Object?> _profile(Map<String, Object?> input, String id) => {
+  ...input,
+  'id': id,
+};
+
+class _BackupTransport extends _Transport implements ApiAttachmentTransport {
+  bool rejectSchema = false;
+  final archive = Uint8List.fromList([0x50, 0x4b, 0x03, 0x04, 1, 2, 3]);
+
+  @override
+  Future<ApiBinaryResponse> readAttachment(
+    ApiRequest request, {
+    required int maxBytes,
+  }) async {
+    requests.add(request);
+    return ApiBinaryResponse(
+      200,
+      archive,
+      headers: {
+        'x-flclash-revision': revision,
+        'content-type': 'application/zip',
+        'content-length': archive.length.toString(),
+        'content-disposition': 'attachment; filename="backup.zip"',
+      },
+    );
+  }
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/backups:prepare') {
+      requests.add(request);
+      if (rejectSchema)
+        return Future.value(
+          ApiResponse(
+            400,
+            jsonEncode({
+              'revision': revision,
+              'error': {
+                'code': 'unsupported_backup_schema',
+                'message': 'Unknown native schema',
+              },
+            }),
+          ),
+        );
+      return Future.value(
+        _reply({
+          'token': 'session-bound-preview',
+          'expiresAt': DateTime.now()
+              .add(const Duration(minutes: 3))
+              .toIso8601String(),
+          'archiveDigest': List.filled(64, 'a').join(),
+          'planDigest': List.filled(64, 'b').join(),
+          'changes': [
+            {
+              'kind': 'profile',
+              'id': '9223372036854775807',
+              'name': 'legacy profile',
+              'count': 2,
+              'action': 'rename',
+              'settingsChange': {
+                'sourceField': 'legacy.stack',
+                'targetField': 'runtime.patchClashConfig.tun.stack',
+                'action': 'convert',
+                'before': 'system',
+                'after': 'mips',
+                'lossless': false,
+                'requiresConfirmation': true,
+              },
+            },
+          ],
+          'requiresConfirmation': true,
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _SourceTransport extends _Transport {
+  bool private = true;
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/sources:prepare') {
+      requests.add(request);
+      final input = jsonDecode(request.body!) as Map<String, dynamic>;
+      return Future.value(
+        _reply({
+          'preparationId': List.filled(43, 'P').join(),
+          'urlDigest': List.filled(64, 'a').join(),
+          'purpose': input['purpose'],
+          if (input['key'] != null) 'key': input['key'],
+          'expiresAt': DateTime.now()
+              .add(const Duration(minutes: 4))
+              .toIso8601String(),
+          'networkView': 'server',
+          'scheme': 'https',
+          'host': 'private.example',
+          'port': 443,
+          'addresses': [private ? '10.0.0.8' : '8.8.8.8'],
+          'requiresPrivateNetworkConfirmation': private,
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+Map<String, Object?> _workflowSettings() {
+  final config = Config.realFromJson(null);
+  final app = settingsJson(config.appSettingProps);
+  return {
+    'runtime': {
+      'patchClashConfig': settingsJson(config.patchClashConfig),
+      'appSetting': {for (final key in webServerAppKeys) key: app[key]},
+    },
+    'network': {
+      'networkProps': settingsJson(config.networkProps),
+      'vpnProps': settingsJson(config.vpnProps),
+      'excludeSSIDs': <String>[],
+    },
+    'currentProfileId': '9223372036854775807',
+    'dav': null,
+  };
+}
+
+class _SetupTransport extends _Transport {
+  late Map<String, Object?> snapshot;
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path.endsWith('/setup-state')) {
+      requests.add(request);
+      return Future.value(_reply(snapshot, revision: revision));
+    }
+    if (Uri.parse(request.path).path == '/api/v1/runtime/provider-sources') {
+      requests.add(request);
+      return Future.value(_reply(<Object?>[], revision: revision));
+    }
+    if (request.path == '/api/v1/profiles:build') {
+      requests.add(request);
+      final input = jsonDecode(request.body!) as Map<String, dynamic>;
+      return Future.value(
+        _reply({
+          'yaml': input['overlay'] ?? input['candidateYaml'],
+          'digest': List.filled(64, 'b').join(),
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _DavTransport extends _SourceTransport {
+  _DavTransport({this.preexistingUnknown = false}) {
+    private = false;
+    if (preexistingUnknown)
+      jobs['previous-upload'] = _job(
+        'previous-upload',
+        'backup',
+        'unknown',
+        '0',
+      );
+  }
+  final bool preexistingUnknown;
+  bool unknownUpload = true;
+  final jobs = <String, Map<String, Object?>>{};
+
+  Map<String, Object?> _job(
+    String id,
+    String action,
+    String phase,
+    String desired, {
+    String? target,
+  }) => {
+    'operationId': id,
+    'desiredRevision': desired,
+    'action': action,
+    'phase': phase,
+    'stage': phase,
+    'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    if (phase == 'succeeded')
+      'result': {
+        'conditional': false,
+        'archiveDigest': List.filled(64, 'c').join(),
+        'archiveSize': 7,
+        if (target != null) 'reconciliationOf': target,
+        if (target != null) 'remoteMatches': true,
+      },
+  };
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/settings') {
+      requests.add(request);
+      return Future.value(
+        _reply({
+          ..._workflowSettings(),
+          'dav': {
+            'uri': 'https://dav.invalid/secret-collection',
+            'user': 'fixture-user',
+            'password': 'fixture-dav-password-secret',
+            'fileName': 'fixture.zip',
+          },
+        }, revision: revision),
+      );
+    }
+    if (request.path == '/api/v1/dav/jobs') {
+      requests.add(request);
+      return Future.value(
+        _reply([
+          for (final job in jobs.values)
+            {
+              'operationId': job['operationId'],
+              'action': job['action'],
+              'phase': job['phase'],
+              'stage': job['stage'],
+              'updatedAt': job['updatedAt'],
+              'currentTupleMatches': true,
+              'needsPrepare':
+                  preexistingUnknown && job['operationId'] == 'previous-upload',
+            },
+        ], revision: revision),
+      );
+    }
+    if (request.method == 'POST' &&
+        (request.path == '/api/v1/dav:backup' ||
+            request.path.endsWith(':reconcile'))) {
+      requests.add(request);
+      final body = apiObject(jsonDecode(request.body!));
+      final id = body['operationId'] as String;
+      final action = request.path.endsWith(':reconcile')
+          ? 'reconcile'
+          : 'backup';
+      final target = action == 'reconcile'
+          ? request.path.split('/').last.replaceFirst(':reconcile', '')
+          : null;
+      if (body['expectedRevision'] != revision)
+        return Future.value(
+          ApiResponse(
+            409,
+            jsonEncode({
+              'revision': revision,
+              'error': {'code': 'revision_conflict', 'message': 'changed'},
+            }),
+          ),
+        );
+      revision = (BigInt.parse(revision) + BigInt.one).toString();
+      final accepted = _job(id, action, 'pending', revision);
+      jobs[id] = _job(
+        id,
+        action,
+        action == 'backup' && unknownUpload ? 'unknown' : 'succeeded',
+        revision,
+        target: target,
+      );
+      return Future.value(
+        _reply(accepted, revision: revision, operationId: id),
+      );
+    }
+    if (request.method == 'GET' &&
+        request.path.startsWith('/api/v1/dav/jobs/')) {
+      requests.add(request);
+      final id = request.path.split('/').last;
+      if (preexistingUnknown && id == 'previous-upload')
+        return Future.value(
+          ApiResponse(
+            403,
+            jsonEncode({
+              'revision': revision,
+              'error': {
+                'code': 'dav_session_mismatch',
+                'message': 'old full job stays private',
+              },
+            }),
+          ),
+        );
+      return Future.value(_reply(jobs[id], revision: revision));
+    }
+    return super.send(request);
+  }
+}
+
+class _PreparedTransport extends _Transport {
+  bool expired = false;
+  Map<String, Object?>? prepared;
+  var chunkSequence = 0;
+  final module = <String, Object?>{
+    'id': '9223372036854775807',
+    'name': 'Original module',
+    'description': '',
+    'url': null,
+    'enabled': true,
+    'order': 0,
+    'arguments': <String, String>{},
+    'resources': <String, String>{},
+    'system': null,
+    'scripts': 0,
+    'lastUpdateTime': '2026-01-01T00:00:00Z',
+  };
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.method == 'GET' && request.path == '/api/v1/mitm-modules') {
+      requests.add(request);
+      return Future.value(_reply([module], revision: revision));
+    }
+    if (request.path == '/api/v1/content:prepare-write' ||
+        request.path == '/api/v1/mitm-modules:prepare-import') {
+      requests.add(request);
+      final input = apiObject(jsonDecode(request.body!));
+      final bytes = base64Decode(
+        (input['bytes'] ?? apiObject(input['source'])['bytes']) as String,
+      );
+      prepared = {
+        'preparedJobId': 'prepared-module-operation',
+        'operationId': 'prepared-module-operation',
+        'requestDigest': List.filled(64, 'a').join(),
+        'contentSha256': crypto.sha256.convert(bytes).toString(),
+        'expiresAt': DateTime.now()
+            .add(Duration(minutes: expired ? -1 : 4))
+            .toUtc()
+            .toIso8601String(),
+        'dependencies': <Object?>[],
+        'attachmentReferences': ['first.js', 'second.json'],
+      };
+      return Future.value(_reply(prepared, revision: revision));
+    }
+    if (request.path ==
+        '/api/v1/content-preparations/prepared-module-operation/attachments') {
+      requests.add(request);
+      final input = apiObject(jsonDecode(request.body!));
+      if (input['requestDigest'] != prepared!['requestDigest'])
+        throw StateError('stale fixture chunk digest');
+      chunkSequence++;
+      prepared = {
+        ...prepared!,
+        'requestDigest': List.filled(64, chunkSequence == 1 ? 'b' : 'c').join(),
+      };
+      return Future.value(_reply(prepared, revision: revision));
+    }
+    return super.send(request);
+  }
+
+  Map<String, Object?> receipt(String content) => {
+    'content': {
+      'key': {'kind': 'mitm-module', 'id': module['id']},
+      'mediaType': 'text/plain',
+      'sha256': crypto.sha256.convert(utf8.encode(content)).toString(),
+      'size': utf8.encode(content).length,
+    },
+    'mitmModule': module,
+  };
+}
+
+class _MetadataTransport extends _SourceTransport {
+  _MetadataTransport() {
+    private = false;
+  }
+  bool unknownCounts = false;
+  bool missingGeo = false;
+  Map<String, Object?>? effect;
+  List<Map<String, Object?>> get geo => [
+    for (final (index, type) in GeoResource.values.indexed)
+      if (!missingGeo || index != GeoResource.values.length - 1)
+        {
+          'type': type.name,
+          'updating': false,
+          'sourceId': ((BigInt.one << 255) + BigInt.from(index)).toString(),
+          'available': index == 0,
+          'size': index == 0 ? 123 : null,
+          'modifiedAt': index == 0 ? '2026-01-02T03:04:05Z' : null,
+        },
+  ];
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/runtime/applied-counts') {
+      requests.add(request);
+      if (unknownCounts)
+        return Future.value(
+          ApiResponse(
+            409,
+            jsonEncode({
+              'revision': revision,
+              'error': {
+                'code': 'runtime_unknown',
+                'message': 'no actual counts proof',
+              },
+            }),
+          ),
+        );
+      return Future.value(
+        _reply({
+          'runtimeGeneration': '2',
+          'actualConfig': 'candidate',
+          'groups': 2,
+          'proxies': 3,
+          'rules': 4,
+        }, revision: revision),
+      );
+    }
+    if (request.path == '/api/v1/runtime/geo') {
+      requests.add(request);
+      return Future.value(_reply(geo, revision: revision));
+    }
+    if (request.path == '/api/v1/runtime/geo:update') {
+      requests.add(request);
+      final body = apiObject(jsonDecode(request.body!));
+      revision = (BigInt.parse(revision) + BigInt.one).toString();
+      final accepted = <String, Object?>{
+        'operationId': body['operationId'],
+        'desiredRevision': revision,
+        'action': 'geo-update',
+        'phase': 'pending',
+        'updatedAt': DateTime.now().toIso8601String(),
+      };
+      effect = {
+        ...accepted,
+        'phase': 'applied',
+        'result': {
+          'type': body['type'],
+          'sourceId': body['sourceId'],
+          'installed': true,
+        },
+      };
+      return Future.value(
+        _reply(
+          accepted,
+          revision: revision,
+          operationId: body['operationId'] as String,
+        ),
+      );
+    }
+    if (request.path.startsWith('/api/v1/runtime/operations/')) {
+      requests.add(request);
+      return Future.value(_reply(effect, revision: revision));
+    }
+    return super.send(request);
+  }
+}
+
+class _RuntimeRecoveryTransport extends _Transport {
+  String phase = 'pending';
+  String operationId = '';
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path.startsWith('/api/v1/runtime/operations/')) {
+      requests.add(request);
+      return Future.value(
+        _reply({
+          'operationId': operationId,
+          'desiredRevision': '1',
+          'action': 'apply-profile',
+          'phase': phase,
+          'updatedAt': DateTime.now().toIso8601String(),
+          if (phase == 'applied') 'result': {'actualConfig': 'candidate'},
+        }, revision: '1'),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _ValidationTransport extends _Transport {
+  bool reject = false;
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/profiles:validate') {
+      requests.add(request);
+      if (reject)
+        return Future.value(
+          ApiResponse(
+            422,
+            jsonEncode({
+              'revision': revision,
+              'error': {
+                'code': 'invalid_profile',
+                'message': 'synthetic invalid candidate',
+              },
+            }),
+          ),
+        );
+      final input = apiObject(jsonDecode(request.body!));
+      return Future.value(
+        _reply({
+          'valid': true,
+          'sha256': crypto.sha256
+              .convert(base64Decode(input['bytes'] as String))
+              .toString(),
+          'counts': {'outbounds': 0, 'ruleProviders': 0, 'subRules': 0},
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _EncryptedTransport extends _Transport {
+  bool advanceOnDecrypt = false;
+  final plain = utf8.encode('proxies: []\nrules:\n - MATCH,DIRECT\n');
+  final encrypted = utf8.encode(
+    '-----BEGIN AGE ENCRYPTED FILE-----\nfixture-only\n',
+  );
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path.startsWith('/api/v1/content/profile/') ||
+        request.path == '/api/v1/content:decrypt') {
+      requests.add(request);
+      final decrypt = request.path == '/api/v1/content:decrypt';
+      if (decrypt && advanceOnDecrypt) revision = '1';
+      final bytes = decrypt ? plain : encrypted;
+      return Future.value(
+        _reply({
+          'key': {'kind': 'profile', 'id': '9223372036854775807'},
+          'mediaType': 'application/yaml',
+          'sha256': crypto.sha256.convert(bytes).toString(),
+          'size': bytes.length,
+          'bytes': base64Encode(bytes),
+          'encrypted': !decrypt,
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _CustomSourceTransport extends _SourceTransport {
+  _CustomSourceTransport() {
+    private = false;
+  }
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/profiles:prepare-custom-import') {
+      requests.add(request);
+      final input = apiObject(jsonDecode(request.body!));
+      return Future.value(
+        _reply({
+          'preparedJobId': 'custom-source-operation',
+          'operationId': 'custom-source-operation',
+          'requestDigest': List.filled(64, 'd').join(),
+          'contentSha256': List.filled(64, 'e').join(),
+          'expiresAt': DateTime.now()
+              .toUtc()
+              .add(const Duration(minutes: 4))
+              .toIso8601String(),
+          'profileId': input['profileId'],
+          'dependencies': <Object?>[],
+          'summary': {
+            'proxyProviders': 0,
+            'ruleProviders': 0,
+            'proxies': 1,
+            'proxyGroups': 1,
+            'rules': 1,
+            'droppedSubRules': 0,
+          },
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _ProviderUiTransport extends _Transport {
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/runtime/external-providers') {
+      requests.add(request);
+      return Future.value(
+        _reply({
+          'runtimeGeneration': '1',
+          'actualConfig': 'candidate',
+          'providers': [
+            {
+              'name': 'Managed provider',
+              'type': 'Proxy',
+              'vehicleType': 'File',
+              'count': 0,
+              'updatedAt': null,
+              'subscriptionInfo': null,
+              'binding': {'kind': 'profile', 'id': '9223372036854775807'},
+            },
+          ],
+        }, revision: revision),
+      );
+    }
+    return super.send(request);
+  }
+}
+
+class _PreparingSetupTransport extends _SetupTransport {
+  bool ready = false;
+  bool privateSource = false;
+  int evaluations = 0;
+  Map<String, Object?>? effect;
+  final providerId = (BigInt.one << 255).toString();
+  void configure(WebApiRepository repository, {bool script = false}) {
+    final scriptId = repository.codec.id(ApiIdentity.script, '9');
+    final profile = Profile.normal(label: 'First apply source').copyWith(
+      extendType: script ? ExtendType.script : ExtendType.standard,
+      scriptId: script ? scriptId : null,
+    );
+    final raw = {
+      'proxy-providers': {
+        'remote': {'type': 'http', 'url': 'https://source.invalid/provider'},
+      },
+    };
+    final code = utf8.encode('function main(config){return config;}');
+    snapshot = {
+      'profile': {
+        ...repository.codec.profileInput(profile),
+        'id': '9223372036854775807',
+      },
+      'settings': _workflowSettings(),
+      'groups': <Object?>[],
+      'rules': <Object?>[],
+      'globalRules': <Object?>[],
+      'disabledRuleIds': <String>[],
+      'customProxies': <Object?>[],
+      'ruleProviders': <Object?>[],
+      'proxyDialers': <Object?>[],
+      'profileProviders': <String, String>{},
+      'script': script
+          ? {
+              'id': '9',
+              'label': 'Script',
+              'url': null,
+              'order': 0,
+              'lastUpdateTime': '2026-01-01T00:00:00Z',
+            }
+          : null,
+      'scriptContent': script
+          ? {
+              'key': {'kind': 'script', 'id': '9'},
+              'mediaType': 'text/javascript',
+              'size': code.length,
+              'sha256': crypto.sha256.convert(code).toString(),
+              'bytes': base64Encode(code),
+              'encrypted': false,
+            }
+          : null,
+      'mitmModules': <Object?>[],
+      'selectedMap': <String, String>{},
+      'options': CoreOptions(
+        testUrl: Config.realFromJson(null).patchClashConfig.testUrl,
+      ).toJson(),
+      'base': {
+        'config': script ? <String, Object?>{} : raw,
+        'digest': List.filled(64, 'a').join(),
+        'match-rules': <String>[],
+        'proxies': 0,
+        'proxy-groups': 0,
+        'rules': 0,
+      },
+    };
+  }
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) {
+    if (request.path == '/api/v1/profiles:evaluate') {
+      requests.add(request);
+      evaluations++;
+      return Future.value(
+        _reply({
+          'profileId': '9223372036854775807',
+          'scriptId': '9',
+          'readRevision': revision,
+          'evaluationId': List.filled(42, 'E').join() + evaluations.toString(),
+          'preview': false,
+          'console': '',
+          'config': {
+            'proxy-providers': {
+              'remote': {
+                'type': 'http',
+                'url': 'https://source.invalid/provider',
+              },
+            },
+          },
+          'sha256': List.filled(64, 'c').join(),
+          'sourceDigest': List.filled(64, 'a').join(),
+          'scriptDigest': List.filled(64, 'b').join(),
+          'counts': {'proxies': 0, 'groups': 0, 'rules': 0},
+        }, revision: revision),
+      );
+    }
+    if (Uri.parse(request.path).path == '/api/v1/runtime/provider-sources') {
+      requests.add(request);
+      return Future.value(
+        _reply([
+          {
+            'id': providerId,
+            'profileId': '9223372036854775807',
+            'name': 'remote',
+            'purpose': 'proxy-providers',
+            'sourceVersion': List.filled(64, 'd').join(),
+            'phase': ready ? 'ready' : 'unprepared',
+          },
+        ], revision: revision),
+      );
+    }
+    if (request.path == '/api/v1/sources:prepare') {
+      requests.add(request);
+      return Future.value(
+        _reply({
+          'preparationId': List.filled(43, 'P').join(),
+          'urlDigest': List.filled(64, 'e').join(),
+          'purpose': 'external-provider-refresh',
+          'key': {'kind': 'external-provider', 'id': providerId},
+          'expiresAt': DateTime.now()
+              .toUtc()
+              .add(const Duration(minutes: 4))
+              .toIso8601String(),
+          'networkView': 'server',
+          'scheme': 'https',
+          'host': 'source.invalid',
+          'port': 443,
+          'addresses': [privateSource ? '10.0.0.8' : '8.8.8.8'],
+          'requiresPrivateNetworkConfirmation': privateSource,
+        }, revision: revision),
+      );
+    }
+    if (request.path == '/api/v1/runtime/provider-sources:refresh') {
+      requests.add(request);
+      final body = apiObject(jsonDecode(request.body!));
+      if (body['expectedRevision'] != revision)
+        throw StateError('Stale source preparation revision');
+      revision = (BigInt.parse(revision) + BigInt.one).toString();
+      ready = true;
+      final accepted = {
+        'operationId': body['operationId'],
+        'desiredRevision': revision,
+        'action': 'refresh-provider-source',
+        'phase': 'pending',
+        'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      };
+      effect = {
+        ...accepted,
+        'phase': 'applied',
+        'result': {
+          'id': providerId,
+          'sourceVersion': List.filled(64, 'd').join(),
+          'prepared': true,
+          'requiresApply': true,
+        },
+      };
+      return Future.value(
+        _reply(
+          accepted,
+          revision: revision,
+          operationId: body['operationId'] as String,
+        ),
+      );
+    }
+    if (request.path.startsWith('/api/v1/runtime/operations/')) {
+      requests.add(request);
+      return Future.value(_reply(effect, revision: revision));
+    }
+    return super.send(request);
+  }
+}
+
+class _NoApplySetupAction extends SetupAction {
+  int exits = 0;
+
+  @override
+  void build() {}
+
+  @override
+  void autoApplyProfile() => exits++;
+}
+
+Widget _host(Widget child) => PrismApp(
+  navigatorKey: rootNavigatorKey,
+  locale: const Locale('en'),
+  theme: ThemeData(
+    colorScheme: seededColorScheme(
+      seedColor: const Color(0xff007aff),
+      brightness: Brightness.light,
+    ),
+  ),
+  localizationsDelegates: const [
+    AppLocalizations.delegate,
+    AppUiLocalizations.delegate,
+    GlobalWidgetsLocalizations.delegate,
+  ],
+  supportedLocales: AppLocalizations.delegate.supportedLocales,
+  builder: (context, child) {
+    globalState.measure = MeasureScope.of(context);
+    return ViewScope(
+      size: MediaQuery.sizeOf(context),
+      isMobile: false,
+      child: child!,
+    );
+  },
+  home: child,
+);
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'Web workflow waits for the canonical receipt before selection/apply/navigation',
+    () async {
+      final transport = _Transport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.profile);
+      final draft = Profile.custom(label: 'local draft');
+      final effects = <String>[];
+      final future = WebProfileWorkflow(repository).save(
+        draft,
+        editVersion: version,
+        onCommitted: (canonical) async {
+          expect(canonical.id, draft.id);
+          expect(canonical.label, 'canonical server label');
+          effects.addAll(['select', 'apply', 'navigate']);
+        },
+      );
+      final request = await transport.sent.future;
+      expect(effects, isEmpty);
+      expect(
+        repository.identities.isBound(ApiIdentity.profile, draft.id),
+        isFalse,
+      );
+      final body = jsonDecode(request.body!) as Map<String, dynamic>;
+      final canonical = _profile({
+        ...Map<String, Object?>.from(body['profile'] as Map),
+        'label': 'canonical server label',
+      }, '9223372036854775807');
+      transport.stored.add(canonical);
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          canonical,
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      final saved = await future;
+      expect(saved.id, draft.id);
+      expect(
+        repository.codec.wireId(ApiIdentity.profile, saved.id),
+        '9223372036854775807',
+      );
+      expect(effects, ['select', 'apply', 'navigate']);
+      expect(
+        transport.requests.every(
+          (request) => request.path.startsWith('/api/v1/'),
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'Web workflow conflict preserves the draft without navigation/apply or VFS retry',
+    () async {
+      final transport = _Transport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.profile);
+      final draft = Profile.custom(label: 'preserved');
+      var effects = 0;
+      final future = WebProfileWorkflow(
+        repository,
+      ).save(draft, editVersion: version, onCommitted: (_) => effects++);
+      final assertion = expectLater(future, throwsA(isA<WebApiException>()));
+      await transport.sent.future;
+      transport.response.complete(
+        ApiResponse(
+          409,
+          jsonEncode({
+            'revision': '1',
+            'error': {
+              'code': 'revision_conflict',
+              'message': 'Retry after refreshing',
+            },
+          }),
+        ),
+      );
+      await assertion;
+      expect(draft.label, 'preserved');
+      expect(effects, 0);
+      expect(
+        repository.identities.isBound(ApiIdentity.profile, draft.id),
+        isFalse,
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'Web workflow unknown commit keeps its draft unbound until matching recovery',
+    () async {
+      final transport = _Transport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.profile);
+      final draft = Profile.custom(label: 'pending');
+      var effects = 0;
+      final future = WebProfileWorkflow(
+        repository,
+      ).save(draft, editVersion: version, onCommitted: (_) => effects++);
+      final assertion = expectLater(
+        future,
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final request = await transport.sent.future;
+      transport.response.completeError(StateError('transport disconnected'));
+      await assertion;
+      expect(effects, 0);
+      expect(draft.label, 'pending');
+      expect(
+        repository.identities.isBound(ApiIdentity.profile, draft.id),
+        isFalse,
+      );
+      expect(repository.pendingOperation?.path, request.path);
+      expect(repository.pendingOperation?.drafts.single.handle, draft.id);
+      final body = jsonDecode(request.body!) as Map<String, dynamic>;
+      final canonical = _profile(
+        Map<String, Object?>.from(body['profile'] as Map),
+        '9223372036854775807',
+      );
+      transport.recovery = _reply(
+        canonical,
+        revision: '1',
+        operationId: body['operationId'] as String,
+      );
+      await repository.recoverOperation(body['operationId'] as String);
+      expect(
+        repository.codec.wireId(ApiIdentity.profile, draft.id),
+        '9223372036854775807',
+      );
+      expect(repository.pendingOperation, isNull);
+      expect(effects, 0);
+    },
+  );
+
+  testWidgets(
+    'old profile Form retains its copyWith draft after WS advances; explicit reopen reloads its edit token',
+    (tester) async {
+      tester.view.physicalSize = const Size(1000, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final transport = _Transport()..revision = '1';
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final json = _profile(
+        repository.codec.profileInput(Profile.normal(label: 'V1')),
+        '9223372036854775807',
+      );
+      transport.stored.add(json);
+      await repository.initialize();
+      var original = (await repository.profiles().get()).single;
+      final previousDatabase = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() => db.database = previousDatabase);
+      final setup = _NoApplySetupAction();
+      final container = ProviderContainer(
+        overrides: [
+          profilesProvider.overrideWithBuild((_, _) => [original]),
+          currentProfileIdProvider.overrideWithBuild((_, _) => original.id),
+          setupActionProvider.overrideWith(() => setup),
+        ],
+      );
+      addTearDown(container.dispose);
+      globalState.container = container;
+      globalState.appEnv = 'stable';
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(
+            Builder(
+              builder: (context) => TextButton(
+                onPressed: () => BaseNavigator.push(
+                  context,
+                  EditProfileView(profile: original),
+                ),
+                child: const Text('Open profile form'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Open profile form'));
+      await tester.pumpAndSettle();
+      expect(find.byType(EditProfileView), findsOneWidget);
+      await tester.enterText(
+        find.byType(EditableText).first,
+        'A retained draft',
+      );
+      transport.stored[0] = {...json, 'label': 'B committed V2'};
+      transport.revision = '2';
+      await repository.handleCommitEvent({'revision': '2'});
+      await tester.tap(find.byTooltip('Save'));
+      await tester.pump();
+      expect(transport.sent.isCompleted, isTrue);
+      final first = await transport.sent.future;
+      final body = jsonDecode(first.body!) as Map<String, dynamic>;
+      expect(body['expectedRevision'], '1');
+      expect((body['profile'] as Map)['label'], 'A retained draft');
+      expect(find.byType(EditProfileView), findsOneWidget);
+      expect(setup.exits, 0);
+      await rootNavigatorKey.currentState!.maybePop();
+      await tester.pump();
+      expect(find.byType(EditProfileView), findsOneWidget);
+      expect(setup.exits, 0);
+      transport.response.complete(
+        ApiResponse(
+          409,
+          jsonEncode({
+            'revision': '2',
+            'error': {
+              'code': 'revision_conflict',
+              'message': 'Reload before saving',
+            },
+          }),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Data changed on the server'), findsOneWidget);
+      expect(
+        find.text(
+          'Your edit is still here. Reload the latest version before applying it again.',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+      expect(find.byType(EditProfileView), findsOneWidget);
+      expect(find.text('A retained draft'), findsOneWidget);
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+      expect(setup.exits, 0);
+      rootNavigatorKey.currentState!.pop();
+      await tester.pumpAndSettle();
+      original = (await repository.profiles().get()).single;
+      transport.sent = Completer<ApiRequest>();
+      transport.response = Completer<ApiResponse>();
+      await tester.tap(find.text('Open profile form'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byType(EditableText).first,
+        'A after explicit reload',
+      );
+      await tester.tap(find.byTooltip('Save'));
+      await tester.pump();
+      final second = await transport.sent.future;
+      final retry = jsonDecode(second.body!) as Map<String, dynamic>;
+      expect(retry['expectedRevision'], '2');
+      final canonical = _profile(
+        Map<String, Object?>.from(retry['profile'] as Map),
+        '9223372036854775807',
+      );
+      transport.stored[0] = canonical;
+      transport.revision = '3';
+      transport.response.complete(
+        _reply(
+          canonical,
+          revision: '3',
+          operationId: retry['operationId'] as String,
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(EditProfileView), findsNothing);
+      expect(
+        transport.requests.every(
+          (request) => request.path.startsWith('/api/v1/'),
+        ),
+        isTrue,
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(2),
+      );
+    },
+  );
+
+  test(
+    'backup preview is read-only and confirmation binds the exact plan without a browser database parser',
+    () async {
+      final transport = _BackupTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebBackupWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final snapshot = await repository.readExternal('/api/v1/meta');
+      final preview = await workflows.prepare(
+        [1, 2, 3],
+        override: true,
+        onlyProfiles: false,
+        editVersion: repository.captureReadVersion(snapshot),
+      );
+      expect(repository.pendingOperation, isNull);
+      expect(preview.changes.single.name, 'legacy profile');
+      expect(preview.changes.single.count, 2);
+      final prepare = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/backups:prepare',
+      );
+      final readBody = jsonDecode(prepare.body!) as Map<String, dynamic>;
+      expect(readBody.containsKey('operationId'), isFalse);
+      expect(
+        transport.requests.where(
+          (request) => request.path.endsWith(':confirm'),
+        ),
+        isEmpty,
+      );
+      final confirmation = workflows.confirm(preview);
+      final request = await transport.sent.future;
+      final body = jsonDecode(request.body!) as Map<String, dynamic>;
+      expect(request.path, '/api/v1/backups:confirm');
+      expect(body['intent'], 'confirm-backup-conversion');
+      expect(body['expectedRevision'], '0');
+      expect(body['archiveDigest'], preview.archiveDigest);
+      expect(body['planDigest'], preview.planDigest);
+      expect(body['token'], preview.token);
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          {'restored': true, 'profileCount': 1, 'contentCount': 1},
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      await confirmation;
+      expect(repository.pendingOperation, isNull);
+      expect(
+        transport.requests.every(
+          (request) => request.path.startsWith('/api/v1/'),
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'unknown backup schemas never fall through to restore or local VFS conversion',
+    () async {
+      final transport = _BackupTransport()..rejectSchema = true;
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebBackupWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final snapshot = await repository.readExternal('/api/v1/meta');
+      await expectLater(
+        workflows.prepare(
+          [1, 2, 3],
+          override: false,
+          onlyProfiles: false,
+          editVersion: repository.captureReadVersion(snapshot),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(repository.pendingOperation, isNull);
+      expect(
+        transport.requests.where(
+          (request) =>
+              request.path.endsWith(':restore') ||
+              request.path.endsWith(':confirm'),
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'backup downloads pass through a bounded typed attachment and exclude DAV credentials by default',
+    () async {
+      final transport = _BackupTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebBackupWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final bytes = await workflows.download(format: 'native-v1');
+      expect(bytes, transport.archive);
+      expect(
+        transport.requests.last.path,
+        '/api/v1/backups?format=native-v1&includeDavCredentials=false',
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'an empty-label legacy profile keeps its decimal wire fallback in provider references',
+    () async {
+      final transport = _Transport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final previousDatabase = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() => db.database = previousDatabase);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(Profile.normal(label: '')),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final rows = await repository.profiles().get();
+      final profile = rows.single;
+      expect(profile.id.toString(), isNot('9223372036854775807'));
+      expect(profile.defaultLabel, '9223372036854775807');
+      expect(profile.realLabel, '9223372036854775807');
+      final container = ProviderContainer(
+        overrides: [profilesProvider.overrideWithBuild((_, _) => rows)],
+      );
+      addTearDown(container.dispose);
+      final providers = container.read(profileProvidersProvider);
+      expect(providers.keys.single, '9223372036854775807');
+      expect(repository.codec.wireProfileProviderValues(providers), {
+        '9223372036854775807': '9223372036854775807',
+      });
+      final group = repository.codec.proxyGroup({
+        'id': '7',
+        'profileId': '8',
+        'definition': {
+          'name': 'uses-legacy-label',
+          'type': 'select',
+          'use': [profile.realLabel],
+        },
+        'memberLayout': null,
+        'order': null,
+      });
+      expect(group.use, [providers.keys.single]);
+      expect(
+        (repository.codec.proxyGroupInput(group)['definition'] as Map)['use'],
+        ['9223372036854775807'],
+      );
+    },
+  );
+
+  test(
+    'resource references use the shared identity codec, never a server path',
+    () async {
+      final repository = WebApiRepository(
+        transport: _Transport(),
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final profile = repository.identities.decode(
+        ApiIdentity.profile,
+        '9223372036854775807',
+      );
+      final script = repository.identities.decode(
+        ApiIdentity.script,
+        '9223372036854775807',
+      );
+      expect(
+        WebContentRef(WebContentKind.profile, profile).endpoint(repository),
+        '/api/v1/content/profile/9223372036854775807',
+      );
+      expect(
+        WebContentRef(WebContentKind.script, script).endpoint(repository),
+        '/api/v1/content/script/9223372036854775807',
+      );
+      expect(
+        () =>
+            WebContentRef(WebContentKind.script, profile).endpoint(repository),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+  test(
+    'source cancel and background paths never authorize a private destination',
+    () async {
+      final transport = _SourceTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final sources = WebSourceWorkflows(repository);
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.profile);
+      await expectLater(
+        sources.prepareAndConfirm(
+          purpose: 'profile-import',
+          url: 'https://private.example/sub',
+          editVersion: version,
+          confirm: (_) async => false,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'source_authorization_cancelled',
+          ),
+        ),
+      );
+      await expectLater(
+        sources.prepareAndConfirm(
+          purpose: 'profile-import',
+          url: 'https://private.example/sub',
+          editVersion: version,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'source_authorization_required',
+          ),
+        ),
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/sources:authorize',
+        ),
+        isEmpty,
+      );
+      expect(repository.pendingOperation, isNull);
+      transport.private = false;
+      expect(
+        await sources.prepareAndConfirm(
+          purpose: 'profile-import',
+          url: 'https://public.example/sub',
+          editVersion: version,
+        ),
+        isNull,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/sources:authorize',
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'source authorization keeps the original token and exact displayed preparation',
+    () async {
+      final transport = _SourceTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final sources = WebSourceWorkflows(repository);
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.profile);
+      WebSourceConsentPreparation? displayed;
+      final future = sources.prepareAndConfirm(
+        purpose: 'profile-import',
+        url: 'https://private.example/sub',
+        editVersion: version,
+        confirm: (value) async {
+          displayed = value;
+          return true;
+        },
+      );
+      final request = await transport.sent.future;
+      final body = jsonDecode(request.body!) as Map<String, dynamic>;
+      expect(request.path, '/api/v1/sources:authorize');
+      expect(body['expectedRevision'], '0');
+      expect(body['preparationId'], displayed!.preparationId);
+      expect(body['urlDigest'], displayed!.urlDigest);
+      expect(body['intent'], 'authorize-server-private-source');
+      transport.response.complete(
+        _reply({
+          'authorizationId': List.filled(43, 'G').join(),
+          'expiresAt': DateTime.now()
+              .add(const Duration(minutes: 30))
+              .toIso8601String(),
+          'importOperationId': displayed!.preparationId,
+        }, operationId: body['operationId'] as String),
+      );
+      final grant = await future;
+      expect(grant!.importOperationId, displayed!.preparationId);
+      expect(repository.pendingOperation, isNull);
+      expect(repository.revision, '0');
+    },
+  );
+
+  testWidgets(
+    'Web server-network consent renders fixed host and addresses with no automatic permission',
+    (tester) async {
+      final preparation = WebSourceConsentPreparation.decode({
+        'preparationId': List.filled(43, 'P').join(),
+        'urlDigest': List.filled(64, 'a').join(),
+        'purpose': 'profile-import',
+        'expiresAt': DateTime.now()
+            .add(const Duration(minutes: 4))
+            .toIso8601String(),
+        'networkView': 'server',
+        'scheme': 'https',
+        'host': 'private.example',
+        'port': 443,
+        'addresses': ['10.0.0.8'],
+        'requiresPrivateNetworkConfirmation': true,
+      });
+      bool? consent;
+      await tester.pumpWidget(
+        _host(
+          Builder(
+            builder: (context) => TextButton(
+              onPressed: () async {
+                consent = await showWebSourceConsent(
+                  preparation,
+                  context: context,
+                );
+              },
+              child: const Text('Consent fixture'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Consent fixture'));
+      await tester.pumpAndSettle();
+      expect(consent, isNull);
+      expect(find.text('Server network access'), findsOneWidget);
+      expect(find.text('Resolved addresses: 10.0.0.8'), findsOneWidget);
+      expect(find.textContaining('private.example:443'), findsOneWidget);
+      expect(
+        find.text(
+          'A redirect to a different destination requires separate permission.',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(consent, isFalse);
+      await tester.tap(find.text('Consent fixture'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Confirm'));
+      await tester.pumpAndSettle();
+      expect(consent, isTrue);
+    },
+  );
+
+  testWidgets(
+    'Web sensitivity choice gates real backup bytes and the whole DAV tuple opt-in',
+    (tester) async {
+      final transport = _BackupTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      registerWebWorkflowReceipts(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final previousDatabase = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() => db.database = previousDatabase);
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      globalState.container = container;
+      bool? delivered;
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(
+            TextButton(
+              onPressed: () async {
+                delivered = await container
+                    .read(backupActionProvider.notifier)
+                    .backup((bytes) async {
+                      expect(bytes, transport.archive);
+                      return true;
+                    });
+              },
+              child: const Text('Backup fixture'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Backup fixture'));
+      await tester.pumpAndSettle();
+      expect(find.text('Sensitive backup data'), findsOneWidget);
+      expect(
+        find.text(
+          'Backups can include proxy passwords and subscription tokens. Excluding WebDAV does not remove all sensitive data.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path.startsWith('/api/v1/backups?'),
+        ),
+        isEmpty,
+      );
+      expect(tester.widget<Checkbox>(find.byType(Checkbox)).value, isFalse);
+      await tester.tap(find.text('Include WebDAV connection and credentials'));
+      await tester.pump();
+      expect(tester.widget<Checkbox>(find.byType(Checkbox)).value, isTrue);
+      await tester.tap(find.text('Confirm'));
+      await tester.pumpAndSettle();
+      expect(delivered, isTrue);
+      expect(
+        transport.requests.last.path,
+        '/api/v1/backups?format=flclash-v1&includeDavCredentials=true',
+      );
+    },
+  );
+
+  test(
+    'script import binds one stable draft with direct metadata and canonical content',
+    () async {
+      final transport = _Transport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebContentWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final draft = Script.create(label: 'Script draft');
+      final version = repository.captureCreateVersion(ApiIdentity.script);
+      final bytes = utf8.encode('function main(config) { return config; }');
+      final saving = workflows.saveScript(
+        draft,
+        utf8.decode(bytes),
+        editVersion: version,
+      );
+      final request = await transport.sent.future;
+      final body = jsonDecode(request.body!) as Map<String, dynamic>;
+      expect(request.path, '/api/v1/scripts:import');
+      expect(body['expectedRevision'], '0');
+      expect((body['metadata'] as Map)['label'], 'Script draft');
+      expect((body['metadata'] as Map).containsKey('script'), isFalse);
+      expect((body['source'] as Map)['bytes'], base64Encode(bytes));
+      expect(
+        repository.identities.isBound(ApiIdentity.script, draft.id),
+        isFalse,
+      );
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          {
+            'content': {
+              'key': {'kind': 'script', 'id': '9223372036854775807'},
+              'mediaType': 'text/javascript',
+              'sha256': crypto.sha256.convert(bytes).toString(),
+              'size': bytes.length,
+            },
+            'script': {
+              'id': '9223372036854775807',
+              'label': 'Canonical script',
+              'lastUpdateTime': DateTime.now().toIso8601String(),
+              'url': null,
+              'order': 0,
+            },
+          },
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      final canonical = await saving;
+      expect(canonical.id, draft.id);
+      expect(canonical.label, 'Canonical script');
+      expect(
+        repository.captureEditVersion(ApiIdentity.script, canonical).revision,
+        '1',
+      );
+      expect(
+        repository.codec.wireId(ApiIdentity.script, canonical.id),
+        '9223372036854775807',
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+    },
+  );
+  test(
+    'staged pure build preserves inline and URL definitions without local provider paths or file migration',
+    () async {
+      final built = await makeRealProfileTask(
+        MakeRealProfileState(
+          profilesPath: '/native-must-not-be-used',
+          profileId: 8,
+          rawConfig: {
+            'proxy-providers': {
+              'remote': {
+                'type': 'http',
+                'url': 'https://provider.invalid/list',
+                'path': '../../../native-cache',
+              },
+              'inline': {'type': 'inline', 'payload': <Object?>[]},
+            },
+            'rule-providers': {
+              'rules': {
+                'type': 'http',
+                'url': 'https://rules.invalid/file',
+                'path': '/native-rules',
+              },
+            },
+            'proxies': <Object?>[],
+            'proxy-groups': <Object?>[],
+            'rules': <String>[],
+          },
+          realPatchConfig: const PatchClashConfig(),
+          overrides: const ProfileOverrides(),
+          appendSystemDns: false,
+          proxyGroups: const [],
+          rules: const [],
+          addedRules: const [],
+          defaultUA: 'Workflow fixture',
+        ),
+      );
+      final output = source_yaml.loadYaml(built.yaml) as Map;
+      final remote = (output['proxy-providers'] as Map)['remote'] as Map;
+      final inline = (output['proxy-providers'] as Map)['inline'] as Map;
+      expect(remote['url'], 'https://provider.invalid/list');
+      expect(remote.containsKey('path'), isFalse);
+      expect(inline['type'], 'inline');
+      expect(inline['payload'], isEmpty);
+      expect(
+        ((output['rule-providers'] as Map)['rules'] as Map).containsKey('path'),
+        isFalse,
+      );
+      expect(built.yaml, isNot(contains('/native')));
+    },
+  );
+
+  test(
+    'typed setup uses one complete source snapshot and refuses an old frame after a WS revision',
+    () async {
+      final transport = _SetupTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final input = repository.codec.profileInput(
+        Profile.normal(label: 'Setup source'),
+      );
+      final settings = _workflowSettings();
+      final patch = Config.realFromJson(null).patchClashConfig;
+      transport.snapshot = {
+        'profile': {...input, 'id': '9223372036854775807'},
+        'settings': settings,
+        'groups': <Object?>[],
+        'rules': <Object?>[],
+        'globalRules': <Object?>[],
+        'disabledRuleIds': <String>[],
+        'customProxies': <Object?>[],
+        'ruleProviders': <Object?>[],
+        'proxyDialers': <Object?>[],
+        'profileProviders': <String, String>{},
+        'script': null,
+        'scriptContent': null,
+        'mitmModules': <Object?>[],
+        'selectedMap': <String, String>{},
+        'options': CoreOptions(testUrl: patch.testUrl).toJson(),
+        'base': {
+          'config': {
+            'proxy-providers': {
+              'remote': {
+                'type': 'http',
+                'url': 'https://provider.invalid/a',
+                'path': '/native-cache',
+              },
+            },
+          },
+          'digest': List.filled(64, 'a').join(),
+          'match-rules': <String>[],
+          'proxies': 0,
+          'proxy-groups': 0,
+          'rules': 0,
+        },
+      };
+      await repository.initialize();
+      final id = repository.codec.id(
+        ApiIdentity.profile,
+        '9223372036854775807',
+      );
+      final workflows = WebSetupWorkflows(repository);
+      final state = await workflows.read(id);
+      final built = await workflows.build(
+        state,
+        defaultUA: 'Workflow fixture',
+        safeMode: true,
+      );
+      addTearDown(() => workflows.release(built));
+      expect(built.base!.path, startsWith('flclash-web-setup:'));
+      final request = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/profiles:build',
+      );
+      final body = jsonDecode(request.body!) as Map<String, dynamic>;
+      expect(body['id'], '9223372036854775807');
+      expect(body.containsKey('overlay'), isTrue);
+      expect(body.containsKey('candidateYaml'), isFalse);
+      expect(body['overlay'], isNot(contains('/native-cache')));
+      expect(body['resourceBindings'], {
+        'profileProviders': {},
+        'ruleProviders': {},
+        'mitmModules': [],
+      });
+      await repository.handleCommitEvent({'revision': '1'});
+      await expectLater(
+        workflows.build(state, defaultUA: 'Workflow fixture', safeMode: true),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/profiles:build',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  testWidgets(
+    'typed batch error messages and stack secrets never reach logs while native failures keep their message',
+    (tester) async {
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      globalState.container = container;
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(const Text('Batch fixture')),
+        ),
+      );
+      final lines = <String>[];
+      final originalPrint = debugPrint;
+      debugPrint = (String? message, {int? wrapWidth}) {
+        lines.add(message ?? '');
+        originalPrint(message, wrapWidth: wrapWidth);
+      };
+      addTearDown(() => debugPrint = originalPrint);
+      await globalState.batchRun<int>(
+        [1],
+        (_) => Future<void>.error(
+          const WebApiException(
+            'revision_conflict',
+            'subscription-password-secret',
+          ),
+          StackTrace.fromString('credential-stack-secret'),
+        ),
+        label: (_) => 'Import 1',
+        concurrency: 1,
+        tag: null,
+      );
+      expect(lines.join('\n'), isNot(contains('subscription-password-secret')));
+      expect(lines.join('\n'), isNot(contains('credential-stack-secret')));
+      expect(lines.join('\n'), contains('revision_conflict'));
+      lines.clear();
+      await globalState.batchRun<int>(
+        [1],
+        (_) => Future<void>.error(
+          const MessageException('Native visible message'),
+          StackTrace.fromString('native stack'),
+        ),
+        label: (_) => 'Native fixture',
+        concurrency: 1,
+        tag: null,
+      );
+      expect(lines.join('\n'), contains('Native visible message'));
+      expect(lines.join('\n'), contains('native stack'));
+      expect(
+        webWorkflowLogCode(
+          const WebApiException('raw-password-secret', 'unused'),
+        ),
+        'api_error',
+      );
+      debugPrint = originalPrint;
+    },
+  );
+
+  testWidgets(
+    'safeRun typed failures show localized feedback without raw code message or stack secrets',
+    (tester) async {
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      globalState.container = container;
+      final lines = <String>[];
+      final originalPrint = debugPrint;
+      debugPrint = (String? message, {int? wrapWidth}) {
+        lines.add(message ?? '');
+        originalPrint(message, wrapWidth: wrapWidth);
+      };
+      addTearDown(() => debugPrint = originalPrint);
+      var settled = false;
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(
+            TextButton(
+              onPressed: () async {
+                final value = await globalState.safeRun(
+                  () => Future<int>.error(
+                    const WebApiException(
+                      'raw-code-secret',
+                      'raw-message-secret',
+                    ),
+                    StackTrace.fromString('raw-stack-secret'),
+                  ),
+                );
+                expect(value, isNull);
+                settled = true;
+              },
+              child: const Text('Failure fixture'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Failure fixture'));
+      await tester.pumpAndSettle();
+      expect(settled, isFalse);
+      expect(find.text('The request failed. Please retry.'), findsOneWidget);
+      expect(find.textContaining('raw-message-secret'), findsNothing);
+      expect(lines.join('\n'), isNot(contains('raw-code-secret')));
+      expect(lines.join('\n'), isNot(contains('raw-message-secret')));
+      expect(lines.join('\n'), isNot(contains('raw-stack-secret')));
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+      expect(settled, isTrue);
+      debugPrint = originalPrint;
+    },
+  );
+  test(
+    'DAV accepted upload is not success and an unresolved job blocks a second PUT intent',
+    () async {
+      final transport = _DavTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      registerWebWorkflowReceipts(repository);
+      await repository.initialize();
+      final workflows = WebDavWorkflows(repository);
+      final first = repository.captureReadVersion(
+        await repository.readExternal('/api/v1/settings'),
+      );
+      await expectLater(
+        workflows.backup(includeDavCredentials: false, editVersion: first),
+        throwsA(isA<WebDavUncertainException>()),
+      );
+      expect(repository.pendingOperation, isNull);
+      final next = repository.captureReadVersion(
+        await repository.readExternal('/api/v1/settings'),
+      );
+      await expectLater(
+        workflows.backup(includeDavCredentials: false, editVersion: next),
+        throwsA(isA<WebDavUncertainException>()),
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/dav:backup',
+        ),
+        hasLength(1),
+      );
+      for (final request in transport.requests.where(
+        (request) => request.method == 'POST',
+      )) {
+        expect(request.body, isNot(contains('fixture-dav-password-secret')));
+        expect(request.body, isNot(contains('secret-collection')));
+        expect(request.body, isNot(contains('archiveBase64')));
+      }
+    },
+  );
+
+  test(
+    'DAV new-session summary never reveals an old full job and reconciliation uses a new read-only operation',
+    () async {
+      final transport = _DavTransport(preexistingUnknown: true)
+        ..unknownUpload = false;
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      registerWebWorkflowReceipts(repository);
+      await repository.initialize();
+      final workflows = WebDavWorkflows(repository);
+      final original = (await workflows.summaries()).single;
+      expect(original.needsPrepare, isTrue);
+      final observed = await workflows.reconcile(original.asUncertainJob());
+      expect(observed.result['remoteMatches'], isTrue);
+      expect(observed.result['reconciliationOf'], original.operationId);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/dav/jobs/previous-upload',
+        ),
+        isEmpty,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/dav:backup',
+        ),
+        isEmpty,
+      );
+      final request = transport.requests.singleWhere(
+        (request) => request.path.endsWith(':reconcile'),
+      );
+      final body = apiObject(jsonDecode(request.body!));
+      expect(body['intent'], 'reconcile-dav-backup');
+      expect(body['expectedRevision'], '0');
+      expect(body['operationId'], isNot(original.operationId));
+      expect(body.keys.toSet(), {'intent', 'operationId', 'expectedRevision'});
+      final version = repository.captureReadVersion(
+        await repository.readExternal('/api/v1/settings'),
+      );
+      await workflows.backup(
+        includeDavCredentials: false,
+        editVersion: version,
+      );
+      final backup = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/dav:backup',
+      );
+      final upload = apiObject(jsonDecode(backup.body!));
+      expect(upload['resolutionOperationId'], observed.operationId);
+      expect(upload['operationId'], isNot(observed.operationId));
+    },
+  );
+
+  testWidgets(
+    'uncertain DAV UI only reconciles on explicit action and explains observation is not exactly once',
+    (tester) async {
+      final transport = _DavTransport(preexistingUnknown: true);
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      registerWebWorkflowReceipts(repository);
+      await repository.initialize();
+      final workflows = WebDavWorkflows(repository);
+      final summary = (await workflows.summaries()).single;
+      await tester.pumpWidget(
+        _host(
+          Builder(
+            builder: (_) => TextButton(
+              onPressed: () => showWebWorkflowFailure(
+                WebDavUncertainException(workflows, summary.asUncertainJob()),
+                repository: repository,
+              ),
+              child: const Text('DAV uncertainty fixture'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('DAV uncertainty fixture'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text(
+          'The result is not known yet. Resolve this operation before trying a new one.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+      await tester.tap(find.text('Resolve operation'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text(
+          'The remote bytes currently match this backup. This is an observation, not proof that the upload ran exactly once.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/dav:backup',
+        ),
+        isEmpty,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/dav/jobs/previous-upload',
+        ),
+        isEmpty,
+      );
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+    },
+  );
+  test(
+    'module text and attachments share one prepared proof and one atomic final command without private authorization',
+    () async {
+      final transport = _PreparedTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final workflows = WebContentWorkflows(repository);
+      await repository.initialize();
+      final original =
+          (await repository.catalog(repository.modules).get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        original,
+      );
+      const text = '#!name=Saved module\n[MITM]\nhostname = example.invalid\n';
+      final saving = workflows.saveModule(
+        original,
+        text,
+        editVersion: version,
+        attachments: {
+          'first.js': [1, 2],
+          'second.json': [3, 4],
+        },
+      );
+      final request = await transport.sent.future;
+      final body = apiObject(jsonDecode(request.body!));
+      final prepare = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/content:prepare-write',
+      );
+      final input = apiObject(jsonDecode(prepare.body!));
+      expect(input['expectedRevision'], '0');
+      expect(input.containsKey('attachments'), isFalse);
+      expect(
+        transport.requests.where(
+          (request) => request.path.endsWith('/attachments'),
+        ),
+        hasLength(2),
+      );
+      expect(body['requestDigest'], List.filled(64, 'c').join());
+      expect(input['bytes'], base64Encode(utf8.encode(text)));
+      expect(request.path, '/api/v1/content:write');
+      expect(body['operationId'], 'prepared-module-operation');
+      expect(body['preparedJobId'], 'prepared-module-operation');
+      expect(body['expectedRevision'], '0');
+      expect(body['authorizationIds'], isEmpty);
+      expect(body.containsKey('bytes'), isFalse);
+      expect(body.containsKey('attachments'), isFalse);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/sources:authorize',
+        ),
+        isEmpty,
+      );
+      transport.module['name'] = 'Saved module';
+      transport.module['enabled'] = false;
+      transport.module['scripts'] = 1;
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          transport.receipt(text),
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      final saved = await saving;
+      expect(saved.name, 'Saved module');
+      expect(saved.enabled, isFalse);
+      expect(
+        repository.captureEditVersion(ApiIdentity.mitmModule, saved).revision,
+        '1',
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'expired module preparation preserves the draft and issues no final command or fresh operation',
+    () async {
+      final transport = _PreparedTransport()..expired = true;
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final workflows = WebContentWorkflows(repository);
+      await repository.initialize();
+      final original =
+          (await repository.catalog(repository.modules).get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        original,
+      );
+      await expectLater(
+        workflows.saveModule(
+          original,
+          '#!name=Retained draft',
+          editVersion: version,
+        ),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(original.name, 'Original module');
+      expect(repository.pendingOperation, isNull);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        isEmpty,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:prepare-write',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'unknown prepared module commit recovers the same operation instead of reparsing with a new ID',
+    () async {
+      final transport = _PreparedTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      final workflows = WebContentWorkflows(repository);
+      await repository.initialize();
+      final original =
+          (await repository.catalog(repository.modules).get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        original,
+      );
+      const text = '#!name=Committed module';
+      final saving = workflows.saveModule(original, text, editVersion: version);
+      final assertion = expectLater(
+        saving,
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      await transport.sent.future;
+      transport.response.completeError(StateError('Synthetic response loss'));
+      await assertion;
+      expect(
+        repository.pendingOperation!.operationId,
+        'prepared-module-operation',
+      );
+      transport.module['name'] = 'Committed module';
+      transport.revision = '1';
+      transport.recovery = _reply(
+        transport.receipt(text),
+        revision: '1',
+        operationId: 'prepared-module-operation',
+      );
+      await repository.recoverOperation('prepared-module-operation');
+      expect(repository.pendingOperation, isNull);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        hasLength(1),
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:prepare-write',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'applied counts come from the actual runtime endpoint and unknown never substitutes source or zero counts',
+    () async {
+      final transport = _MetadataTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      await repository.initialize();
+      final metadata = WebRuntimeMetadata(repository);
+      final observed = await metadata.appliedCounts();
+      expect(observed.runtimeGeneration, '2');
+      expect(observed.actualConfig, 'candidate');
+      expect(observed.counts, (groups: 2, proxies: 3, rules: 4));
+      transport.unknownCounts = true;
+      await expectLater(
+        metadata.appliedCounts(),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'runtime_unknown',
+          ),
+        ),
+      );
+      expect(
+        transport.requests.where((request) => request.path.contains('/base')),
+        isEmpty,
+      );
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'geo metadata preserves opaque source IDs unavailable states and complete snapshots without file paths',
+    () async {
+      final transport = _MetadataTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      await repository.initialize();
+      final metadata = WebRuntimeMetadata(repository);
+      final snapshot = await metadata.geoSnapshot();
+      expect(snapshot.infos[GeoResource.MMDB]!.size, 123);
+      expect(
+        snapshot.infos[GeoResource.MMDB]!.lastModified,
+        DateTime.parse('2026-01-02T03:04:05Z'),
+      );
+      expect(snapshot.infos[GeoResource.ASN], isNull);
+      expect(snapshot.sourceIds[GeoResource.MMDB]!.length, greaterThan(20));
+      transport.missingGeo = true;
+      await expectLater(
+        metadata.geoInfos(),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'manual geo update binds its actual metadata token source ID and confirmed install through the runtime queue',
+    () async {
+      final transport = _MetadataTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      registerWebWorkflowReceipts(repository);
+      final binding = WebRuntimeBinding.configure(repository);
+      addTearDown(binding.close);
+      await repository.initialize();
+      await WebRuntimeMetadata(repository)
+          .updateGeo(
+            GeoResource.MMDB,
+            confirmSource: (_) async =>
+                fail('A public source must not request private permission'),
+          )
+          .timeout(
+            const Duration(seconds: 3),
+            onTimeout: () => throw StateError(
+              'Geo fixture did not complete: ${transport.requests.map((request) => request.method + ' ' + request.path).join(',')}; pending=${repository.pendingOperation?.path}',
+            ),
+          );
+      final request = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/runtime/geo:update',
+      );
+      final body = apiObject(jsonDecode(request.body!));
+      expect(body['type'], 'MMDB');
+      expect(body['expectedRevision'], '0');
+      expect(body['sourceId'], (BigInt.one << 255).toString());
+      expect(body.containsKey('url'), isFalse);
+      expect(body.containsKey('path'), isFalse);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/sources:authorize',
+        ),
+        isEmpty,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path.startsWith('/api/v1/runtime/operations/'),
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  testWidgets(
+    'runtime admission recovery remains unknown until the explicit read confirms the applied effect',
+    (tester) async {
+      final transport = _RuntimeRecoveryTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      repository.registerExternalReceipt('/api/v1/runtime', apiObject);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final version = repository.captureReadVersion(
+        await repository.readExternal('/api/v1/meta'),
+      );
+      final command = repository.executeExternalCommand(
+        '/api/v1/runtime:apply',
+        {
+          'profileId': null,
+          'selectedMap': <String, String>{},
+          'options': const CoreOptions(
+            testUrl: 'https://fixture.invalid',
+          ).toJson(),
+        },
+        apiObject,
+        editVersion: version,
+      );
+      WebApiUnknownCommitException? unknown;
+      final caught = command.catchError((Object error) {
+        unknown = error as WebApiUnknownCommitException;
+        return <String, Object?>{};
+      });
+      final request = await transport.sent.future;
+      final body = apiObject(jsonDecode(request.body!));
+      transport.operationId = body['operationId'] as String;
+      transport.response.completeError(
+        StateError('Synthetic runtime response loss'),
+      );
+      await caught;
+      transport.recovery = _reply(
+        {
+          'operationId': transport.operationId,
+          'desiredRevision': '1',
+          'action': 'apply-profile',
+          'phase': 'pending',
+          'updatedAt': DateTime.now().toIso8601String(),
+        },
+        revision: '1',
+        operationId: transport.operationId,
+      );
+      await tester.pumpWidget(
+        _host(
+          Builder(
+            builder: (_) => TextButton(
+              onPressed: () =>
+                  showWebWorkflowFailure(unknown!, repository: repository),
+              child: const Text('Runtime recovery fixture'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Runtime recovery fixture'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Resolve operation'));
+      await tester.pumpAndSettle();
+      expect(repository.pendingOperation, isNull);
+      expect(
+        find.text(
+          'The change was committed, but the latest view could not be loaded. Refresh without resubmitting the change.',
+        ),
+        findsNothing,
+      );
+      expect(
+        find.text(
+          'The result is not known yet. Resolve this operation before trying a new one.',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Resolve operation'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text(
+          'The result is not known yet. Resolve this operation before trying a new one.',
+        ),
+        findsOneWidget,
+      );
+      transport.phase = 'applied';
+      await tester.tap(find.text('Resolve operation'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text(
+          'The change was committed, but the latest view could not be loaded. Refresh without resubmitting the change.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/runtime:apply',
+        ),
+        hasLength(1),
+      );
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+    },
+  );
+  test(
+    'profile draft validation uses the pure typed endpoint original read and no commit or browser file',
+    () async {
+      final transport = _ValidationTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(
+            Profile.normal(label: 'Validation fixture'),
+          ),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final original = (await repository.profiles().get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        original,
+      );
+      final workflows = WebContentWorkflows(repository);
+      await workflows.validateProfileDraft(
+        utf8.encode('proxies: []'),
+        profileId: original.id,
+        editVersion: version,
+      );
+      final request = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/profiles:validate',
+      );
+      final body = apiObject(jsonDecode(request.body!));
+      expect(body['expectedRevision'], '0');
+      expect(body['profileId'], '9223372036854775807');
+      expect(body.containsKey('operationId'), isFalse);
+      expect(body.containsKey('path'), isFalse);
+      expect(repository.pendingOperation, isNull);
+      transport.reject = true;
+      await expectLater(
+        workflows.validateProfileDraft(
+          [0, 1],
+          profileId: original.id,
+          editVersion: version,
+        ),
+        throwsA(
+          isA<WebApiException>().having((error) => error.status, 'status', 422),
+        ),
+      );
+      expect(repository.pendingOperation, isNull);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'detach consumes a dedicated removed key without accepting fake SHA summaries and returns tagged canonical module',
+    () async {
+      final transport = _PreparedTransport();
+      transport.module['resources'] = {'attachment.js': 'opaque-removed-key'};
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebContentWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final original =
+          (await repository.catalog(repository.modules).get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        original,
+      );
+      final removing = workflows.detach(
+        original,
+        'attachment.js',
+        editVersion: version,
+      );
+      final request = await transport.sent.future;
+      final body = apiObject(jsonDecode(request.body!));
+      expect(request.path, '/api/v1/mitm-modules:detach');
+      expect(body['expectedRevision'], '0');
+      transport.module['resources'] = <String, String>{};
+      transport.module['enabled'] = false;
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          {
+            'mitmModule': transport.module,
+            'detachedKey': {
+              'kind': 'mitm-resource',
+              'id': '9223372036854775807',
+              'name': 'opaque-removed-key',
+            },
+          },
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      final saved = await removing;
+      expect(saved.resources, isEmpty);
+      expect(saved.enabled, isFalse);
+      expect(original.resources.containsKey('attachment.js'), isTrue);
+      expect(
+        repository.captureEditVersion(ApiIdentity.mitmModule, saved).revision,
+        '1',
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+    },
+  );
+  testWidgets(
+    'legacy restore confirmation shows the complete typed settings conversion and cancel never commits',
+    (tester) async {
+      final transport = _BackupTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebBackupWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final version = repository.captureReadVersion(
+        await repository.readExternal('/api/v1/meta'),
+      );
+      final preview = await workflows.prepare(
+        [1, 2, 3],
+        override: false,
+        onlyProfiles: false,
+        editVersion: version,
+      );
+      expect(preview.changes.single.settingsChange!.before, 'system');
+      expect(preview.changes.single.settingsChange!.after, 'mips');
+      expect(preview.changes.single.settingsChange!.lossless, isFalse);
+      tester.view.physicalSize = const Size(1000, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      bool? confirmed;
+      await tester.pumpWidget(
+        _host(
+          TextButton(
+            onPressed: () async {
+              confirmed = await confirmWebBackupConversion(
+                preview,
+                destructive: false,
+              );
+            },
+            child: const Text('Legacy conversion fixture'),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Legacy conversion fixture'));
+      await tester.pumpAndSettle();
+      expect(find.text('Review legacy conversion'), findsOneWidget);
+      expect(
+        find.textContaining('"sourceField": "legacy.stack"'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('"before": "system"'), findsOneWidget);
+      expect(find.textContaining('"after": "mips"'), findsOneWidget);
+      expect(
+        find.textContaining('"requiresConfirmation": true'),
+        findsOneWidget,
+      );
+      expect(confirmed, isNull);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(confirmed, isFalse);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/backups:confirm',
+        ),
+        isEmpty,
+      );
+    },
+  );
+  test(
+    'encrypted profile editing uses verified pure decryption bytes and its original read token without a browser file',
+    () async {
+      final transport = _EncryptedTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(
+            Profile.normal(
+              label: 'Encrypted fixture',
+            ).copyWith(ageSecretKey: 'fixture-only-key'),
+          ),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final original = (await repository.profiles().get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        original,
+      );
+      final bytes = await WebContentWorkflows(
+        repository,
+      ).editableProfileBytes(original, editVersion: version);
+      expect(bytes, transport.plain);
+      expect(repository.pendingOperation, isNull);
+      final request = transport.requests.singleWhere(
+        (request) => request.path == '/api/v1/content:decrypt',
+      );
+      final body = apiObject(jsonDecode(request.body!));
+      expect(body['id'], '9223372036854775807');
+      expect(body['ageSecretKey'], 'fixture-only-key');
+      expect(body.containsKey('operationId'), isFalse);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'decryption refuses a different source revision and never adopts it as the old editor baseline',
+    () async {
+      final transport = _EncryptedTransport()..advanceOnDecrypt = true;
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(
+            Profile.normal(label: 'Retained source'),
+          ),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final original = (await repository.profiles().get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        original,
+      );
+      await expectLater(
+        WebContentWorkflows(
+          repository,
+        ).editableProfileBytes(original, editVersion: version),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'edit_snapshot_mismatch',
+          ),
+        ),
+      );
+      expect(
+        repository.captureEditVersion(ApiIdentity.profile, original).revision,
+        '0',
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'new module import uses its immutable preparation and one atomic canonical content receipt',
+    () async {
+      final transport = _PreparedTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebContentWorkflows(repository);
+      addTearDown(repository.close);
+      await repository.initialize();
+      final draft = MitmModule(
+        id: snowflake.id,
+        name: 'Draft module',
+        lastUpdateTime: DateTime.now(),
+      );
+      final version = repository.captureCreateVersion(ApiIdentity.mitmModule);
+      const text = '#!name=Saved module';
+      final saving = workflows.saveModule(draft, text, editVersion: version);
+      final request = await transport.sent.future;
+      final body = apiObject(jsonDecode(request.body!));
+      expect(request.path, '/api/v1/mitm-modules:import');
+      expect(body['operationId'], 'prepared-module-operation');
+      expect(body.containsKey('source'), isFalse);
+      expect(body.containsKey('metadata'), isFalse);
+      transport.module['name'] = 'Saved module';
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          transport.receipt(text),
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      final saved = await saving;
+      expect(saved.id, draft.id);
+      expect(
+        repository.captureEditVersion(ApiIdentity.mitmModule, saved).revision,
+        '1',
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/mitm-modules:prepare-import',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+  test(
+    'custom URL import keeps root acquisition parsing and final atomic graph behind a source job with its original token',
+    () async {
+      final transport = _CustomSourceTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      final workflows = WebContentWorkflows(repository);
+      addTearDown(repository.close);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(Profile.custom(label: 'Custom source')),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final original = (await repository.profiles().get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        original,
+      );
+      final prepared = await workflows.prepareCustomUrl(
+        original,
+        'https://public.example/config.yaml',
+        editVersion: version,
+      );
+      expect(prepared.operationId, 'custom-source-operation');
+      expect(prepared.editVersion.revision, '0');
+      expect(repository.pendingOperation, isNull);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/profiles:import-custom',
+        ),
+        isEmpty,
+      );
+      final committing = workflows.commitCustomUrl(prepared);
+      final request = await transport.sent.future;
+      final body = apiObject(jsonDecode(request.body!));
+      expect(request.path, '/api/v1/profiles:import-custom');
+      expect(body['expectedRevision'], '0');
+      expect(body['operationId'], 'custom-source-operation');
+      expect(body['preparedJobId'], 'custom-source-operation');
+      expect(body.containsKey('custom'), isFalse);
+      expect(body.containsKey('url'), isFalse);
+      expect(body['authorizationIds'], isEmpty);
+      transport.revision = '1';
+      transport.response.complete(
+        _reply(
+          {
+            'profile': transport.stored.single,
+            'addedProfileIds': <String>[],
+            'addedRuleProviderIds': <String>[],
+            'addedProxyIds': <String>[],
+            'groupIds': <String>[],
+            'ruleIds': <String>[],
+          },
+          revision: '1',
+          operationId: body['operationId'] as String,
+        ),
+      );
+      final saved = await committing;
+      expect(saved.id, original.id);
+      expect(
+        repository.captureEditVersion(ApiIdentity.profile, saved).revision,
+        '1',
+      );
+      expect(
+        transport.requests.every(
+          (request) => request.path.startsWith('/api/v1/'),
+        ),
+        isTrue,
+      );
+    },
+  );
+  testWidgets(
+    'provider row resolves its typed managed binding and opens preview without native File or Core provider RPC',
+    (tester) async {
+      final transport = _ProviderUiTransport();
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      registerWebWorkflowReceipts(repository);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(
+            Profile.normal(label: 'Managed provider'),
+          ),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final previous = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() => db.database = previous);
+      final workflows = webExternalProviderWorkflows(repository);
+      final rows = await workflows.runtimeProviders();
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      globalState.container = container;
+      tester.view.physicalSize = const Size(1000, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(
+            Scaffold(
+              title: 'Provider fixture',
+              body: ProviderItem(provider: rows.providers.single),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Managed provider'), findsOneWidget);
+      expect(
+        transport.requests.where(
+          (request) => request.path.startsWith('/api/v1/content/profile/'),
+        ),
+        isNotEmpty,
+      );
+      await tester.tap(find.text('Managed provider'));
+      await tester.pumpAndSettle();
+      expect(find.byType(EditorPage), findsOneWidget);
+      expect(
+        transport.requests.every(
+          (request) => request.path.startsWith('/api/v1/'),
+        ),
+        isTrue,
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+      rootNavigatorKey.currentState!.pop();
+      await tester.pumpAndSettle();
+    },
+  );
+  for (final script in [false, true]) {
+    test(
+      'first apply prepares unready HTTP provider then re-reads actual snapshot and reevaluates=$script',
+      () async {
+        final transport = _PreparingSetupTransport();
+        final repository = WebApiRepository(
+          transport: transport,
+          journal: MemoryApiOperationJournal(),
+        );
+        addTearDown(repository.close);
+        transport.configure(repository, script: script);
+        final binding = WebRuntimeBinding.configure(repository);
+        addTearDown(binding.close);
+        await repository.initialize();
+        final id = repository.codec.id(
+          ApiIdentity.profile,
+          '9223372036854775807',
+        );
+        final workflows = WebSetupWorkflows(repository);
+        final oldState = await workflows.read(id);
+        final built = await workflows.build(
+          oldState,
+          defaultUA: 'Fixture',
+          safeMode: true,
+        );
+        addTearDown(() => workflows.release(built));
+        expect(
+          transport.requests.where(
+            (request) => request.path.endsWith('/setup-state'),
+          ),
+          hasLength(2),
+        );
+        expect(
+          transport.requests.where(
+            (request) =>
+                request.path == '/api/v1/runtime/provider-sources:refresh',
+          ),
+          hasLength(1),
+        );
+        final refresh = transport.requests.singleWhere(
+          (request) =>
+              request.path == '/api/v1/runtime/provider-sources:refresh',
+        );
+        expect(apiObject(jsonDecode(refresh.body!))['expectedRevision'], '0');
+        expect(
+          transport.requests.where(
+            (request) => request.path == '/api/v1/profiles:build',
+          ),
+          hasLength(1),
+        );
+        expect(workflows.stateOf(built), isNot(same(oldState)));
+        final build = apiObject(
+          jsonDecode(
+            transport.requests
+                .singleWhere(
+                  (request) => request.path == '/api/v1/profiles:build',
+                )
+                .body!,
+          ),
+        );
+        if (script) {
+          expect(transport.evaluations, 2);
+          expect(build['evaluationId'], List.filled(42, 'E').join() + '2');
+          final evaluations = transport.requests
+              .where((request) => request.path == '/api/v1/profiles:evaluate')
+              .toList();
+          expect(
+            apiObject(jsonDecode(evaluations[0].body!))['expectedRevision'],
+            '0',
+          );
+          expect(
+            apiObject(jsonDecode(evaluations[1].body!))['expectedRevision'],
+            '1',
+          );
+          final sources = transport.requests
+              .where(
+                (request) =>
+                    Uri.parse(request.path).path ==
+                    '/api/v1/runtime/provider-sources',
+              )
+              .toList();
+          expect(
+            Uri.parse(sources[0].path).queryParameters['evaluationId'],
+            List.filled(42, 'E').join() + '1',
+          );
+          expect(
+            Uri.parse(sources[1].path).queryParameters['evaluationId'],
+            List.filled(42, 'E').join() + '2',
+          );
+        }
+        expect(
+          transport.requests.where(
+            (request) => request.path == '/api/v1/sources:authorize',
+          ),
+          isEmpty,
+        );
+      },
+    );
+  }
+
+  test(
+    'background first-apply private source has no authorization and foreground cancellation never refreshes',
+    () async {
+      final transport = _PreparingSetupTransport()..privateSource = true;
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      transport.configure(repository);
+      await repository.initialize();
+      final workflows = WebSetupWorkflows(repository);
+      final id = repository.codec.id(
+        ApiIdentity.profile,
+        '9223372036854775807',
+      );
+      final state = await workflows.read(id);
+      await expectLater(
+        workflows.build(state, defaultUA: 'Fixture', safeMode: true),
+        throwsA(isA<WebSetupSourceConsentRequired>()),
+      );
+      var shown = 0;
+      await expectLater(
+        workflows.build(
+          state,
+          defaultUA: 'Fixture',
+          safeMode: true,
+          confirmSource: (preparation) async {
+            shown++;
+            return false;
+          },
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'source_authorization_cancelled',
+          ),
+        ),
+      );
+      expect(shown, 1);
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/sources:authorize',
+        ),
+        isEmpty,
+      );
+      expect(
+        transport.requests.where(
+          (request) =>
+              request.path == '/api/v1/runtime/provider-sources:refresh',
+        ),
+        isEmpty,
+      );
+      expect(
+        transport.requests.where(
+          (request) => request.path == '/api/v1/profiles:build',
+        ),
+        isEmpty,
+      );
+    },
+  );
+  testWidgets(
+    'explicit private setup continuation releases the old serial task before foreground retry',
+    (tester) async {
+      final repository = WebApiRepository(
+        transport: _Transport(),
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      await repository.initialize();
+      final scheduler = SerialTaskScheduler();
+      bool oldReleased = false;
+      bool retryRan = false;
+      Future<void>? original;
+      await tester.pumpWidget(
+        _host(
+          TextButton(
+            onPressed: () {
+              original = scheduler.run(() async {
+                await showWebWorkflowFailure(
+                  WebSetupSourceConsentRequired(() async {
+                    await scheduler.run(() async {
+                      expect(oldReleased, isTrue);
+                      retryRan = true;
+                    });
+                  }),
+                  repository: repository,
+                );
+                oldReleased = true;
+              });
+            },
+            child: const Text('Private setup continuation fixture'),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Private setup continuation fixture'));
+      await tester.pumpAndSettle();
+      expect(retryRan, isFalse);
+      expect(oldReleased, isFalse);
+      await tester.tap(find.text('Server network access'));
+      await tester.pumpAndSettle();
+      await original;
+      expect(oldReleased, isTrue);
+      expect(retryRan, isTrue);
+      expect(find.byType(WebWorkflowFailureDialog), findsNothing);
+    },
+  );
+}

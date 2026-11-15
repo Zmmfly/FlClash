@@ -1,0 +1,218 @@
+import 'dart:convert';
+
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/identity.dart';
+
+import 'storage.dart';
+
+const webBrowserAppKeys = {
+  'locale',
+  'dashboardWidgets',
+  'tabAnimation',
+  'floatingNavigationBar',
+  'sidebarExpanded',
+  'acceptedDisclaimerVersion',
+  'minimizeOnExit',
+  'hidden',
+  'developerMode',
+  'showTrayTitle',
+  'monochromeTrayIcon',
+  'filters',
+  'hideIp',
+  'editorLineWrap',
+  'editorFontSize',
+  'serviceOrder',
+  'disabledServices',
+  'tableColumnWidths',
+  'recordGroupings',
+};
+const webServerAppKeys = {
+  'onlyStatisticsProxy',
+  'showNotificationStopAction',
+  'autoLaunch',
+  'silentLaunch',
+  'autoRun',
+  'openLogs',
+  'closeConnections',
+  'requestFeed',
+  'delayTestTimeout',
+  'autoCheckUpdate',
+  'restoreStrategy',
+  'checkCertificate',
+  'userAgents',
+};
+const _presentationKey = 'flclash.presentation.v1';
+const _themeKeys = {
+  'primaryColor',
+  'primaryColors',
+  'themeMode',
+  'colorStyle',
+  'pureBlack',
+  'sidebarBlur',
+  'liquidGlass',
+  'textScale',
+  'systemFontFamily',
+};
+const _windowKeys = {'width', 'height', 'top', 'left', 'scale'};
+const _styleKeys = {
+  'type',
+  'sortType',
+  'layout',
+  'iconStyle',
+  'cardType',
+  'hideTimeoutProxies',
+};
+
+Map<String, Object?> settingsJson(Object? value) =>
+    Map<String, Object?>.from(jsonDecode(jsonEncode(value)) as Map);
+
+Map<String, Object?> _fields(
+  Map<String, Object?> source,
+  Set<String> allowed,
+) => {
+  for (final entry in source.entries)
+    if (allowed.contains(entry.key)) entry.key: entry.value,
+};
+
+Map<String, Object?> _map(Object? value) =>
+    value is Map<String, Object?> ? value : const <String, Object?>{};
+
+Map<String, Object?> browserPresentation(Config config) {
+  final app = settingsJson(config.appSettingProps);
+  final theme = settingsJson(config.themeProps);
+  final window = settingsJson(config.windowProps);
+  final style = settingsJson(config.proxiesStyleProps);
+  return {
+    'appSettingProps': _fields(app, webBrowserAppKeys),
+    'themeProps': _fields(theme, _themeKeys),
+    'windowGeometry': _fields(window, _windowKeys),
+    'proxiesStyleProps': _fields(style, _styleKeys),
+    'hotKeyActions': [
+      for (final item in config.hotKeyActions)
+        _fields(settingsJson(item), {'action', 'key', 'modifiers'}),
+    ],
+  };
+}
+
+class WebSettingsPresentationStore {
+  WebSettingsPresentationStore({WebSettingsStorage? storage})
+    : storage = storage ?? createWebSettingsStorage();
+  final WebSettingsStorage storage;
+
+  Map<String, Object?> read() {
+    try {
+      final raw = storage.read(_presentationKey);
+      if (raw == null) return const {};
+      final object = jsonDecode(raw);
+      if (object is! Map<String, Object?> || object['version'] != 1) {
+        return const {};
+      }
+      final hotkeys = switch (object['hotKeyActions']) {
+        final List values => [
+          for (final item in values)
+            HotKeyAction.fromJson(
+              _fields(_map(item), {'action', 'key', 'modifiers'}),
+            ),
+        ],
+        _ => <HotKeyAction>[],
+      };
+      final config = Config(
+        themeProps: ThemeProps.fromJson(
+          _fields(_map(object['themeProps']), _themeKeys),
+        ),
+        appSettingProps: AppSettingProps.fromJson(
+          _fields(_map(object['appSettingProps']), webBrowserAppKeys),
+        ),
+        windowProps: WindowProps.fromJson(
+          _fields(_map(object['windowGeometry']), _windowKeys),
+        ),
+        proxiesStyleProps: ProxiesStyleProps.fromJson(
+          _fields(_map(object['proxiesStyleProps']), _styleKeys),
+        ),
+        hotKeyActions: hotkeys,
+      );
+      return browserPresentation(config);
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  void save(Config config) {
+    storage.write(
+      _presentationKey,
+      jsonEncode({'version': 1, ...browserPresentation(config)}),
+    );
+  }
+
+  Config merge(Config server) {
+    final local = read();
+    if (local.isEmpty) return server;
+    return server.copyWith(
+      appSettingProps: AppSettingProps.fromJson({
+        ...settingsJson(server.appSettingProps),
+        ..._map(local['appSettingProps']),
+      }),
+      themeProps: ThemeProps.fromJson(_map(local['themeProps'])),
+      windowProps: WindowProps.fromJson(_map(local['windowGeometry'])),
+      proxiesStyleProps: ProxiesStyleProps.fromJson(
+        _map(local['proxiesStyleProps']),
+      ),
+      hotKeyActions: [
+        for (final item in local['hotKeyActions'] as List? ?? const [])
+          HotKeyAction.fromJson(_map(item)),
+      ],
+    );
+  }
+
+  Set<String> readProfileUnfoldSet(String storeId, String wireProfileId) {
+    final key = webProfilePresentationKey(storeId, wireProfileId);
+    try {
+      final raw = storage.read(key);
+      if (raw == null) return const {};
+      final value = jsonDecode(raw);
+      if (value is! List ||
+          value.length > 10000 ||
+          value.any(
+            (item) =>
+                item is! String ||
+                item.length > 4096 ||
+                item.contains('\u0000'),
+          )) {
+        return const {};
+      }
+      return Set<String>.unmodifiable(value.cast<String>());
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  void saveProfileUnfoldSet(
+    String storeId,
+    String wireProfileId,
+    Set<String> value,
+  ) {
+    if (value.length > 10000 ||
+        value.any((item) => item.length > 4096 || item.contains('\u0000'))) {
+      throw const FormatException('Invalid profile presentation');
+    }
+    storage.write(
+      webProfilePresentationKey(storeId, wireProfileId),
+      jsonEncode(value.toList()),
+    );
+  }
+
+  void clear() => storage.remove(_presentationKey);
+}
+
+String webProfilePresentationKey(String storeId, String wireProfileId) {
+  if (storeId.isEmpty ||
+      storeId.length > 128 ||
+      !RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(storeId)) {
+    throw const FormatException('Invalid settings store identity');
+  }
+  requireWireId(wireProfileId, 'profileId');
+  if (BigInt.parse(wireProfileId) <= BigInt.zero) {
+    throw const FormatException('Invalid profile identity');
+  }
+  return 'flclash.presentation.profile.$storeId.$wireProfileId';
+}

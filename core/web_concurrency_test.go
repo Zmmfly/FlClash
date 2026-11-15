@@ -2,7 +2,7 @@
 
 package core
 
-// WEBPANEL.md and README Web capability claims are exercised through these public routes and RPCs.
+// WEBPANEL.md: typed transfers remain cancellable while retired tunnels never accept work.
 
 import (
 	"bytes"
@@ -41,54 +41,106 @@ func (w *webBlockingWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func TestWebSlowUploadDoesNotHoldFilesystemLock(t *testing.T) {
-	s := newWebTestServer(t)
-	cookie := webLogin(t, s)
-	for _, operation := range []string{"write?path=/data/slow", "rename", "copy"} {
-		t.Run(operation, func(t *testing.T) {
-			reader := &webBlockingReader{started: make(chan struct{}), release: make(chan struct{}), data: strings.NewReader(`{"from":"/data/missing","to":"/tmp/missing"}`)}
-			r := httptest.NewRequest("POST", "http://panel.test/api/fs/"+operation, reader)
-			r.AddCookie(cookie)
-			done := make(chan struct{})
-			go func() { defer close(done); s.ServeHTTP(httptest.NewRecorder(), r) }()
-			<-reader.started
-			fast := make(chan int, 1)
-			go func() { fast <- webRequest(s, "GET", "/api/fs/stat?path=/data", "", cookie).Code }()
-			status := 0
-			select {
-			case status = <-fast:
-			case <-time.After(time.Second):
-			}
-			close(reader.release)
-			<-done
-			if status != 200 {
-				t.Fatal("slow network reader held filesystem lock")
-			}
-		})
+func webConcurrencyWait(t *testing.T, done <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal(message)
 	}
 }
 
-func TestWebSlowDownloadDoesNotHoldFilesystemLock(t *testing.T) {
+func webConcurrencyUnblock(release chan struct{}) func() {
+	var once sync.Once
+	return func() { once.Do(func() { close(release) }) }
+}
+
+func webConcurrencyReadAndLogout(t *testing.T, s *WebServer, cookie *http.Cookie) {
+	t.Helper()
+	done := make(chan [2]int, 1)
+	go func() {
+		done <- [2]int{webRequest(s, "GET", "/api/v1/meta", "", cookie).Code, webRequest(s, "POST", "/api/auth/logout", "", cookie).Code}
+	}()
+	select {
+	case status := <-done:
+		if status != [2]int{200, 204} {
+			t.Fatalf("control requests returned %v", status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("slow transfer held a store or authentication lock")
+	}
+}
+
+func TestWebSlowUploadDoesNotHoldStoreOrAuthenticationLock(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
-	s.data.WriteFile("slow", []byte("data"), 0600)
-	writer := &webBlockingWriter{started: make(chan struct{}), release: make(chan struct{}), header: make(http.Header)}
-	r := httptest.NewRequest("GET", "http://panel.test/api/fs/read?path=/data/slow", nil)
-	r.AddCookie(cookie)
+	body := `{"expectedRevision":"0","operationId":"slow-upload-contract","rule":{"profileId":null,"ruleAction":"DOMAIN_SUFFIX","content":"slow.invalid","ruleTarget":"DIRECT","noResolve":false,"src":false}}`
+	reader := &webBlockingReader{started: make(chan struct{}), release: make(chan struct{}), data: strings.NewReader(body)}
+	unblock := webConcurrencyUnblock(reader.release)
+	defer unblock()
+	request := httptest.NewRequest("POST", "http://panel.test/api/v1/rules:create", reader)
+	request.AddCookie(cookie)
+	request.Header.Set("Origin", "http://panel.test")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
 	done := make(chan struct{})
-	go func() { defer close(done); s.ServeHTTP(writer, r) }()
-	<-writer.started
-	fast := make(chan int, 1)
-	go func() { fast <- webRequest(s, "GET", "/api/fs/stat?path=/data", "", cookie).Code }()
-	status := 0
-	select {
-	case status = <-fast:
-	case <-time.After(time.Second):
+	go func() { defer close(done); s.ServeHTTP(response, request) }()
+	webConcurrencyWait(t, reader.started, "typed upload never began reading its body")
+	webConcurrencyReadAndLogout(t, s, cookie)
+	unblock()
+	webConcurrencyWait(t, done, "revoked upload did not settle")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked upload returned %d", response.Code)
 	}
-	close(writer.release)
-	<-done
-	if status != 200 {
-		t.Fatal("slow network writer held filesystem lock")
+	fresh := webLogin(t, s)
+	var meta WebAPIEnvelope[WebAPIStoreMeta]
+	observed := webRequest(s, "GET", "/api/v1/meta", "", fresh)
+	if observed.Code != 200 || json.Unmarshal(observed.Body.Bytes(), &meta) != nil || meta.Revision != "0" {
+		t.Fatal("revoked slow upload changed committed state")
+	}
+}
+
+func TestWebSlowDownloadDoesNotHoldStoreOrAuthenticationLock(t *testing.T) {
+	s := newWebTestServer(t)
+	cookie := webLogin(t, s)
+	writer := &webBlockingWriter{started: make(chan struct{}), release: make(chan struct{}), header: make(http.Header)}
+	unblock := webConcurrencyUnblock(writer.release)
+	defer unblock()
+	request := httptest.NewRequest("GET", "http://panel.test/api/v1/meta", nil)
+	request.AddCookie(cookie)
+	done := make(chan struct{})
+	go func() { defer close(done); s.ServeHTTP(writer, request) }()
+	webConcurrencyWait(t, writer.started, "typed response never began writing")
+	webConcurrencyReadAndLogout(t, s, cookie)
+	unblock()
+	webConcurrencyWait(t, done, "slow typed response did not settle")
+}
+
+func TestWebRetiredFilesystemAndRelayRejectWithoutReadingBody(t *testing.T) {
+	s := newWebTestServer(t)
+	cookie := webLogin(t, s)
+	for _, route := range []string{"/api/fs/write?path=/data/slow", "/api/fs/rename", "/api/fs/copy", "/api/fs/delete?path=/data/slow", "/api/fs/mkdir?path=/data/slow", "/api/http-proxy"} {
+		t.Run(route, func(t *testing.T) {
+			reader := &webBlockingReader{started: make(chan struct{}), release: make(chan struct{}), data: strings.NewReader("{}")}
+			unblock := webConcurrencyUnblock(reader.release)
+			defer unblock()
+			request := httptest.NewRequest("POST", "http://panel.test"+route, reader)
+			request.AddCookie(cookie)
+			request.Header.Set("Origin", "http://panel.test")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() { defer close(done); s.ServeHTTP(response, request) }()
+			webConcurrencyWait(t, done, "retired route attempted to consume its body")
+			select {
+			case <-reader.started:
+				t.Fatal("retired route read its body")
+			default:
+			}
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("retired route returned %d", response.Code)
+			}
+		})
 	}
 }
 
@@ -129,28 +181,42 @@ func TestWebProviderSideLoadPreservesShareLinksBase64AndBinary(t *testing.T) {
 	}
 }
 
-func TestWebUploadAndUpstreamBounds(t *testing.T) {
+func TestWebTypedUploadBoundAndRetiredRelayDoesNotDial(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
-	body := io.MultiReader(io.LimitReader(webZeroReader{}, webMaxBody), bytes.NewReader([]byte{1}))
-	r := httptest.NewRequest("POST", "http://panel.test/api/fs/write?path=/data/too-large", body)
-	r.AddCookie(cookie)
-	w := httptest.NewRecorder()
-	s.ServeHTTP(w, r)
-	if w.Code != 413 {
-		t.Fatalf("oversized upload = %d", w.Code)
+	body := io.MultiReader(io.LimitReader(webZeroReader{}, webAPIMaxJSONBytes), bytes.NewReader([]byte{1}))
+	request := httptest.NewRequest("POST", "http://panel.test/api/v1/rules:create", body)
+	request.AddCookie(cookie)
+	request.Header.Set("Origin", "http://panel.test")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized typed control request = %d", response.Code)
 	}
-	if _, err := s.data.Stat("too-large"); err == nil {
-		t.Fatal("oversized upload persisted")
-	}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	contacted := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case contacted <- struct{}{}:
+		default:
+		}
+		w.Write([]byte("unexpected"))
+	}))
 	defer upstream.Close()
-	data, _ := json.Marshal(webProxyRequest{URL: upstream.URL, TimeoutMs: 25})
-	w = webRequest(s, "POST", "/api/http-proxy", string(data), cookie)
-	var response webProxyResponse
-	json.Unmarshal(w.Body.Bytes(), &response)
-	if response.OK || response.Error == "" {
-		t.Fatal("upstream timeout ignored")
+	payload, _ := json.Marshal(webProxyRequest{URL: upstream.URL, TimeoutMs: 25})
+	response = webRequest(s, "POST", "/api/http-proxy", string(payload), cookie)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("retired relay = %d", response.Code)
+	}
+	select {
+	case <-contacted:
+		t.Fatal("retired relay contacted an upstream")
+	default:
+	}
+	var meta WebAPIEnvelope[WebAPIStoreMeta]
+	observed := webRequest(s, "GET", "/api/v1/meta", "", cookie)
+	if observed.Code != 200 || json.Unmarshal(observed.Body.Bytes(), &meta) != nil || meta.Revision != "0" {
+		t.Fatal("rejected upload or relay changed committed state")
 	}
 }
 

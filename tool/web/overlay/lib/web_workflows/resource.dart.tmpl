@@ -1,0 +1,39 @@
+import 'package:fl_clash/database/database.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+String webProfileWireFallback(int id) {
+  if (id == 0 || id == -1) return '';
+  final repository = database.repository;
+  return repository.identities.isBound(ApiIdentity.profile, id)
+      ? repository.codec.wireId(ApiIdentity.profile, id)
+      : '';
+}
+
+enum WebContentKind {
+  profile('profile', ApiIdentity.profile),
+  script('script', ApiIdentity.script),
+  ruleProvider('rule-provider', ApiIdentity.clashProvider),
+  mitmModule('mitm-module', ApiIdentity.mitmModule),
+  mitmResource('mitm-resource', ApiIdentity.mitmModule);
+
+  const WebContentKind(this.wireName, this.identity);
+
+  final String wireName;
+  final ApiIdentity identity;
+}
+
+class WebContentRef {
+  const WebContentRef(this.kind, this.id, {this.name});
+
+  final WebContentKind kind;
+  final int id;
+  final String? name;
+
+  String wireId(WebApiRepository repository) =>
+      repository.codec.wireId(kind.identity, id);
+
+  String endpoint(WebApiRepository repository, {bool download = false}) =>
+      '/api/v1/content/${kind.wireName}/${wireId(repository)}'
+      '${download ? '/download' : ''}'
+      '${name == null ? '' : '?resourceKey=${Uri.encodeQueryComponent(name!)}'}';
+}

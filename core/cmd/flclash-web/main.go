@@ -31,7 +31,7 @@ func defaultDataDir(getenv func(string) string) string {
 }
 
 func parseOptions(args []string, getenv func(string) string, output io.Writer) (core.WebServerOptions, bool, error) {
-	opts := core.WebServerOptions{ListenAddr: "127.0.0.1:8080", DataDir: defaultDataDir(getenv), WebDir: getenv("FLCLASH_WEB_DIR"), Username: getenv("FLCLASH_WEB_USERNAME"), Password: getenv("FLCLASH_WEB_PASSWORD"), PasswordFile: getenv("FLCLASH_WEB_PASSWORD_FILE"), AuthFile: getenv("FLCLASH_WEB_AUTH_FILE")}
+	opts := core.WebServerOptions{ListenAddr: "127.0.0.1:8080", DataDir: defaultDataDir(getenv), WebDir: getenv("FLCLASH_WEB_DIR"), Username: getenv("FLCLASH_WEB_USERNAME"), Password: getenv("FLCLASH_WEB_PASSWORD"), PasswordFile: getenv("FLCLASH_WEB_PASSWORD_FILE"), AuthFile: getenv("FLCLASH_WEB_AUTH_FILE"), APIStoreDir: getenv("FLCLASH_WEB_API_STORE_DIR")}
 	if value := getenv("FLCLASH_WEB_LISTEN"); value != "" {
 		opts.ListenAddr = value
 	}
@@ -42,6 +42,13 @@ func parseOptions(args []string, getenv func(string) string, output io.Writer) (
 		}
 		opts.SecureCookie = parsed
 	}
+	if value := getenv("FLCLASH_WEB_SAFE_MODE"); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return opts, false, errors.New("invalid FLCLASH_WEB_SAFE_MODE boolean")
+		}
+		opts.SafeMode = parsed
+	}
 	flags := flag.NewFlagSet("flclash-web", flag.ContinueOnError)
 	flags.SetOutput(output)
 	flags.StringVar(&opts.ListenAddr, "listen", opts.ListenAddr, "HTTP/WebSocket listen address (FLCLASH_WEB_LISTEN)")
@@ -51,6 +58,8 @@ func parseOptions(args []string, getenv func(string) string, output io.Writer) (
 	flags.StringVar(&opts.PasswordFile, "password-file", opts.PasswordFile, "Bootstrap password file outside data/assets (FLCLASH_WEB_PASSWORD_FILE); exclusive with FLCLASH_WEB_PASSWORD during initialization")
 	flags.StringVar(&opts.AuthFile, "auth-file", opts.AuthFile, "Persistent credential file outside data/assets (FLCLASH_WEB_AUTH_FILE); default <absolute data-dir>.auth.json")
 	flags.BoolVar(&opts.SecureCookie, "secure-cookie", opts.SecureCookie, "Require HTTPS browser origin and Secure cookies behind a Host-preserving reverse proxy")
+	flags.StringVar(&opts.APIStoreDir, "api-store-dir", opts.APIStoreDir, "Private API store directory outside data/assets/auth (FLCLASH_WEB_API_STORE_DIR)")
+	flags.BoolVar(&opts.SafeMode, "safe-mode", opts.SafeMode, "Disable server runtime and remote-resource effects for isolated validation (FLCLASH_WEB_SAFE_MODE)")
 	version := flags.Bool("version", false, "Print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return opts, false, err

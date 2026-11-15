@@ -1,0 +1,40 @@
+import 'dart:convert';
+import 'dart:js_interop';
+
+import 'errors.dart';
+import 'operation.dart';
+
+@JS('window.sessionStorage')
+external _SessionStorage get _storage;
+
+extension type _SessionStorage(JSObject _) implements JSObject {
+  external JSString? getItem(JSString key);
+  external void setItem(JSString key, JSString value);
+  external void removeItem(JSString key);
+}
+
+ApiOperationJournal createApiOperationJournal() => BrowserApiOperationJournal();
+
+class BrowserApiOperationJournal implements ApiOperationJournal {
+  static const _key = 'flclash.api.pending.v1';
+
+  @override
+  ApiPendingOperation? read() {
+    final value = _storage.getItem(_key.toJS)?.toDart;
+    if (value == null) return null;
+    try {
+      return ApiPendingOperation.fromJournal(
+        Map<String, Object?>.from(jsonDecode(value) as Map),
+      );
+    } catch (_) {
+      throw const WebApiProtocolException('Invalid pending operation journal');
+    }
+  }
+
+  @override
+  void write(ApiPendingOperation operation) =>
+      _storage.setItem(_key.toJS, jsonEncode(operation.toJournal()).toJS);
+
+  @override
+  void clear() => _storage.removeItem(_key.toJS);
+}

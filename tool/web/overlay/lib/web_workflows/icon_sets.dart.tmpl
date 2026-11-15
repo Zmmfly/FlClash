@@ -1,0 +1,83 @@
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+import 'source_consent.dart';
+import 'sources.dart';
+
+class WebIconSetWorkflows {
+  WebIconSetWorkflows(this.repository, {this.confirmSource}) {
+    repository.registerExternalReceipt(
+      '/api/v1/icon-sets:import',
+      repository.codec.iconSet,
+    );
+    repository.registerExternalReceipt(
+      '/api/v1/icon-sets:refresh',
+      repository.codec.iconSet,
+    );
+  }
+
+  final WebApiRepository repository;
+  final Future<bool> Function(WebSourceConsentPreparation)? confirmSource;
+
+  Future<IconSet> importRemote(
+    String url, {
+    String name = '',
+    required ApiEditVersion editVersion,
+  }) => repository.runIntent(() async {
+    final grant = await WebSourceWorkflows(repository).prepareAndConfirm(
+      purpose: 'icon-set-import',
+      url: url,
+      editVersion: editVersion,
+      confirm: confirmSource,
+    );
+    final draft = IconSet(
+      id: snowflake.id,
+      name: name,
+      url: url,
+      icons: const [],
+    );
+    repository.identities.registerDraft(ApiIdentity.iconSet, draft.id);
+    return repository.executeExternalCommand(
+      '/api/v1/icon-sets:import',
+      {
+        if (name.isNotEmpty) 'name': name,
+        'source': {
+          'url': url,
+          if (grant != null) 'authorizationId': grant.authorizationId,
+        },
+      },
+      repository.codec.iconSet,
+      editVersion: editVersion,
+      drafts: [ApiDraftBinding(ApiIdentity.iconSet, draft.id)],
+      operationId: grant?.importOperationId,
+    );
+  });
+
+  Future<IconSet> saveRemote(
+    IconSet edited, {
+    required ApiEditVersion editVersion,
+  }) => repository.runIntent(() async {
+    final id = repository.codec.wireId(ApiIdentity.iconSet, edited.id);
+    final grant = await WebSourceWorkflows(repository).prepareAndConfirm(
+      purpose: 'icon-set-import',
+      key: {'kind': 'icon-set', 'id': id},
+      url: edited.url,
+      editVersion: editVersion,
+      confirm: confirmSource,
+    );
+    return repository.executeExternalCommand(
+      '/api/v1/icon-sets:import',
+      {
+        'id': id,
+        'name': edited.name,
+        'source': {
+          'url': edited.url,
+          if (grant != null) 'authorizationId': grant.authorizationId,
+        },
+      },
+      repository.codec.iconSet,
+      editVersion: editVersion,
+      operationId: grant?.importOperationId,
+    );
+  });
+}

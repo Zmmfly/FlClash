@@ -24,17 +24,6 @@ def run(arguments, cwd=ROOT, without_proxy=False):
     subprocess.run(arguments, cwd=cwd, check=True, env=environment)
 
 
-def configure_browser_test_hooks(source):
-    pubspec = source / 'pubspec.yaml'
-    text = pubspec.read_text()
-    anchor = '  user_defines:\n    setup:'
-    if text.count(anchor) != 1:
-        raise RuntimeError('Missing isolated browser-test hook anchor')
-    # Chrome uses WASM SQLite; its unrelated host hook must not fetch a native library.
-    pubspec.write_text(text.replace(anchor,
-        '  user_defines:\n    sqlite3:\n      source: system\n    setup:', 1))
-
-
 def main():
     for executable in ('flutter', 'dart', 'node'):
         if shutil.which(executable) is None:
@@ -45,18 +34,44 @@ def main():
     run(['node', '--test', 'tool/web/bridge_test.mjs', 'tool/web/login_test.mjs'])
     with tempfile.TemporaryDirectory(prefix='flclash-web-tests-') as temporary:
         source = stage(ROOT, Path(temporary) / 'src')
-        configure_browser_test_hooks(source)
         shutil.copyfile(ROOT / 'tool/web/vfs_test.dart.tmpl', source / 'vfs_test.dart')
         run(['flutter', 'pub', 'get'], cwd=source)
         run(['dart', 'run', 'intl_utils:generate'], cwd=source)
+        run(['python3', str(ROOT / 'tool/web/validate_artifact.py'),
+             '--staged', str(source), '--deps', str(source / '.dart_tool/package_config.json')])
         compiled = source / 'vfs_test.js'
         run(['dart', 'compile', 'js', 'vfs_test.dart', '-o', str(compiled)], cwd=source)
         run(['node', str(ROOT / 'tool/web/vfs_runtime_test.mjs'), str(compiled)])
-        (source / 'test').mkdir()
+        (source / 'test').mkdir(exist_ok=True)
+        api_tests = []
+        for template in sorted((ROOT / 'tool/web').glob('api_*_test.dart.tmpl')):
+            if template.name == 'api_client_browser_test.dart.tmpl':
+                continue
+            destination = source / 'test' / template.with_suffix('').name
+            shutil.copyfile(template, destination)
+            api_tests.append(str(destination.relative_to(source)))
+        browser_client = ROOT / 'tool/web/api_client_browser_test.dart.tmpl'
+        if browser_client.is_file():
+            shutil.copyfile(browser_client, source / 'api_client_browser_test.dart')
+            browser_js = source / 'api_client_browser_test.js'
+            run(['dart', 'compile', 'js', 'api_client_browser_test.dart',
+                 '-o', str(browser_js)], cwd=source)
+            run(['node', str(ROOT / 'tool/web/api_redirect_fixture.mjs'),
+                 str(browser_js)], without_proxy=True)
+        api_tests = sorted(set(api_tests) | {
+            str(path.relative_to(source)) for path in (source / 'test').glob('api_*_test.dart')
+        })
+        if not api_tests:
+            raise RuntimeError('Missing typed API browser contracts')
+        run(['flutter', 'test', '--platform', 'chrome', '--dart-define=WEB_PANEL=true',
+             '--dart-define=SAFE_MODE=true', *api_tests],
+            cwd=source, without_proxy=True)
         shutil.copyfile(ROOT / 'tool/web/account_widget_test.dart.tmpl', source / 'test/web_account_test.dart')
         shutil.copyfile(ROOT / 'tool/web/account_disabled_test.dart.tmpl', source / 'test/web_account_disabled_test.dart')
+        shutil.copyfile(ROOT / 'tool/web/navigation_widget_test.dart.tmpl', source / 'test/web_navigation_test.dart')
         run(['flutter', 'test', '--platform', 'chrome', '--dart-define=WEB_PANEL=true',
-             '--dart-define=SAFE_MODE=true', 'test/web_account_test.dart'], cwd=source, without_proxy=True)
+             '--dart-define=SAFE_MODE=true', 'test/web_account_test.dart',
+             'test/web_navigation_test.dart'], cwd=source, without_proxy=True)
         run(['flutter', 'test', '--platform', 'chrome', '--dart-define=SAFE_MODE=true',
              'test/web_account_disabled_test.dart'], cwd=source, without_proxy=True)
 

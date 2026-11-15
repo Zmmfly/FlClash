@@ -1,0 +1,49 @@
+{
+  "format": 1,
+  "engine": "QuickJS-NG 0.15.1",
+  "source": {
+    "url": "https://static.crates.io/crates/rquickjs-sys/rquickjs-sys-0.12.2.crate",
+    "sha256": "a13ac243b86a74120814ef7e9e30ad5a2c1199b7b9963b1cf7c84e4cdc1cad99",
+    "subdirectory": "rquickjs-sys-0.12.2/quickjs",
+    "compiled": [
+      "quickjs.c",
+      "dtoa.c",
+      "libregexp.c",
+      "libunicode.c"
+    ],
+    "excluded": [
+      "quickjs-libc.c",
+      "qjs.c",
+      "qjs-wasi-reactor.c"
+    ],
+    "license": "MIT"
+  },
+  "toolchain": {
+    "name": "WASI SDK 34.0 x86_64-linux",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+    "wasiLibcRevision": "2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "llvmRevision": "895aa2c896ada719451be2e3673c83da8ddf1141",
+    "deploymentRequirement": false
+  },
+  "wrapper": {
+    "file": "evaluator.c",
+    "sha256": "f9dca63619a877c4d349a542e817d61703c07eaa22dfd848b25a5d3dc1981d5b"
+  },
+  "artifact": {
+    "file": "quickjs.wasm",
+    "sha256": "1500dcc84476daf2801825c618003028829fa433b5d4973daeb28c8c3acbbe9c",
+    "imports": [],
+    "initialMemoryPages": 64,
+    "maximumMemoryPages": 4096,
+    "guestCStackBytes": 2097152
+  },
+  "licenses": {
+    "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171",
+    "LICENSE.wasi-libc": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a",
+    "LICENSE.musl": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b",
+    "LICENSE.compiler-rt": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d"
+  },
+  "rebuild": "python3 core/web_api_evaluate_guest/build.py --source-archive <rquickjs-sys-0.12.2.crate> --sdk-archive <wasi-sdk-34.0-x86_64-linux.tar.gz> --output <quickjs.wasm>",
+  "verification": "CGO_ENABLED=0 go test -mod=readonly -tags=webpanel . -run '^TestWebEvaluate'"
+}

@@ -1,0 +1,154 @@
+import 'package:fl_clash/common/task.dart' show ConfigCounts;
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_runtime/runtime.dart';
+
+import 'source_consent.dart';
+import 'sources.dart';
+
+class WebAppliedCounts {
+  const WebAppliedCounts({
+    required this.runtimeGeneration,
+    required this.actualConfig,
+    required this.counts,
+  });
+
+  final String runtimeGeneration;
+  final String actualConfig;
+  final ConfigCounts counts;
+}
+
+class WebGeoSnapshot {
+  const WebGeoSnapshot({
+    required this.infos,
+    required this.sourceIds,
+    required this.editVersion,
+  });
+  final Map<GeoResource, FileInfo?> infos;
+  final Map<GeoResource, String> sourceIds;
+  final ApiEditVersion editVersion;
+}
+
+class WebRuntimeMetadata {
+  const WebRuntimeMetadata(this.repository);
+
+  final WebApiRepository repository;
+
+  Future<WebAppliedCounts> appliedCounts() async {
+    final receipt = await repository.readExternal(
+      '/api/v1/runtime/applied-counts',
+    );
+    final data = apiObject(receipt.data, 'applied runtime counts');
+    final actual = data['actualConfig'];
+    if (!const {'candidate', 'default-fallback'}.contains(actual)) {
+      throw const WebApiProtocolException(
+        'The applied configuration is not known',
+      );
+    }
+    int count(String name) {
+      final value = apiInteger(data[name], 'applied counts.$name');
+      if (value < 0)
+        throw const WebApiProtocolException('Negative applied counts');
+      return value;
+    }
+
+    return WebAppliedCounts(
+      runtimeGeneration: requireApiRevision(data['runtimeGeneration']),
+      actualConfig: actual as String,
+      // Provider members are added by profileStatsOf, never twice here.
+      counts: (
+        groups: count('groups'),
+        proxies: count('proxies'),
+        rules: count('rules'),
+      ),
+    );
+  }
+
+  Future<WebGeoSnapshot> geoSnapshot() async {
+    final receipt = await repository.readExternal('/api/v1/runtime/geo');
+    final result = <GeoResource, FileInfo?>{};
+    final sourceIds = <GeoResource, String>{};
+    for (final row in apiList(receipt.data)) {
+      final data = apiObject(row, 'geo resource metadata');
+      final type = GeoResource.values
+          .where((type) => type.name == data['type'])
+          .firstOrNull;
+      final available = data['available'];
+      final size = data['size'];
+      final modified = data['modifiedAt'];
+      if (type == null ||
+          result.containsKey(type) ||
+          available is! bool ||
+          size != null && (size is! int || size < 0) ||
+          modified != null &&
+              (modified is! String || DateTime.tryParse(modified) == null) ||
+          data['updating'] is! bool ||
+          data['sourceId'] is! String ||
+          available && size == null) {
+        throw const WebApiProtocolException('Invalid geo resource metadata');
+      }
+      final sourceId = data['sourceId'] as String;
+      if (!RegExp(r'^[1-9][0-9]{0,77}$').hasMatch(sourceId) ||
+          BigInt.parse(sourceId).bitLength > 256) {
+        throw const WebApiProtocolException(
+          'Invalid opaque geo source identity',
+        );
+      }
+      sourceIds[type] = sourceId;
+      result[type] = available
+          ? FileInfo(
+              size: size as int,
+              lastModified: modified == null
+                  ? null
+                  : DateTime.parse(modified as String),
+            )
+          : null;
+    }
+    if (result.length != GeoResource.values.length) {
+      throw const WebApiProtocolException(
+        'The geo metadata snapshot is incomplete',
+      );
+    }
+    return WebGeoSnapshot(
+      infos: Map.unmodifiable(result),
+      sourceIds: Map.unmodifiable(sourceIds),
+      editVersion: repository.captureReadVersion(receipt),
+    );
+  }
+
+  Future<Map<GeoResource, FileInfo?>> geoInfos() async =>
+      (await geoSnapshot()).infos;
+
+  Future<FileInfo?> geoInfo(GeoResource type) async => (await geoInfos())[type];
+
+  Future<void> updateGeo(
+    GeoResource type, {
+    Future<bool> Function(WebSourceConsentPreparation)? confirmSource,
+  }) => repository.runIntent(() async {
+    final source = await geoSnapshot();
+    final id = source.sourceIds[type];
+    if (id == null)
+      throw const WebApiProtocolException('Geo source is missing');
+    final grant = await WebSourceWorkflows(repository).prepareAndConfirm(
+      purpose: 'geo-refresh',
+      key: {'kind': 'geo', 'id': id},
+      editVersion: source.editVersion,
+      confirm: confirmSource,
+    );
+    final result = apiObject(
+      await WebRuntimeBinding.instance.command('geo:update', {
+        'type': type.name,
+        'sourceId': id,
+        if (grant != null) 'authorizationId': grant.authorizationId,
+      }, editVersion: source.editVersion),
+    );
+    if (result['type'] != type.name ||
+        result['sourceId'] != id ||
+        result['installed'] != true) {
+      throw const WebApiProtocolException(
+        'Geo refresh has no confirmed installation',
+      );
+    }
+  });
+}

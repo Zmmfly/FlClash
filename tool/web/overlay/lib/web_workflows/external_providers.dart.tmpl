@@ -1,0 +1,1114 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_runtime/runtime.dart';
+
+import 'content.dart';
+import 'resource.dart';
+import 'source_consent.dart';
+import 'sources.dart';
+
+const _providerContentLimit = 32 * 1024 * 1024;
+final _providerDigest = RegExp(r'^[0-9a-f]{64}$');
+final _providerOpaqueId = RegExp(r'^[1-9][0-9]*$');
+
+enum WebExternalProviderPurpose {
+  proxies('proxy-providers'),
+  rules('rule-providers');
+
+  const WebExternalProviderPurpose(this.wireName);
+  final String wireName;
+}
+
+enum WebExternalProviderFormat { text, mrs, binary }
+
+final class WebRuntimeExternalProviderSnapshot {
+  const WebRuntimeExternalProviderSnapshot._({
+    required this.runtimeGeneration,
+    required this.actualConfig,
+    required this.providers,
+    required this.editVersion,
+  });
+
+  final String runtimeGeneration;
+  final String actualConfig;
+  final List<ExternalProvider> providers;
+  final ApiEditVersion editVersion;
+}
+
+final class WebExternalProviderSubscriptionInfo {
+  const WebExternalProviderSubscriptionInfo._(
+    this.upload,
+    this.download,
+    this.total,
+    this.expire,
+  );
+
+  // Exact wire quantities remain available even when native display counters
+  // exceed JavaScript's integer precision. They never authorize an edit.
+  final String upload;
+  final String download;
+  final String total;
+  final String expire;
+}
+
+final class _WebRuntimeProviderOrigin {
+  const _WebRuntimeProviderOrigin(
+    this.binding,
+    this.version,
+    this.updatedAt,
+    this.subscriptionInfo,
+  );
+
+  final Map<String, Object?> binding;
+  final ApiEditVersion version;
+  final DateTime? updatedAt;
+  final WebExternalProviderSubscriptionInfo? subscriptionInfo;
+}
+
+sealed class WebExternalProviderBinding {
+  const WebExternalProviderBinding._(this.editVersion);
+
+  final ApiEditVersion editVersion;
+}
+
+final class WebManagedProfileProvider extends WebExternalProviderBinding {
+  const WebManagedProfileProvider._(this.profile, super.editVersion)
+    : super._();
+
+  final Profile profile;
+  WebContentRef get ref => WebContentRef(WebContentKind.profile, profile.id);
+}
+
+final class WebManagedRuleProvider extends WebExternalProviderBinding {
+  const WebManagedRuleProvider._(this.provider, super.editVersion) : super._();
+
+  final ClashProvider provider;
+  WebContentRef get ref =>
+      WebContentRef(WebContentKind.ruleProvider, provider.id);
+}
+
+final class WebOpaqueProviderSource extends WebExternalProviderBinding {
+  const WebOpaqueProviderSource._({
+    required this.id,
+    required this.profileId,
+    required this.name,
+    required this.purpose,
+    required this.sourceVersion,
+    required this.phase,
+    required ApiEditVersion editVersion,
+  }) : super._(editVersion);
+
+  // A server-issued 256-bit decimal identity, never a local/int64 model ID.
+  final String id;
+  final int profileId;
+  final String name;
+  final WebExternalProviderPurpose purpose;
+  final String sourceVersion;
+  final String phase;
+
+  String get _endpoint => '/api/v1/runtime/provider-sources/$id';
+}
+
+base class WebExternalProviderHead {
+  const WebExternalProviderHead._({
+    required Object issuer,
+    required this.binding,
+    required this.prepared,
+    required this.mediaType,
+    required this.size,
+    required this.sha256,
+  }) : _issuer = issuer;
+
+  final Object _issuer;
+  final WebExternalProviderBinding binding;
+  final bool prepared;
+  final String mediaType;
+  final int size;
+  final String sha256;
+
+  ApiEditVersion get editVersion => binding.editVersion;
+}
+
+final class WebExternalProviderDocument extends WebExternalProviderHead {
+  const WebExternalProviderDocument._({
+    required super.issuer,
+    required super.binding,
+    required super.prepared,
+    required super.mediaType,
+    required super.size,
+    required super.sha256,
+    required this.bytes,
+    required this.encrypted,
+    required this.format,
+  }) : super._();
+
+  final Uint8List bytes;
+  final bool encrypted;
+  final WebExternalProviderFormat format;
+
+  bool get readOnly => encrypted || format != WebExternalProviderFormat.text;
+}
+
+final class WebExternalProviderPreview {
+  const WebExternalProviderPreview._({
+    required this.document,
+    required this.text,
+    required this.format,
+    required this.readOnly,
+  });
+
+  final WebExternalProviderDocument document;
+  final String text;
+  final WebExternalProviderFormat format;
+  final bool readOnly;
+}
+
+final class WebExternalProviderMutation {
+  const WebExternalProviderMutation._({
+    required this.binding,
+    required this.runtimePreparationConfirmed,
+    this.content,
+  });
+
+  final WebExternalProviderBinding binding;
+  final WebContentMutation? content;
+
+  // Managed content commits synchronously. Opaque preparation has an additional
+  // runtime operation barrier. Neither result means the running Core applied it.
+  final bool runtimePreparationConfirmed;
+  bool get requiresApply => true;
+}
+
+class WebExternalProviderWorkflows {
+  WebExternalProviderWorkflows(
+    this.repository, {
+    WebRuntimeBinding? runtime,
+    this.confirmSource,
+  }) : runtime = runtime ?? WebRuntimeBinding.configure(repository) {
+    if (!identical(this.runtime.repository, repository)) {
+      throw const WebApiException(
+        'edit_issuer_mismatch',
+        'The runtime belongs to another API repository',
+      );
+    }
+    _content = WebContentWorkflows(repository, confirmSource: confirmSource);
+  }
+
+  final WebApiRepository repository;
+  final WebRuntimeBinding runtime;
+  final Future<bool> Function(WebSourceConsentPreparation)? confirmSource;
+  final Object _issuer = Object();
+  late final WebContentWorkflows _content;
+  final _runtimeOrigins = Expando<_WebRuntimeProviderOrigin>();
+
+  Future<WebRuntimeExternalProviderSnapshot> runtimeProviders() async {
+    final receipt = await runtime.readReceipt(
+      '/api/v1/runtime/external-providers',
+    );
+    final proof = repository.client.requestProof(receipt);
+    if (proof == null ||
+        proof.method != 'GET' ||
+        proof.path != '/api/v1/runtime/external-providers') {
+      throw const WebApiProtocolException(
+        'External providers require their authenticated runtime read',
+      );
+    }
+    final version = repository.captureReadVersion(
+      receipt,
+      kind: ApiIdentity.runtime,
+    );
+    final data = apiObject(receipt.data, 'runtime external providers');
+    _fields(data, {'runtimeGeneration', 'actualConfig', 'providers'});
+    final generation = requireApiRevision(data['runtimeGeneration']);
+    final actual = data['actualConfig'];
+    final rows = apiList(
+      data['providers'],
+      'runtime external providers.providers',
+    );
+    if (!const {'candidate', 'default-fallback'}.contains(actual) ||
+        rows.length > 4096 ||
+        actual == 'default-fallback' && rows.isNotEmpty) {
+      throw const WebApiProtocolException(
+        'Invalid actual external-provider snapshot',
+      );
+    }
+    final seen = <String>{};
+    final providers = <ExternalProvider>[];
+    for (final value in rows) {
+      final row = apiObject(value, 'runtime external provider');
+      _fields(row, {
+        'name',
+        'type',
+        'vehicleType',
+        'count',
+        'updatedAt',
+        'subscriptionInfo',
+        'binding',
+      });
+      final name = _metadataString(row['name'], 256);
+      final type = row['type'];
+      final count = apiInteger(row['count'], 'runtime external provider.count');
+      if (!const {'Proxy', 'Rule'}.contains(type) ||
+          count < 0 ||
+          !seen.add('$type/$name')) {
+        throw const WebApiProtocolException(
+          'Invalid external-provider type, count or duplicate name',
+        );
+      }
+      final updated = _timestamp(row['updatedAt']);
+      final subscription = _subscription(row['subscriptionInfo']);
+      final binding = _runtimeBinding(row['binding'], type as String);
+      final provider = ExternalProvider(
+        name: name,
+        type: type,
+        vehicleType: _metadataString(row['vehicleType'], 64),
+        count: count,
+        // Native Core uses its zero time for a provider that never updated.
+        // Keep the authoritative nullable value separately for typed callers.
+        updateAt: updated ?? DateTime.utc(1),
+        subscriptionInfo: subscription == null
+            ? null
+            : SubscriptionInfo(
+                upload: _displayQuantity(subscription.upload),
+                download: _displayQuantity(subscription.download),
+                total: _displayQuantity(subscription.total),
+                expire: BigInt.parse(subscription.expire).toInt(),
+              ),
+      );
+      _runtimeOrigins[provider] = _WebRuntimeProviderOrigin(
+        binding,
+        version,
+        updated,
+        subscription,
+      );
+      providers.add(provider);
+    }
+    return WebRuntimeExternalProviderSnapshot._(
+      runtimeGeneration: generation,
+      actualConfig: actual as String,
+      providers: List.unmodifiable(providers),
+      editVersion: version,
+    );
+  }
+
+  DateTime? runtimeUpdatedAt(ExternalProvider original) =>
+      _runtimeOrigin(original).updatedAt;
+
+  WebExternalProviderSubscriptionInfo? runtimeSubscriptionInfo(
+    ExternalProvider original,
+  ) => _runtimeOrigin(original).subscriptionInfo;
+
+  // A native-shaped row is resolved only through the provenance captured for
+  // that exact row. Neither its name nor its nullable native path is a lookup.
+  Future<WebExternalProviderBinding> resolveRuntimeBinding(
+    ExternalProvider original,
+  ) async {
+    final origin = _runtimeOrigin(original);
+    final data = origin.binding;
+    switch (data['kind']) {
+      case 'profile':
+        final id = repository.codec.id(ApiIdentity.profile, data['id']);
+        final profile = await repository.profiles(id: id).getSingleOrNull();
+        if (profile == null || profile.id != id) {
+          throw const WebApiException(
+            'binding_target_changed',
+            'The applied profile provider owner no longer exists',
+          );
+        }
+        final canonical = managedProfile(profile);
+        _sameBindingVersion(origin.version, canonical.editVersion);
+        return WebManagedProfileProvider._(profile, origin.version);
+      case 'rule-provider':
+        final id = repository.codec.id(ApiIdentity.clashProvider, data['id']);
+        final providers = await repository.catalog(repository.providers).get();
+        final matching = providers.where((row) => row.id == id).toList();
+        if (matching.length != 1) {
+          throw const WebApiException(
+            'binding_target_changed',
+            'The applied rule provider owner no longer exists',
+          );
+        }
+        final canonical = managedRuleProvider(matching.single);
+        _sameBindingVersion(origin.version, canonical.editVersion);
+        return WebManagedRuleProvider._(matching.single, origin.version);
+      case 'external-provider':
+        final id = repository.codec.id(ApiIdentity.profile, data['profileId']);
+        final candidates = await sources(id);
+        // An empty list still needs a revision proof; sources() issued its real
+        // read above, but no matching descriptor is an owner change, not a new ID.
+        final matching = candidates
+            .where((row) => row.id == data['id'])
+            .toList();
+        if (matching.length != 1) {
+          throw const WebApiException(
+            'binding_target_changed',
+            'The applied HTTP provider source no longer exists',
+          );
+        }
+        final source = matching.single;
+        _sameBindingVersion(origin.version, source.editVersion);
+        if (source.profileId != id ||
+            source.purpose.wireName != data['purpose'] ||
+            source.sourceVersion != data['sourceVersion'] ||
+            source.name != original.name) {
+          throw const WebApiProtocolException(
+            'Runtime binding and HTTP source descriptor disagree',
+          );
+        }
+        return WebOpaqueProviderSource._(
+          id: source.id,
+          profileId: source.profileId,
+          name: source.name,
+          purpose: source.purpose,
+          sourceVersion: source.sourceVersion,
+          phase: source.phase,
+          editVersion: origin.version,
+        );
+      default:
+        throw const WebApiProtocolException('Unknown runtime provider binding');
+    }
+  }
+
+  _WebRuntimeProviderOrigin _runtimeOrigin(ExternalProvider original) {
+    final origin = _runtimeOrigins[original];
+    if (origin == null) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'Reload this exact provider through its typed runtime inventory',
+      );
+    }
+    repository.requireReadVersion(origin.version);
+    return origin;
+  }
+
+  void _sameBindingVersion(ApiEditVersion original, ApiEditVersion metadata) {
+    repository.requireReadVersion(original);
+    repository.requireReadVersion(metadata);
+    if (metadata.revision != original.revision ||
+        metadata.storeId != original.storeId) {
+      throw const WebApiException(
+        'edit_snapshot_mismatch',
+        'The provider owner changed; keep the original edit and reload its applied binding',
+      );
+    }
+  }
+
+  WebManagedProfileProvider managedProfile(Profile original) {
+    final version = repository.captureEditVersion(
+      ApiIdentity.profile,
+      original,
+    );
+    if (original.type != ProfileType.file && original.type != ProfileType.url) {
+      throw const WebApiException(
+        'unsupported_provider_binding',
+        'A managed proxy provider requires an ordinary profile resource',
+      );
+    }
+    return WebManagedProfileProvider._(original, version);
+  }
+
+  WebManagedRuleProvider managedRuleProvider(ClashProvider original) =>
+      WebManagedRuleProvider._(
+        original,
+        repository.captureEditVersion(ApiIdentity.clashProvider, original),
+      );
+
+  Future<List<WebOpaqueProviderSource>> sources(int profileId) async {
+    final owner = _profileWireId(profileId);
+    final receipt = await runtime.readReceipt(
+      '/api/v1/runtime/provider-sources?${Uri(queryParameters: {'profileId': owner}).query}',
+    );
+    final version = repository.captureReadVersion(
+      receipt,
+      kind: ApiIdentity.runtime,
+    );
+    final rows = apiList(receipt.data, 'provider sources');
+    if (rows.length > 4096) {
+      throw const WebApiProtocolException(
+        'Too many provider source descriptors',
+      );
+    }
+    final seen = <String>{};
+    return List.unmodifiable([
+      for (final row in rows) _source(row, version, owner, seen: seen),
+    ]);
+  }
+
+  Future<WebExternalProviderHead> head(
+    WebExternalProviderBinding binding,
+  ) async {
+    _requireBinding(binding);
+    if (binding is! WebOpaqueProviderSource) return read(binding);
+    final receipt = await runtime.readReceipt(binding._endpoint);
+    _requireSnapshotRevision(binding, receipt);
+    return _head(receipt.data, binding);
+  }
+
+  Future<WebExternalProviderDocument> read(
+    WebExternalProviderBinding binding,
+  ) async {
+    _requireBinding(binding);
+    if (binding is WebOpaqueProviderSource) {
+      final receipt = await runtime.readReceipt('${binding._endpoint}/content');
+      _requireSnapshotRevision(binding, receipt);
+      final data = apiObject(receipt.data, 'provider content');
+      final head = _head(data, binding, content: true);
+      if (!head.prepared) {
+        throw const WebApiProtocolException('Provider content is not prepared');
+      }
+      final bytes = _decodeBytes(data['bytes']);
+      _verifyBytes(head, bytes);
+      return _document(head, bytes, encrypted: false);
+    }
+    final content = await _content.read(
+      _managedRef(binding),
+      editVersion: binding.editVersion,
+    );
+    _requireBinding(binding);
+    final head = WebExternalProviderHead._(
+      issuer: _issuer,
+      binding: binding,
+      prepared: true,
+      mediaType: _mediaType(content.summary.mediaType),
+      size: _size(content.summary.size),
+      sha256: _digest(content.summary.sha256),
+    );
+    _verifyBytes(head, content.bytes);
+    return _document(head, content.bytes, encrypted: content.encrypted);
+  }
+
+  Future<WebExternalProviderPreview> preview(
+    WebExternalProviderBinding binding,
+  ) async {
+    final document = await read(binding);
+    if (document.encrypted) {
+      throw const WebApiException(
+        'encrypted_provider_content',
+        'Decrypt the managed profile through its typed content workflow before editing',
+      );
+    }
+    if (binding is WebOpaqueProviderSource) {
+      final receipt = await runtime.readReceipt('${binding._endpoint}/preview');
+      _requireSnapshotRevision(binding, receipt);
+      final data = apiObject(receipt.data, 'provider preview');
+      _fields(data, {
+        'sourceVersion',
+        'format',
+        'text',
+        'readOnly',
+        'sha256',
+        'size',
+      });
+      final format = switch (data['format']) {
+        'text' => WebExternalProviderFormat.text,
+        'mrs' => WebExternalProviderFormat.mrs,
+        _ => throw const WebApiProtocolException(
+          'Unknown provider preview format',
+        ),
+      };
+      final text = data['text'];
+      final readOnly = format == WebExternalProviderFormat.mrs;
+      if (data['sourceVersion'] != binding.sourceVersion ||
+          data['sha256'] != document.sha256 ||
+          _size(data['size']) != document.size ||
+          data['readOnly'] != readOnly ||
+          text is! String ||
+          utf8.encode(text).length > _providerContentLimit ||
+          format == WebExternalProviderFormat.text && _text(document) != text) {
+        throw const WebApiProtocolException('Mismatched provider preview');
+      }
+      return WebExternalProviderPreview._(
+        document: document,
+        text: text,
+        format: format,
+        readOnly: readOnly,
+      );
+    }
+    if (binding is WebManagedRuleProvider &&
+        binding.provider.format == RuleProviderFormat.mrs) {
+      final text = await _content.ruleProviderText(
+        binding.provider,
+        editVersion: binding.editVersion,
+      );
+      _requireBinding(binding);
+      if (utf8.encode(text).length > _providerContentLimit) {
+        throw const WebApiProtocolException('Oversized provider preview');
+      }
+      return WebExternalProviderPreview._(
+        document: document,
+        text: text,
+        format: WebExternalProviderFormat.mrs,
+        readOnly: true,
+      );
+    }
+    return WebExternalProviderPreview._(
+      document: document,
+      text: _text(document),
+      format: WebExternalProviderFormat.text,
+      readOnly: false,
+    );
+  }
+
+  // Download returns only bytes whose owner, original revision, size and digest
+  // were checked. No browser path or unrestricted attachment route is accepted.
+  Future<Uint8List> download(WebExternalProviderBinding binding) async =>
+      (await read(binding)).bytes;
+
+  Future<WebExternalProviderMutation> write(
+    WebExternalProviderDocument original,
+    List<int> bytes,
+  ) => repository.runIntent(() async {
+    _requireSnapshot(original);
+    final copy = _checkedBytes(bytes);
+    if (original.readOnly ||
+        _format(original.binding, original.mediaType, copy) !=
+            WebExternalProviderFormat.text) {
+      throw const WebApiException(
+        'read_only_provider',
+        'Binary and MRS providers require an explicit binary sideload',
+      );
+    }
+    return _write(original, copy, sideload: false);
+  });
+
+  Future<WebExternalProviderMutation> sideload(
+    WebExternalProviderHead original,
+    List<int> bytes,
+  ) => repository.runIntent(() async {
+    _requireSnapshot(original);
+    return _write(original, _checkedBytes(bytes), sideload: true);
+  });
+
+  Future<WebExternalProviderMutation> _write(
+    WebExternalProviderHead original,
+    Uint8List bytes, {
+    required bool sideload,
+  }) async {
+    final binding = original.binding;
+    if (binding is WebOpaqueProviderSource) {
+      return _opaqueMutation(
+        binding,
+        await runtime.command(
+          '${binding._endpoint}:${sideload ? 'sideload' : 'write'}',
+          {
+            'sourceVersion': binding.sourceVersion,
+            'bytes': base64Encode(bytes),
+          },
+          editVersion: binding.editVersion,
+        ),
+      );
+    }
+    return _managedMutation(
+      binding,
+      '/api/v1/content:write',
+      () => _content.write(
+        _managedRef(binding),
+        bytes,
+        editVersion: binding.editVersion,
+      ),
+    );
+  }
+
+  Future<WebExternalProviderMutation> refresh(
+    WebExternalProviderHead original,
+  ) => repository.runIntent(() async {
+    _requireSnapshot(original);
+    final binding = original.binding;
+    if (binding is WebOpaqueProviderSource) {
+      final grant = await WebSourceWorkflows(repository).prepareAndConfirm(
+        purpose: 'external-provider-refresh',
+        key: {'kind': 'external-provider', 'id': binding.id},
+        editVersion: binding.editVersion,
+        confirm: confirmSource,
+      );
+      _requireBinding(binding);
+      return _opaqueMutation(
+        binding,
+        await runtime.command('/api/v1/runtime/provider-sources:refresh', {
+          'id': binding.id,
+          'purpose': binding.purpose.wireName,
+          if (grant != null) 'authorizationId': grant.authorizationId,
+        }, editVersion: binding.editVersion),
+      );
+    }
+    return _managedMutation(
+      binding,
+      '/api/v1/content:refresh',
+      () => _content.refresh(
+        _managedRef(binding),
+        editVersion: binding.editVersion,
+      ),
+    );
+  });
+
+  Future<WebExternalProviderMutation> _managedMutation(
+    WebExternalProviderBinding binding,
+    String path,
+    Future<WebContentMutation> Function() body,
+  ) async {
+    final epoch = repository.client.sessionEpoch;
+    WebContentMutation result;
+    try {
+      result = await body();
+    } on WebApiUnknownCommitException catch (error) {
+      // A lost source-authorization receipt is not a content receipt. Keep its
+      // own recovery barrier instead of manufacturing another authorization.
+      if (repository.pendingOperation?.path != path) rethrow;
+      final receipt = await repository.recoverOperation(error.operationId);
+      repository.client.requireSession(epoch);
+      result = _content.decodeMutation(receipt.data);
+    }
+    repository.client.requireSession(epoch);
+    _requireBinding(binding);
+    final expected = _managedRef(binding);
+    if (result.summary.ref.kind != expected.kind ||
+        result.summary.ref.id != expected.id ||
+        result.summary.ref.name != null) {
+      throw const WebApiProtocolException(
+        'Content mutation changed the provider owner',
+      );
+    }
+    return WebExternalProviderMutation._(
+      binding: binding,
+      content: result,
+      runtimePreparationConfirmed: false,
+    );
+  }
+
+  WebExternalProviderMutation _opaqueMutation(
+    WebOpaqueProviderSource binding,
+    Object? value,
+  ) {
+    _requireBinding(binding);
+    final data = apiObject(value, 'applied provider preparation');
+    _fields(data, {'id', 'sourceVersion', 'prepared', 'requiresApply'});
+    if (data['id'] != binding.id ||
+        data['sourceVersion'] != binding.sourceVersion ||
+        data['prepared'] != true ||
+        data['requiresApply'] != true) {
+      throw const WebApiProtocolException(
+        'Mismatched applied provider preparation',
+      );
+    }
+    return WebExternalProviderMutation._(
+      binding: binding,
+      runtimePreparationConfirmed: true,
+    );
+  }
+
+  WebOpaqueProviderSource _source(
+    Object? value,
+    ApiEditVersion version,
+    String owner, {
+    Set<String>? seen,
+  }) {
+    final data = apiObject(value, 'provider source');
+    _fields(data, {
+      'id',
+      'profileId',
+      'name',
+      'purpose',
+      'sourceVersion',
+      'phase',
+    });
+    final id = _opaqueId(data['id']);
+    final name = data['name'];
+    final phase = data['phase'];
+    final purpose = switch (data['purpose']) {
+      'proxy-providers' => WebExternalProviderPurpose.proxies,
+      'rule-providers' => WebExternalProviderPurpose.rules,
+      _ => throw const WebApiProtocolException('Unknown provider purpose'),
+    };
+    if (data['profileId'] != owner ||
+        name is! String ||
+        name.isEmpty ||
+        utf8.encode(name).length > 256 ||
+        name.contains(RegExp(r'[\x00\r\n]')) ||
+        !const {
+          'unprepared',
+          'pending',
+          'ready',
+          'failed',
+          'unknown',
+        }.contains(phase) ||
+        seen != null && !seen.add(id)) {
+      throw const WebApiProtocolException(
+        'Invalid provider owner, name, phase or duplicate identity',
+      );
+    }
+    return WebOpaqueProviderSource._(
+      id: id,
+      profileId: repository.codec.id(ApiIdentity.profile, owner),
+      name: name,
+      purpose: purpose,
+      sourceVersion: _digest(data['sourceVersion']),
+      phase: phase as String,
+      editVersion: version,
+    );
+  }
+
+  WebExternalProviderHead _head(
+    Object? value,
+    WebOpaqueProviderSource expected, {
+    bool content = false,
+  }) {
+    final data = apiObject(value, 'provider head');
+    _fields(data, {
+      'source',
+      'prepared',
+      'mediaType',
+      'sha256',
+      'size',
+      if (content) 'bytes',
+    });
+    final source = _source(
+      data['source'],
+      expected.editVersion,
+      _profileWireId(expected.profileId),
+    );
+    if (source.id != expected.id ||
+        source.name != expected.name ||
+        source.purpose != expected.purpose ||
+        source.sourceVersion != expected.sourceVersion) {
+      throw const WebApiProtocolException(
+        'Provider source changed during this read',
+      );
+    }
+    final prepared = data['prepared'];
+    final size = _size(data['size']);
+    if (prepared is! bool ||
+        prepared != (source.phase == 'ready') ||
+        !prepared && (size != 0 || data['sha256'] != '')) {
+      throw const WebApiProtocolException('Invalid provider preparation state');
+    }
+    return WebExternalProviderHead._(
+      issuer: _issuer,
+      binding: expected,
+      prepared: prepared,
+      mediaType: _mediaType(data['mediaType']),
+      size: size,
+      sha256: prepared ? _digest(data['sha256']) : '',
+    );
+  }
+
+  WebExternalProviderDocument _document(
+    WebExternalProviderHead head,
+    List<int> bytes, {
+    required bool encrypted,
+  }) => WebExternalProviderDocument._(
+    issuer: _issuer,
+    binding: head.binding,
+    prepared: head.prepared,
+    mediaType: head.mediaType,
+    size: head.size,
+    sha256: head.sha256,
+    bytes: Uint8List.fromList(bytes).asUnmodifiableView(),
+    encrypted: encrypted,
+    format: _format(head.binding, head.mediaType, bytes),
+  );
+
+  WebExternalProviderFormat _format(
+    WebExternalProviderBinding binding,
+    String mediaType,
+    List<int> bytes,
+  ) {
+    if (binding is WebManagedRuleProvider &&
+            binding.provider.format == RuleProviderFormat.mrs ||
+        binding is WebOpaqueProviderSource &&
+            mediaType.split(';').first == 'application/octet-stream' ||
+        bytes.length >= 4 &&
+            bytes[0] == 0x28 &&
+            bytes[1] == 0xb5 &&
+            bytes[2] == 0x2f &&
+            bytes[3] == 0xfd) {
+      return WebExternalProviderFormat.mrs;
+    }
+    try {
+      if (!bytes.contains(0)) {
+        utf8.decode(bytes);
+        return WebExternalProviderFormat.text;
+      }
+    } on FormatException {
+      // A binary document remains downloadable and explicitly replaceable.
+    }
+    return WebExternalProviderFormat.binary;
+  }
+
+  String _text(WebExternalProviderDocument document) {
+    if (document.readOnly) {
+      throw const WebApiException(
+        'read_only_provider',
+        'This provider has no editable UTF-8 text representation',
+      );
+    }
+    return utf8.decode(document.bytes);
+  }
+
+  WebContentRef _managedRef(WebExternalProviderBinding binding) =>
+      switch (binding) {
+        WebManagedProfileProvider() => binding.ref,
+        WebManagedRuleProvider() => binding.ref,
+        WebOpaqueProviderSource() => throw const WebApiException(
+          'unsupported_provider_binding',
+          'Opaque providers are runtime source resources',
+        ),
+      };
+
+  String _profileWireId(int id) {
+    final wire = repository.codec.wireId(ApiIdentity.profile, id);
+    if (wire.startsWith('-') || wire == '0') {
+      throw const WebApiProtocolException(
+        'A provider requires a positive profile identity',
+      );
+    }
+    return wire;
+  }
+
+  void _requireBinding(WebExternalProviderBinding binding) =>
+      repository.requireReadVersion(binding.editVersion);
+
+  void _requireSnapshot(WebExternalProviderHead value) {
+    _requireBinding(value.binding);
+    if (!identical(value._issuer, _issuer)) {
+      throw const WebApiException(
+        'provider_read_context_mismatch',
+        'Use this workflow\'s original provider read',
+      );
+    }
+  }
+
+  void _requireSnapshotRevision(
+    WebExternalProviderBinding binding,
+    ApiReceipt receipt,
+  ) {
+    _requireBinding(binding);
+    repository.captureReadVersion(receipt);
+    if (receipt.revision != binding.editVersion.revision) {
+      throw const WebApiException(
+        'edit_snapshot_mismatch',
+        'The provider changed; reload its original binding before editing',
+      );
+    }
+  }
+
+  static Map<String, Object?> _runtimeBinding(Object? value, String type) {
+    final data = apiObject(value, 'runtime provider binding');
+    switch (data['kind']) {
+      case 'profile':
+      case 'rule-provider':
+        _fields(data, {'kind', 'id'});
+        _positiveId(data['id']);
+        if ((data['kind'] == 'profile') != (type == 'Proxy')) {
+          throw const WebApiProtocolException(
+            'Runtime provider has the wrong managed owner kind',
+          );
+        }
+      case 'external-provider':
+        _fields(data, {'kind', 'id', 'profileId', 'purpose', 'sourceVersion'});
+        _opaqueId(data['id']);
+        _positiveId(data['profileId']);
+        _digest(data['sourceVersion']);
+        if (data['purpose'] !=
+            (type == 'Proxy' ? 'proxy-providers' : 'rule-providers')) {
+          throw const WebApiProtocolException(
+            'Runtime provider has the wrong HTTP source purpose',
+          );
+        }
+      default:
+        throw const WebApiProtocolException(
+          'Unknown runtime provider binding kind',
+        );
+    }
+    return Map.unmodifiable(data);
+  }
+
+  static String _positiveId(Object? value) {
+    final id = requireWireId(value, 'runtime provider binding.id');
+    if (id == '0' || id.startsWith('-')) {
+      throw const WebApiProtocolException(
+        'Runtime provider owner identity must be positive',
+      );
+    }
+    return id;
+  }
+
+  static String _metadataString(Object? value, int maxBytes) {
+    if (value is! String ||
+        value.isEmpty ||
+        utf8.encode(value).length > maxBytes ||
+        value.contains(RegExp(r'[\x00\r\n]'))) {
+      throw const WebApiProtocolException(
+        'Invalid runtime provider metadata string',
+      );
+    }
+    return value;
+  }
+
+  static WebExternalProviderSubscriptionInfo? _subscription(Object? value) {
+    if (value == null) return null;
+    final data = apiObject(value, 'provider subscription info');
+    _fields(data, {'upload', 'download', 'total', 'expire'});
+    final upload = requireWireId(
+      data['upload'],
+      'provider.subscriptionInfo.upload',
+    );
+    final download = requireWireId(
+      data['download'],
+      'provider.subscriptionInfo.download',
+    );
+    final total = requireWireId(
+      data['total'],
+      'provider.subscriptionInfo.total',
+    );
+    final expire = requireWireId(
+      data['expire'],
+      'provider.subscriptionInfo.expire',
+    );
+    if (BigInt.parse(expire).abs() > BigInt.from(8640000000000)) {
+      throw const WebApiException(
+        'quantity_unrepresentable',
+        'Provider expiry is outside the Web date range',
+      );
+    }
+    return WebExternalProviderSubscriptionInfo._(
+      upload,
+      download,
+      total,
+      expire,
+    );
+  }
+
+  static int _displayQuantity(String value) {
+    final integer = BigInt.parse(value);
+    // Same read-only display policy as ApiModelCodec's subscription counters.
+    return integer.abs() <= BigInt.from(maxSafeLocalId)
+        ? integer.toInt()
+        : integer.toDouble().round();
+  }
+
+  static DateTime? _timestamp(Object? value) {
+    if (value == null) return null;
+    if (value is! String) {
+      throw const WebApiProtocolException('Invalid provider update time');
+    }
+    final match = RegExp(
+      r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$',
+    ).firstMatch(value);
+    if (match == null) {
+      throw const WebApiProtocolException('Invalid provider update time');
+    }
+    final parts = [for (var i = 1; i <= 6; i++) int.parse(match.group(i)!)];
+    final calendar = DateTime.utc(
+      parts[0],
+      parts[1],
+      parts[2],
+      parts[3],
+      parts[4],
+      parts[5],
+    );
+    final zone = match.group(7)!;
+    final parsed = DateTime.tryParse(value);
+    if (parsed == null ||
+        calendar.year != parts[0] ||
+        calendar.month != parts[1] ||
+        calendar.day != parts[2] ||
+        calendar.hour != parts[3] ||
+        calendar.minute != parts[4] ||
+        calendar.second != parts[5] ||
+        zone != 'Z' &&
+            (int.parse(zone.substring(1, 3)) > 23 ||
+                int.parse(zone.substring(4, 6)) > 59)) {
+      throw const WebApiProtocolException('Invalid provider update time');
+    }
+    return parsed;
+  }
+
+  static void _fields(Map<String, Object?> data, Set<String> required) {
+    if (data.keys.any((key) => !required.contains(key)) ||
+        required.any((key) => !data.containsKey(key))) {
+      throw const WebApiProtocolException('Invalid provider resource fields');
+    }
+  }
+
+  static String _opaqueId(Object? value) {
+    if (value is! String ||
+        value.length > 78 ||
+        !_providerOpaqueId.hasMatch(value) ||
+        BigInt.parse(value).bitLength > 256) {
+      throw const WebApiProtocolException('Invalid opaque provider identity');
+    }
+    return value;
+  }
+
+  static String _digest(Object? value) {
+    if (value is! String || !_providerDigest.hasMatch(value)) {
+      throw const WebApiProtocolException('Invalid provider digest');
+    }
+    return value;
+  }
+
+  static int _size(Object? value) {
+    final size = apiInteger(value, 'provider.size');
+    if (size < 0 || size > _providerContentLimit) {
+      throw const WebApiProtocolException('Invalid provider content size');
+    }
+    return size;
+  }
+
+  static String _mediaType(Object? value) {
+    if (value is! String ||
+        value.length > 256 ||
+        !RegExp(
+          r'^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:;[ -~]*)?$',
+        ).hasMatch(value)) {
+      throw const WebApiProtocolException('Invalid provider media type');
+    }
+    return value;
+  }
+
+  static Uint8List _checkedBytes(List<int> value) {
+    if (value.length > _providerContentLimit) {
+      throw const WebApiException(
+        'content_too_large',
+        'Provider content exceeds 32 MiB',
+      );
+    }
+    if (value.any((byte) => byte < 0 || byte > 255)) {
+      throw const WebApiProtocolException(
+        'Provider content is not a byte sequence',
+      );
+    }
+    return Uint8List.fromList(value);
+  }
+
+  static Uint8List _decodeBytes(Object? value) {
+    if (value is! String ||
+        value.length > ((_providerContentLimit + 2) ~/ 3) * 4) {
+      throw const WebApiProtocolException('Invalid encoded provider content');
+    }
+    try {
+      final bytes = base64Decode(value);
+      if (bytes.length > _providerContentLimit ||
+          base64Encode(bytes) != value) {
+        throw const FormatException();
+      }
+      return bytes;
+    } on FormatException {
+      throw const WebApiProtocolException('Invalid encoded provider content');
+    }
+  }
+
+  static void _verifyBytes(WebExternalProviderHead head, List<int> bytes) {
+    if (head.size != bytes.length ||
+        crypto.sha256.convert(bytes).toString() != head.sha256) {
+      throw const WebApiProtocolException(
+        'Provider bytes do not match their size and digest',
+      );
+    }
+  }
+}

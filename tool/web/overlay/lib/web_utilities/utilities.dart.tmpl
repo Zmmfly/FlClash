@@ -1,0 +1,117 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:fl_clash/web_api/index.dart';
+
+import 'models.dart';
+
+void registerWebUtilityReceipts(WebApiRepository repository) {
+  repository.registerExternalReceipt(
+    '/api/v1/icon-images:register',
+    WebUtilityIconRegistration.decode,
+  );
+}
+
+class WebUtilities {
+  WebUtilities(this.repository) {
+    registerWebUtilityReceipts(repository);
+    _sessionSubscription = repository.sessionChanges.listen((_) {
+      _grants.clear();
+      _images.clear();
+    });
+  }
+
+  final WebApiRepository repository;
+  final _grants = <String, String>{};
+  final _images = <String, Future<WebUtilityImage>>{};
+  final _mediaTypes = Expando<String>();
+  late final StreamSubscription<void> _sessionSubscription;
+
+  int get sessionEpoch => repository.client.sessionEpoch;
+  void requireSession(int epoch) => repository.client.requireSession(epoch);
+
+  Uri releasePageForUpdate(Map<String, dynamic> data) {
+    final tag = data['tag_name'];
+    final url = data['web_release_url'];
+    if (tag is! String ||
+        data['web_update_policy'] != 'server-image' ||
+        url != 'https://github.com/$webUtilityRepository/releases/tag/$tag' ||
+        !RegExp(
+          r'^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$',
+        ).hasMatch(tag)) {
+      throw const WebApiProtocolException('Untrusted release navigation');
+    }
+    return Uri.parse(url as String);
+  }
+
+  Future<WebUtilityRelease> latestRelease() async => WebUtilityRelease.decode(
+    (await repository.readExternal('/api/v1/app/release')).data,
+  );
+
+  Future<WebUtilityIpQuality> lookupIpQuality(
+    String ip, {
+    bool refresh = false,
+  }) async => WebUtilityIpQuality.decode(
+    (await repository.queryExternal('/api/v1/ip-quality:lookup', {
+      'ip': ip,
+      if (refresh) 'refresh': true,
+    })).data,
+    ip,
+  );
+
+  Future<WebUtilityIconRegistration> registerIconPreview(String url) =>
+      repository.runIntent(
+        () => repository.executeExternalCacheCommand(
+          '/api/v1/icon-images:register',
+          {'url': url, 'intent': 'preview-icon'},
+          WebUtilityIconRegistration.decode,
+        ),
+      );
+
+  Future<WebUtilityImage> loadIcon(String url) {
+    final current = _images[url];
+    if (current != null) return current;
+    final future = _loadIcon(url);
+    _images[url] = future;
+    return future.whenComplete(() {
+      if (identical(_images[url], future)) _images.remove(url);
+    });
+  }
+
+  Future<WebUtilityImage> _loadIcon(String url) async {
+    final image = WebUtilityImage.decode(
+      (await repository.queryExternal('/api/v1/icon-images:load', {
+        'url': url,
+        'authorizationId': ?_grants[url],
+      })).data,
+      url,
+    );
+    _mediaTypes[image.bytes] = image.mediaType;
+    return image;
+  }
+
+  Future<Uint8List> iconBytes(String url) async => (await loadIcon(url)).bytes;
+
+  bool isSvg(Uint8List bytes) {
+    if (_mediaTypes[bytes] case final mediaType?) {
+      return mediaType == 'image/svg+xml';
+    }
+    final prefix = utf8
+        .decode(bytes.take(1024).toList(), allowMalformed: true)
+        .trimLeft();
+    return prefix.startsWith('<svg') ||
+        prefix.startsWith('<?xml') ||
+        prefix.startsWith('<!--');
+  }
+
+  void rememberIconGrant(String url, String authorizationId) {
+    if (authorizationId.isEmpty) {
+      throw const WebApiProtocolException('Missing icon source authorization');
+    }
+    repository.client.requireSession(repository.client.sessionEpoch);
+    _grants[url] = authorizationId;
+  }
+
+  Future<void> close() => _sessionSubscription.cancel();
+}

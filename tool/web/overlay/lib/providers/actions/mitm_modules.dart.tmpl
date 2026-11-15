@@ -1,0 +1,192 @@
+part of '../action.dart';
+
+@Riverpod(keepAlive: true)
+class MitmModulesAction extends _$MitmModulesAction {
+  var _autoUpdating = false;
+
+  @override
+  void build() {}
+
+  Future<MitmModule> addFromUrl(String url) {
+    final version = database.repository.captureCreateVersion(
+      ApiIdentity.mitmModule,
+    );
+    final draft = MitmModule(
+      id: snowflake.id,
+      name: Uri.parse(url).pathSegments.where((part) => part.isNotEmpty).lastOrNull ?? currentAppLocalizations.mitmModule,
+      url: url,
+      lastUpdateTime: DateTime.now(),
+    );
+    return WebContentWorkflows(
+      database.repository, confirmSource: showWebSourceConsent,
+    ).saveModule(draft, null, refresh: true, editVersion: version);
+  }
+
+  Future<MitmModule> addFromFile(String text, String fileName) {
+    final version = database.repository.captureCreateVersion(
+      ApiIdentity.mitmModule,
+    );
+    final draft = MitmModule(
+      id: snowflake.id,
+      name: basenameWithoutExtension(fileName),
+      lastUpdateTime: DateTime.now(),
+    );
+    return WebContentWorkflows(
+      database.repository, confirmSource: showWebSourceConsent,
+    ).saveModule(draft, text, editVersion: version);
+  }
+
+  Future<MitmModule> create(
+    String text, {
+    ApiEditVersion? editVersion,
+    MitmModule? draft,
+    Map<String, List<int>> attachments = const {},
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureCreateVersion(ApiIdentity.mitmModule);
+    return WebContentWorkflows(database.repository, confirmSource: showWebSourceConsent).saveModule(
+      draft ??
+          MitmModule(
+            id: snowflake.id,
+            name: currentAppLocalizations.mitmModule,
+            lastUpdateTime: DateTime.now(),
+          ),
+      text,
+      first: true,
+      editVersion: version,
+      attachments: attachments,
+    );
+  }
+
+  Future<MitmModule> edit(
+    MitmModule module,
+    String text, {
+    ApiEditVersion? editVersion,
+    Map<String, List<int>> attachments = const {},
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.mitmModule, module);
+    return WebContentWorkflows(
+      database.repository, confirmSource: showWebSourceConsent,
+    ).saveModule(module, text, editVersion: version, attachments: attachments);
+  }
+
+  Future<MitmModule> updateModule(MitmModule module, {bool allowSourceConsent = false}) async {
+    final version = database.repository.captureEditVersion(
+      ApiIdentity.mitmModule,
+      module,
+    );
+    final updatingKeys = ref.read(updatingKeysProvider.notifier);
+    final operation = updatingKeys.start(module.updatingKey);
+    try {
+      return await WebContentWorkflows(
+        database.repository, confirmSource: allowSourceConsent ? showWebSourceConsent : null,
+      ).refreshModule(module, editVersion: version);
+    } finally {
+      updatingKeys.stop(module.updatingKey, operation);
+    }
+  }
+
+  Future<MitmModule> putModule(
+    MitmModule module, {
+    bool first = false,
+    ApiEditVersion? editVersion,
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.mitmModule, module);
+    return database.repository.saveCatalog(
+      database.repository.modules,
+      module,
+      editVersion: version,
+    );
+  }
+
+  Future<MitmModule?> setArguments(
+    MitmModule module,
+    Map<String, String> arguments,
+  ) async {
+    final version = database.repository.captureEditVersion(
+      ApiIdentity.mitmModule,
+      module,
+    );
+    final canonical = await WebContentWorkflows(
+      database.repository, confirmSource: showWebSourceConsent,
+    ).setArguments(module, arguments, editVersion: version);
+    return module.enabled && !canonical.enabled ? canonical : null;
+  }
+
+  Future<void> attach(
+    MitmModule module,
+    String fileName,
+    List<int> bytes,
+  ) async {
+    final version = database.repository.captureEditVersion(
+      ApiIdentity.mitmModule,
+      module,
+    );
+    await WebContentWorkflows(
+      database.repository,
+    ).attach(module, fileName, bytes, editVersion: version);
+  }
+
+  Future<void> detach(MitmModule module, String fileName) async {
+    final version = database.repository.captureEditVersion(
+      ApiIdentity.mitmModule,
+      module,
+    );
+    await WebContentWorkflows(
+      database.repository,
+    ).detach(module, fileName, editVersion: version);
+  }
+
+  Future<void> deleteModule(MitmModule module) async {
+    final version = database.repository.captureEditVersion(
+      ApiIdentity.mitmModule,
+      module,
+    );
+    await database.repository.deleteCatalog(database.repository.modules, [
+      module.id,
+    ], editVersion: version);
+  }
+
+  Future<void> clean() async {}
+
+  Future<void> autoUpdate() async {
+    final setting = ref.read(patchClashConfigProvider);
+    if (!mitmFeature ||
+        _autoUpdating ||
+        !ref.mounted ||
+        !setting.mitm.enable ||
+        !setting.geoAutoUpdate)
+      return;
+    _autoUpdating = true;
+    try {
+      final interval = Duration(hours: setting.geoUpdateInterval);
+      for (final module in await database.mitmModulesDao.query().get()) {
+        if (!ref.mounted) return;
+        if (!module.isRemote ||
+            !module.lastUpdateTime.add(interval).isBeforeNow)
+          continue;
+        try {
+          final updated = await updateModule(module);
+          if (module.enabled && !updated.enabled) {
+            dialogs.showBanner(
+              currentAppLocalizations.mitmModuleScriptsChanged(updated.name),
+              level: BannerLevel.warning,
+            );
+          }
+        } catch (error) {
+          commonPrint.log(
+            'auto update ${module.name}: ${compactError(error)}',
+            logLevel: LogLevel.warning,
+          );
+        }
+      }
+    } finally {
+      _autoUpdating = false;
+    }
+  }
+}

@@ -11,6 +11,7 @@ import 'package:fl_clash/state.dart';
 import 'package:fl_clash/ui/ui.dart';
 import 'package:fl_clash/web_auth/account_view.dart';
 import 'package:fl_clash/web_auth/auth_client.dart';
+import 'package:fl_clash/web_auth/logout_navigation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -70,6 +71,7 @@ Widget host(
   Widget child, {
   Brightness brightness = Brightness.light,
   Locale locale = const Locale('en'),
+  WebAuthClient? navigationClient,
 }) {
   return PrismApp(
     locale: locale,
@@ -88,7 +90,13 @@ Widget host(
     builder: (context, child) {
       globalState.measure = MeasureScope.of(context);
       final size = MediaQuery.sizeOf(context);
-      return ViewScope(size: size, isMobile: size.width < 600, child: child!);
+      return ViewScope(
+        size: size,
+        isMobile: size.width < 600,
+        child: navigationClient == null
+            ? child!
+            : WebLogoutScope(client: navigationClient, child: child!),
+      );
     },
     home: child,
   );
@@ -182,12 +190,12 @@ void main() {
           );
           await tester.pumpAndSettle();
           expect(find.text('Web账户'), findsOneWidget);
-          expect(find.byKey(const ValueKey('web-log-out')), findsOneWidget);
+          expect(find.byKey(const ValueKey('web-log-out')), findsNothing);
           expect(
             find.byKey(const ValueKey('web-edit-account')),
             findsOneWidget,
           );
-          expect(find.byType(ListItem), findsNWidgets(3));
+          expect(find.byType(ListItem), findsNWidgets(2));
           expect(tester.takeException(), isNull);
         },
       );
@@ -432,35 +440,6 @@ void main() {
       await tester.pump();
       expect(client.redirects, [true]);
       expect(tester.takeException(), isNull);
-    },
-  );
-
-  testWidgets(
-    'logout requires confirmation, cleans busy state on failure and redirects only on success',
-    (tester) async {
-      final client = FakeAuth()
-        ..logoutError = const WebAuthException('request_failed');
-      await tester.pumpWidget(host(WebAccountView(client: client)));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('web-log-out')));
-      await tester.pumpAndSettle();
-      expect(client.logouts, 0);
-      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
-      await tester.pumpAndSettle();
-      expect(client.logouts, 0);
-      await tester.tap(find.byKey(const ValueKey('web-log-out')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(TextButton, 'Log out'));
-      await tester.pumpAndSettle();
-      expect(find.text('The request failed. Please retry.'), findsOneWidget);
-      expect(client.redirects, isEmpty);
-      client.logoutError = null;
-      await tester.tap(find.byKey(const ValueKey('web-log-out')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(TextButton, 'Log out'));
-      await tester.pumpAndSettle();
-      expect(client.logouts, 2);
-      expect(client.redirects, [false]);
     },
   );
 }

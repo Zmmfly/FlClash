@@ -1,0 +1,196 @@
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
+import 'dart:typed_data';
+
+import 'errors.dart';
+import 'transport_types.dart';
+
+@JS('globalThis.location.origin')
+external JSString get _origin;
+
+@JS('globalThis')
+external JSObject get _global;
+
+@JS('globalThis.fetch')
+external JSPromise<_FetchResponse> _fetch(JSString url, JSObject options);
+
+@JS('AbortController')
+extension type _AbortController._(JSObject _) implements JSObject {
+  external factory _AbortController();
+  external JSObject get signal;
+  external void abort();
+}
+
+extension type _FetchResponse(JSObject _) implements JSObject {
+  external int get status;
+  external _FetchHeaders get headers;
+  external _ByteStream? get body;
+  external JSPromise<JSString> text();
+}
+
+extension type _FetchHeaders(JSObject _) implements JSObject {
+  external JSString? get(JSString key);
+}
+
+extension type _ByteStream(JSObject _) implements JSObject {
+  external _ByteReader getReader();
+  external JSPromise<JSAny?> cancel();
+}
+
+extension type _ByteReader(JSObject _) implements JSObject {
+  external JSPromise<_ByteResult> read();
+  external JSPromise<JSAny?> cancel();
+  external void releaseLock();
+}
+
+extension type _ByteResult(JSObject _) implements JSObject {
+  external bool get done;
+  external JSUint8Array? get value;
+}
+
+ApiTransport createApiTransport() => BrowserApiTransport();
+String currentApiOrigin() => _origin.toDart;
+
+void notifyApiUnauthorized() {
+  try {
+    final bridge = _global.getProperty<JSAny?>('__flclashWeb'.toJS);
+    if (bridge == null || !bridge.isA<JSObject>()) return;
+    final owner = bridge as JSObject;
+    final callback = owner.getProperty<JSAny?>('notifyUnauthorized'.toJS);
+    if (callback != null && callback.isA<JSFunction>()) {
+      (callback as JSFunction).callAsFunction(owner);
+    }
+  } catch (_) {}
+}
+
+class BrowserApiTransport implements ApiTransport, ApiAttachmentTransport {
+  var _closed = false;
+
+  JSObject _options(ApiRequest request, {JSObject? signal}) {
+    if (_closed) throw const WebApiSessionException();
+    final uri = Uri.parse(request.path);
+    if (uri.hasAuthority ||
+        uri.scheme.isNotEmpty ||
+        uri.fragment.isNotEmpty ||
+        !uri.path.startsWith('/api/v1/') ||
+        uri.pathSegments.any((part) => part == '.' || part == '..')) {
+      throw const WebApiProtocolException('Invalid API resource route');
+    }
+    final options =
+        {
+              'method': request.method,
+              'credentials': 'same-origin',
+              'cache': 'no-store',
+              'redirect': 'error',
+              'referrerPolicy': 'no-referrer',
+              'headers': {
+                'Accept': 'application/json',
+                if (request.body != null) 'Content-Type': 'application/json',
+              },
+              if (request.body != null) 'body': request.body,
+            }.jsify()
+            as JSObject;
+    if (signal != null) options.setProperty('signal'.toJS, signal);
+    return options;
+  }
+
+  ({JSObject? signal, void Function() dispose}) _bindCancellation(
+    ApiRequest request,
+  ) {
+    final cancellation = request.cancellation;
+    if (cancellation == null) return (signal: null, dispose: () {});
+    if (cancellation.isCancelled) throw const WebApiSessionException();
+    final controller = _AbortController();
+    void abort() => controller.abort();
+    cancellation.addListener(abort);
+    return (
+      signal: controller.signal,
+      dispose: () => cancellation.removeListener(abort),
+    );
+  }
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    final binding = _bindCancellation(request);
+    try {
+      final response = await _fetch(
+        request.path.toJS,
+        _options(request, signal: binding.signal),
+      ).toDart;
+      final body = (await response.text().toDart).toDart;
+      if (_closed || request.cancellation?.isCancelled == true) {
+        throw const WebApiSessionException();
+      }
+      return ApiResponse(response.status, body);
+    } finally {
+      binding.dispose();
+    }
+  }
+
+  @override
+  Future<ApiBinaryResponse> readAttachment(
+    ApiRequest request, {
+    required int maxBytes,
+  }) async {
+    final binding = _bindCancellation(request);
+    try {
+      final response = await _fetch(
+        request.path.toJS,
+        _options(request, signal: binding.signal),
+      ).toDart;
+      final headers = <String, String>{};
+      for (final key in [
+        'x-flclash-revision',
+        'content-length',
+        'content-type',
+        'content-disposition',
+      ]) {
+        final value = response.headers.get(key.toJS)?.toDart;
+        if (value != null) headers[key] = value;
+      }
+      final declared = int.tryParse(headers['content-length'] ?? '');
+      if (declared != null && (declared < 0 || declared > maxBytes)) {
+        await response.body?.cancel().toDart;
+        throw const WebApiProtocolException(
+          'Attachment exceeds its byte limit',
+        );
+      }
+      final builder = BytesBuilder(copy: false);
+      final reader = response.body?.getReader();
+      if (reader != null) {
+        try {
+          while (true) {
+            final result = await reader.read().toDart;
+            if (_closed) throw const WebApiSessionException();
+            if (result.done) break;
+            final value = result.value;
+            if (value == null) {
+              throw const WebApiProtocolException('Missing attachment chunk');
+            }
+            final bytes = value.toDart;
+            if (builder.length + bytes.length > maxBytes) {
+              await reader.cancel().toDart;
+              throw const WebApiProtocolException(
+                'Attachment exceeds its byte limit',
+              );
+            }
+            builder.add(bytes);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+      if (_closed) throw const WebApiSessionException();
+      return ApiBinaryResponse(
+        response.status,
+        builder.takeBytes(),
+        headers: headers,
+      );
+    } finally {
+      binding.dispose();
+    }
+  }
+
+  @override
+  void close() => _closed = true;
+}

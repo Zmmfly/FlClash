@@ -1,0 +1,142 @@
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:flutter/widgets.dart';
+
+/// A fixed, server-resolved source preparation, never a browser URL resolver.
+class WebSourceConsentPreparation {
+  WebSourceConsentPreparation._({
+    required this.preparationId,
+    required this.urlDigest,
+    required this.purpose,
+    required this.expiresAt,
+    required this.scheme,
+    required this.host,
+    required this.port,
+    required this.addresses,
+    required this.requiresPrivateNetworkConfirmation,
+  });
+
+  final String preparationId;
+  final String urlDigest;
+  final String purpose;
+  final DateTime expiresAt;
+  final String scheme;
+  final String host;
+  final int port;
+  final List<String> addresses;
+  final bool requiresPrivateNetworkConfirmation;
+
+  factory WebSourceConsentPreparation.decode(Object? value) {
+    final data = apiObject(value, 'source preparation');
+    final id = data['preparationId'];
+    final digest = data['urlDigest'];
+    final purpose = data['purpose'];
+    final scheme = data['scheme'];
+    final host = data['host'];
+    final port = apiInteger(data['port'], 'source preparation.port');
+    final expiry = data['expiresAt'];
+    final parsed = expiry is String ? DateTime.tryParse(expiry) : null;
+    final requiresConfirmation = data['requiresPrivateNetworkConfirmation'];
+    final addresses = <String>[];
+    for (final address in apiList(data['addresses'])) {
+      if (address is! String ||
+          address.isEmpty ||
+          address.length > 64 ||
+          !RegExp(r'^[0-9a-fA-F:.]+$').hasMatch(address)) {
+        throw const WebApiProtocolException('Invalid source resolved address');
+      }
+      addresses.add(address);
+    }
+    if (id is! String ||
+        !RegExp(r'^[A-Za-z0-9_-]{16,128}$').hasMatch(id) ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+        purpose is! String ||
+        purpose.isEmpty ||
+        purpose.length > 80 ||
+        data['networkView'] != 'server' ||
+        !const {'http', 'https'}.contains(scheme) ||
+        host is! String ||
+        host.isEmpty ||
+        host.length > 253 ||
+        RegExp(r'[\x00-\x20\x7f/@?#]').hasMatch(host) ||
+        port < 1 ||
+        port > 65535 ||
+        parsed == null ||
+        requiresConfirmation is! bool ||
+        addresses.isEmpty ||
+        addresses.length > 64 ||
+        addresses.toSet().length != addresses.length) {
+      throw const WebApiProtocolException('Invalid source preparation');
+    }
+    return WebSourceConsentPreparation._(
+      preparationId: id,
+      urlDigest: digest,
+      purpose: purpose,
+      expiresAt: parsed,
+      scheme: scheme as String,
+      host: host,
+      port: port,
+      addresses: List.unmodifiable(addresses),
+      requiresPrivateNetworkConfirmation: requiresConfirmation,
+    );
+  }
+}
+
+/// Call only from a user-triggered workflow. This never authorizes or fetches.
+/// The caller must authorize exactly this preparation and its original version.
+Future<bool> showWebSourceConsent(
+  WebSourceConsentPreparation preparation, {
+  BuildContext? context,
+}) async {
+  if (!preparation.expiresAt.isAfter(DateTime.now())) return false;
+  return await dialogs.showCommonDialog<bool>(
+        context: context,
+        child: WebSourceConsentDialog(preparation: preparation),
+      ) ==
+      true;
+}
+
+class WebSourceConsentDialog extends StatelessWidget {
+  const WebSourceConsentDialog({super.key, required this.preparation});
+
+  final WebSourceConsentPreparation preparation;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = context.appLocalizations;
+    return AlertDialog(
+      title: l.webServerNetworkTitle,
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: Text(l.cancel),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(
+            context,
+          ).pop(preparation.expiresAt.isAfter(DateTime.now())),
+          child: Text(l.confirm),
+        ),
+      ],
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        spacing: 12,
+        children: [
+          Text(
+            l.webServerNetworkDescription(
+              preparation.host,
+              preparation.port.toString(),
+            ),
+          ),
+          SelectableText(
+            l.webServerNetworkAddresses(preparation.addresses.join(', ')),
+          ),
+          Text(l.webServerNetworkRedirectTip),
+        ],
+      ),
+    );
+  }
+}

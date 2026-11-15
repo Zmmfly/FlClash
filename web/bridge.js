@@ -25,20 +25,6 @@
   function failure(error) {
     return JSON.stringify({ ok: false, status: 500, error: String(error) });
   }
-  function syncRequest(method, url, body, contentType) {
-    try {
-      sameOrigin(url);
-      const xhr = new XMLHttpRequest();
-      xhr.open(method, url, false);
-      xhr.setRequestHeader('Cache-Control', 'no-cache');
-      if (body !== undefined && body !== null) xhr.setRequestHeader('Content-Type', contentType);
-      xhr.send(body === undefined ? null : body);
-      if (xhr.status === 401) return unauthorized();
-      return JSON.stringify({ status: xhr.status, text: xhr.responseText || '' });
-    } catch (error) {
-      return failure(error);
-    }
-  }
     window.__flclashWeb = {
       bytesToBase64: function(bytes) {
         let binary = '';
@@ -73,32 +59,6 @@
           return failure(error);
         }
       },
-      syncJsonRequest: function(method, url, jsonBody) {
-        return syncRequest(method || 'GET', url, jsonBody, 'application/json');
-      },
-      syncBinaryWrite: function(url, base64Body) {
-        return syncRequest('POST', url, this.base64ToBytes(base64Body || ''), 'application/octet-stream');
-      },
-      syncReadBase64: function(vpath) {
-        try {
-          const stat = JSON.parse(this.syncJsonRequest('GET', '/api/fs/stat?path=' + encodeURIComponent(vpath), null));
-          if (stat.status < 200 || stat.status >= 300) return JSON.stringify({ ok: false, ...stat });
-          const info = JSON.parse(stat.text);
-          if (!info.exists || info.isDir) return JSON.stringify(info);
-          const xhr = new XMLHttpRequest();
-          xhr.open('GET', '/api/fs/read?path=' + encodeURIComponent(vpath), false);
-          xhr.setRequestHeader('Cache-Control', 'no-cache');
-          xhr.overrideMimeType('text/plain; charset=x-user-defined');
-          xhr.send(null);
-          if (xhr.status === 401) return unauthorized();
-          if (xhr.status !== 200) return JSON.stringify({ ok: false, status: xhr.status, error: xhr.responseText });
-          const bytes = Uint8Array.from(xhr.responseText, character => character.charCodeAt(0) & 0xff);
-          info.contentBase64 = this.bytesToBase64(bytes);
-          return JSON.stringify(info);
-        } catch (error) {
-          return failure(error);
-        }
-      },
       triggerDownload: function(filename, base64Data) {
         try {
           const bytes = window.__flclashWeb.base64ToBytes(base64Data);
@@ -113,7 +73,7 @@
           setTimeout(() => URL.revokeObjectURL(url), 5000);
           return true;
         } catch (e) {
-          console.error('[FlClash-web] triggerDownload error:', e);
+          console.error('[FlClash-web] download failed');
           return false;
         }
       },
@@ -148,21 +108,13 @@
           document.body.appendChild(input);
           input.click();
         });
-      },
-      evalClashScript: function(scriptSource, configJsonStr, profileName) {
-        try {
-          const configObj = JSON.parse(configJsonStr);
-          const fn = new Function('config', 'profileName', scriptSource + '\n; return main(config, profileName);');
-          const res = fn(configObj, profileName || '');
-          return JSON.stringify({ ok: true, data: JSON.stringify(res) });
-        } catch (e) {
-          return JSON.stringify({ ok: false, error: String(e) });
-        }
       }
+
     };
 
 
   const bridge = window.__flclashWeb;
+  bridge.notifyUnauthorized = unauthorized;
   let sessionCheck;
   bridge.checkSession = function() {
     if (authMutation || pendingAuthRedirect) return Promise.resolve(false);
@@ -177,7 +129,7 @@
     return sessionCheck;
   };
   bridge.CoreWebSocket = function(url) {
-    const expected = new URL('/ws/core', window.location.href);
+    const expected = new URL('/ws/v1/events', window.location.href);
     expected.protocol = expected.protocol === 'https:' ? 'wss:' : 'ws:';
     if (url !== expected.href) throw new Error('Core WebSocket must remain same-origin');
     const socket = new WebSocket(url);

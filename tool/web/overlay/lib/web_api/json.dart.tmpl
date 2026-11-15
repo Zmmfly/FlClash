@@ -1,0 +1,23 @@
+import 'draft_ids.dart' show maxSafeLocalId;
+import 'errors.dart';
+
+Map<String, Object?> apiObject(Object? value, [String path = 'data']) {
+  if (value is! Map<String, Object?>) {
+    throw WebApiProtocolException('Expected an object at $path');
+  }
+  return Map.of(value);
+}
+
+List<Object?> apiList(Object? value, [String path = 'data']) {
+  if (value is! List) {
+    throw WebApiProtocolException('Expected a list at $path');
+  }
+  return List<Object?>.of(value);
+}
+
+int apiInteger(Object? value, String path) {
+  if (value is! int || value.abs() > maxSafeLocalId) {
+    throw WebApiProtocolException('Expected a safe integer at $path');
+  }
+  return value;
+}

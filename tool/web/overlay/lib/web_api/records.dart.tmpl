@@ -1,0 +1,20 @@
+import 'package:fl_clash/models/models.dart';
+
+class IconRecord {
+  const IconRecord({required this.url, required this.lastAccessed});
+
+  final String url;
+  final int lastAccessed;
+}
+
+class IpQualityRecord {
+  const IpQualityRecord({
+    required this.ip,
+    required this.quality,
+    required this.checkedAt,
+  });
+
+  final String ip;
+  final IpQuality quality;
+  final DateTime checkedAt;
+}

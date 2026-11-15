@@ -28,10 +28,13 @@ FROM alpine:3.24.1 AS runtime
 RUN apk add --no-cache ca-certificates curl tzdata \
     && addgroup -g 1000 flclash \
     && adduser -D -u 1000 -G flclash flclash \
-    && mkdir -p /data /auth \
-    && chown 1000:1000 /data /auth
+    && mkdir -p /data /auth /state \
+    && chmod 700 /state \
+    && chown 1000:1000 /data /auth /state
 COPY --from=builder --chmod=0755 /src/dist/FlClash-web /usr/local/bin/flclash-web
 COPY LICENSE tool/web/NOTICE tool/web/LICENSE.FlClash-web /usr/share/licenses/flclash/
+COPY core/web_api_evaluate_guest/LICENSE* core/web_api_evaluate_guest/manifest.json /usr/share/licenses/flclash/evaluator/
+RUN find /usr/share/licenses/flclash -type f -exec chmod 0644 {} +
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="FlClash Web panel" \
       org.opencontainers.image.description="Authenticated Flutter Web panel and Clash.Meta core" \
@@ -41,6 +44,7 @@ LABEL org.opencontainers.image.title="FlClash Web panel" \
 ENV FLCLASH_WEB_LISTEN=0.0.0.0:8080 \
     FLCLASH_DATA_DIR=/data \
     FLCLASH_WEB_AUTH_FILE=/auth/credentials.json \
+    FLCLASH_WEB_API_STORE_DIR=/state \
     TZ=UTC
 WORKDIR /data
 USER 1000:1000

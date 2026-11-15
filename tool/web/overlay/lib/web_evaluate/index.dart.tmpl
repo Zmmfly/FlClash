@@ -1,0 +1,169 @@
+import 'dart:convert';
+
+import 'package:fl_clash/web_api/index.dart';
+
+class WebEvaluationResult {
+  const WebEvaluationResult({
+    required this.profileId,
+    required this.scriptId,
+    required this.editVersion,
+    required this.config,
+    required this.sha256,
+    required this.sourceDigest,
+    required this.scriptDigest,
+    required this.counts,
+    required this.console,
+    required this.preview,
+    this.evaluationId,
+  });
+
+  final int profileId;
+  final int scriptId;
+  final ApiEditVersion editVersion;
+  final Map<String, dynamic> config;
+  final String sha256;
+  final String sourceDigest;
+  final String scriptDigest;
+  final ({int proxies, int groups, int rules}) counts;
+  final String console;
+  final bool preview;
+  final String? evaluationId;
+}
+
+class WebEvaluateService {
+  WebEvaluateService(this.repository);
+
+  final WebApiRepository repository;
+  static const _maxBytes = 32 * 1024 * 1024;
+
+  Future<WebEvaluationResult> evaluateCommitted({
+    required int profileId,
+    required int scriptId,
+    required ApiEditVersion editVersion,
+  }) => _evaluate(
+    profileId: profileId,
+    scriptId: scriptId,
+    editVersion: editVersion,
+  );
+
+  Future<WebEvaluationResult> preview({
+    required int profileId,
+    required int scriptId,
+    required ApiEditVersion editVersion,
+    required String scriptText,
+    required Map<String, dynamic> config,
+  }) {
+    if (utf8.encode(scriptText).length > _maxBytes ||
+        utf8.encode(jsonEncode(config)).length > _maxBytes) {
+      throw const WebApiException(
+        'evaluation_input_limit',
+        'The draft exceeds its evaluation input budget',
+      );
+    }
+    return _evaluate(
+      profileId: profileId,
+      scriptId: scriptId,
+      editVersion: editVersion,
+      scriptText: scriptText,
+      config: config,
+    );
+  }
+
+  Future<WebEvaluationResult> _evaluate({
+    required int profileId,
+    required int scriptId,
+    required ApiEditVersion editVersion,
+    String? scriptText,
+    Map<String, dynamic>? config,
+  }) async {
+    repository.requireReadVersion(editVersion);
+    final preview = scriptText != null;
+    final profileWire = repository.identities.encode(
+      ApiIdentity.profile,
+      profileId,
+    );
+    final scriptWire = repository.identities.encode(
+      ApiIdentity.script,
+      scriptId,
+    );
+    final receipt = await repository.queryExternal(
+      preview ? '/api/v1/scripts:preview' : '/api/v1/profiles:evaluate',
+      {
+        'expectedRevision': editVersion.revision,
+        'profileId': profileWire,
+        'scriptId': scriptWire,
+        if (preview) 'scriptText': scriptText,
+        if (preview) 'config': config,
+      },
+    );
+    repository.requireReadVersion(editVersion);
+    final data = apiObject(receipt.data, 'evaluation');
+    if (receipt.revision != editVersion.revision ||
+        data['readRevision'] != editVersion.revision) {
+      throw const WebApiException(
+        'source_revision_conflict',
+        'Reload the original source before evaluating again',
+      );
+    }
+    if (data['profileId'] != profileWire ||
+        data['scriptId'] != scriptWire ||
+        data['preview'] != preview) {
+      throw const WebApiProtocolException(
+        'Evaluation returned a different source',
+      );
+    }
+    final evaluationId = data['evaluationId'];
+    if (preview
+        ? evaluationId != null
+        : evaluationId is! String ||
+              !RegExp(r'^[A-Za-z0-9_-]{43}$').hasMatch(evaluationId)) {
+      throw const WebApiProtocolException('Invalid evaluation provenance');
+    }
+    final output = apiObject(data['config'], 'evaluation.config');
+    if (utf8.encode(jsonEncode(output)).length > _maxBytes) {
+      throw const WebApiProtocolException(
+        'Evaluation output exceeds its budget',
+      );
+    }
+    final console = data['console'];
+    if (console is! String || utf8.encode(console).length > 16 * 1024) {
+      throw const WebApiProtocolException(
+        'Evaluation console exceeds its budget',
+      );
+    }
+    final counts = apiObject(data['counts'], 'evaluation.counts');
+    int count(String key) {
+      final value = apiInteger(counts[key], 'evaluation.counts.$key');
+      if (value < 0 || value > 1000000) {
+        throw const WebApiProtocolException('Invalid evaluation counts');
+      }
+      return value;
+    }
+
+    String digest(String key) {
+      final value = data[key];
+      if (value is! String || !RegExp(r'^[0-9a-f]{64}$').hasMatch(value)) {
+        throw const WebApiProtocolException('Invalid evaluation digest');
+      }
+      return value;
+    }
+
+    return WebEvaluationResult(
+      profileId: profileId,
+      scriptId: scriptId,
+      editVersion: editVersion,
+      config: Map<String, dynamic>.unmodifiable(output),
+      sha256: digest('sha256'),
+      sourceDigest: digest('sourceDigest'),
+      scriptDigest: digest('scriptDigest'),
+      counts: (
+        proxies: count('proxies'),
+        groups: count('groups'),
+        rules: count('rules'),
+      ),
+      console: console,
+      preview: preview,
+      evaluationId: evaluationId as String?,
+    );
+  }
+}

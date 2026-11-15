@@ -1,0 +1,7 @@
+import 'journal_stub.dart'
+    if (dart.library.js_interop) 'journal_browser.dart'
+    as platform;
+import 'operation.dart';
+
+ApiOperationJournal createApiOperationJournal() =>
+    platform.createApiOperationJournal();

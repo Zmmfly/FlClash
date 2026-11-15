@@ -1,0 +1,22 @@
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_evaluate/index.dart';
+
+Future<WebEvaluationResult> handleEvaluateCommitted({
+  required int profileId,
+  required int scriptId,
+  required ApiEditVersion editVersion,
+}) => WebEvaluateService(webApiRepository).evaluateCommitted(
+  profileId: profileId,
+  scriptId: scriptId,
+  editVersion: editVersion,
+);
+
+Future<Map<String, dynamic>> handleEvaluate(
+  String scriptContent,
+  Map<String, dynamic> config,
+) async {
+  throw const WebApiException(
+    'evaluation_source_required',
+    'Web evaluation requires committed resource identities and the original source revision',
+  );
+}

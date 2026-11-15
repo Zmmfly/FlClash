@@ -1,0 +1,12 @@
+import 'package:fl_clash/web_api/index.dart';
+
+import 'service.dart';
+
+export 'service.dart';
+export 'types.dart';
+
+final webScheduler = WebSchedulerService(webApiRepository);
+
+void registerWebSchedulerReceipts(WebApiRepository repository) {
+  WebSchedulerService(repository);
+}

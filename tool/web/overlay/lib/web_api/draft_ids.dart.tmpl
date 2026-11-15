@@ -1,0 +1,46 @@
+import 'dart:math';
+
+import 'errors.dart';
+
+const maxSafeLocalId = 9007199254740991;
+int _nextDraft = -2;
+int allocateWebDraftId() {
+  if (_nextDraft < -maxSafeLocalId) {
+    throw const WebApiProtocolException('Local draft identity space exhausted');
+  }
+  final id = _nextDraft--;
+  return id;
+}
+
+void reserveWebDraftId(int id) {
+  if (id > -2 || id < -maxSafeLocalId) {
+    throw const WebApiProtocolException('Invalid local draft identity');
+  }
+  if (_nextDraft >= id) _nextDraft = id - 1;
+}
+
+class Snowflake {
+  factory Snowflake() => _instance;
+  Snowflake._();
+
+  static final _instance = Snowflake._();
+
+  static int buildId(int? id) => id ?? snowflake.id;
+
+  int get id => allocateWebDraftId();
+}
+
+final snowflake = Snowflake();
+
+String get uuidV4 {
+  final random = Random.secure();
+  final bytes = List.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+      '${hex.substring(12, 16)}-${hex.substring(16, 20)}-'
+      '${hex.substring(20)}';
+}
+
+String get uniqueId => uuidV4;

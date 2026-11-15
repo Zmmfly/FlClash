@@ -1,0 +1,200 @@
+import 'package:fl_clash/web_api/index.dart';
+
+const _schedulerKinds = {
+  'profile',
+  'script',
+  'icon-set',
+  'rule-provider',
+  'mitm-module',
+  'geo',
+  'external-provider',
+};
+const _schedulerPhases = {
+  'due',
+  'idle',
+  'disabled',
+  'blocked',
+  'backoff',
+  'inflight',
+  'unknown',
+};
+
+Map<String, Object?> _object(Object? value) {
+  if (value is! Map || value.keys.any((key) => key is! String)) {
+    throw const WebApiProtocolException('Expected typed scheduler object');
+  }
+  return Map<String, Object?>.from(value);
+}
+
+bool _flag(Map<String, Object?> object, String key) {
+  final value = object[key];
+  if (value is! bool) {
+    throw const WebApiProtocolException('Expected scheduler boolean');
+  }
+  return value;
+}
+
+String _text(Object? value, {bool optional = false}) {
+  if (optional && value == null) return '';
+  if (value is! String ||
+      value.length > 256 ||
+      RegExp(r'[\x00-\x1f\x7f]').hasMatch(value)) {
+    throw const WebApiProtocolException('Invalid scheduler text');
+  }
+  return value;
+}
+
+DateTime? _date(Object? value) {
+  if (value == null) return null;
+  final raw = _text(value);
+  final parsed = DateTime.tryParse(raw);
+  if (parsed == null || !raw.endsWith('Z')) {
+    throw const WebApiProtocolException('Invalid scheduler time');
+  }
+  return parsed.toUtc();
+}
+
+class WebSchedulerTarget {
+  const WebSchedulerTarget({
+    required this.kind,
+    required this.id,
+    required this.name,
+    required this.enabled,
+    required this.missingContent,
+    required this.phase,
+    required this.operationId,
+    required this.dueAt,
+    required this.lastSuccess,
+    required this.nextAttempt,
+    required this.failures,
+    required this.errorCode,
+    required this.requiresApply,
+    required this.confirmationRequired,
+  });
+
+  factory WebSchedulerTarget.decode(Object? value) {
+    final data = _object(value);
+    final kind = _text(data['kind']);
+    final id = _text(data['id']);
+    final phase = _text(data['phase']);
+    if (!_schedulerKinds.contains(kind) ||
+        !_schedulerPhases.contains(phase) ||
+        !RegExp(r'^[1-9][0-9]{0,77}$').hasMatch(id)) {
+      throw const WebApiProtocolException('Invalid scheduler target');
+    }
+    final maximum = kind == 'geo' || kind == 'external-provider'
+        ? (BigInt.one << 256) - BigInt.one
+        : BigInt.parse('9223372036854775807');
+    if (BigInt.parse(id) > maximum) {
+      throw const WebApiProtocolException('Scheduler identity out of range');
+    }
+    final failures = data['failures'];
+    if (failures is! int || failures < 0 || failures > 20) {
+      throw const WebApiProtocolException('Invalid scheduler failure count');
+    }
+    final operation = _text(data['operationId'], optional: true);
+    if (operation.isNotEmpty &&
+        !RegExp(r'^[A-Za-z0-9_-]{8,128}$').hasMatch(operation)) {
+      throw const WebApiProtocolException('Invalid scheduler operation');
+    }
+    return WebSchedulerTarget(
+      kind: kind,
+      id: id,
+      name: _text(data['name'], optional: true),
+      enabled: _flag(data, 'enabled'),
+      missingContent: _flag(data, 'missingContent'),
+      phase: phase,
+      operationId: operation,
+      dueAt: _date(data['dueAt']),
+      lastSuccess: _date(data['lastSuccess']),
+      nextAttempt: _date(data['nextAttempt']),
+      failures: failures,
+      errorCode: _text(data['errorCode'], optional: true),
+      requiresApply: _flag(data, 'requiresApply'),
+      confirmationRequired: _flag(data, 'confirmationRequired'),
+    );
+  }
+
+  final String kind;
+  final String id;
+  final String name;
+  final bool enabled;
+  final bool missingContent;
+  final String phase;
+  final String operationId;
+  final DateTime? dueAt;
+  final DateTime? lastSuccess;
+  final DateTime? nextAttempt;
+  final int failures;
+  final String errorCode;
+  final bool requiresApply;
+  final bool confirmationRequired;
+}
+
+class WebSchedulerStatus {
+  const WebSchedulerStatus({
+    required this.flightId,
+    required this.running,
+    required this.started,
+    required this.closed,
+    required this.safeMode,
+    required this.targets,
+    required this.editVersion,
+  });
+
+  factory WebSchedulerStatus.decode(Object? value, ApiEditVersion version) {
+    final data = _object(value);
+    final rows = data['targets'];
+    if (rows is! List || rows.length > 4096) {
+      throw const WebApiProtocolException('Invalid scheduler target list');
+    }
+    final targets = rows.map(WebSchedulerTarget.decode).toList(growable: false);
+    final keys = <String>{};
+    for (final target in targets) {
+      if (!keys.add('${target.kind}:${target.id}:${target.name}')) {
+        throw const WebApiProtocolException('Duplicate scheduler target');
+      }
+    }
+    return WebSchedulerStatus(
+      flightId: _text(data['flightId'], optional: true),
+      running: _flag(data, 'running'),
+      started: _flag(data, 'started'),
+      closed: _flag(data, 'closed'),
+      safeMode: _flag(data, 'safeMode'),
+      targets: List.unmodifiable(targets),
+      editVersion: version,
+    );
+  }
+
+  final String flightId;
+  final bool running;
+  final bool started;
+  final bool closed;
+  final bool safeMode;
+  final List<WebSchedulerTarget> targets;
+  final ApiEditVersion editVersion;
+  bool get hasDue =>
+      targets.any((target) => target.enabled && target.phase == 'due');
+}
+
+class WebSchedulerAccepted {
+  const WebSchedulerAccepted({required this.flightId, required this.coalesced});
+
+  factory WebSchedulerAccepted.decode(Object? value) {
+    final data = _object(value);
+    final flight = _text(data['flightId']);
+    if (!RegExp(r'^scheduler-[0-9a-f]{32}$').hasMatch(flight) ||
+        data['phase'] != 'accepted') {
+      throw const WebApiProtocolException(
+        'A scheduler trigger is not an update receipt',
+      );
+    }
+    return WebSchedulerAccepted(
+      flightId: flight,
+      coalesced: _flag(data, 'coalesced'),
+    );
+  }
+
+  final String flightId;
+  final bool coalesced;
+}

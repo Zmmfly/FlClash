@@ -1,0 +1,485 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_api_recovery/index.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _operationId = '00000000-0000-4000-8000-000000000051';
+const _origin = 'https://panel.test';
+const _draftId = -51;
+
+class _RecoveryTransport implements ApiTransport {
+  final requests = <ApiRequest>[];
+  int unauthorizedNotifications = 0;
+  bool committed = false;
+  bool notCommitted = false;
+  bool loseCommandReply = false;
+  int errorStatus = 404;
+  String errorCode = 'operation_unknown';
+  Object? receiptData = const {'accepted': true};
+  Completer<void>? replyGate;
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    if (request.method == 'GET' && request.path == '/api/v1/meta') {
+      return ApiResponse(
+        200,
+        jsonEncode({
+          'revision': '7',
+          'data': {
+            'storeId': 'recovery-store',
+            'schemaVersion': 1,
+            'revision': '7',
+          },
+        }),
+      );
+    }
+    if (request.method == 'POST' &&
+        request.path == '/api/v1/runtime:apply' &&
+        loseCommandReply) {
+      throw StateError('synthetic lost command reply');
+    }
+    if (request.path.endsWith(':resolve') && notCommitted) {
+      await replyGate?.future;
+      return ApiResponse(
+        409,
+        jsonEncode({
+          'revision': '7',
+          'error': {
+            'code': 'operation_not_committed',
+            'message': 'PRIVATE-MESSAGE',
+            'details': {'state': 'not_committed'},
+          },
+        }),
+      );
+    }
+    if (committed) {
+      return ApiResponse(
+        200,
+        jsonEncode({
+          'revision': '7',
+          'operationId': _operationId,
+          'data': receiptData,
+        }),
+      );
+    }
+    return ApiResponse(
+      errorStatus,
+      jsonEncode({
+        'error': {'code': errorCode, 'message': 'PRIVATE-MESSAGE'},
+      }),
+    );
+  }
+
+  @override
+  void close() {}
+}
+
+WebApiRepository _repository(
+  _RecoveryTransport transport, {
+  String storeId = 'recovery-store',
+  String origin = _origin,
+  String path = '/api/v1/runtime:apply',
+  bool pending = true,
+  List<ApiDraftBinding> drafts = const [],
+}) {
+  final journal = MemoryApiOperationJournal();
+  if (pending) {
+    journal.write(
+      ApiPendingOperation(
+        operationId: _operationId,
+        path: path,
+        expectedRevision: '6',
+        origin: origin,
+        storeId: storeId,
+        drafts: drafts,
+      ),
+    );
+  }
+  final repository = WebApiRepository(
+    transport: transport,
+    journal: journal,
+    origin: _origin,
+    onUnauthorized: () => transport.unauthorizedNotifications++,
+  );
+  repository.registerExternalReceipt('runtime:apply', (data) => data);
+  return repository;
+}
+
+Future<void> _settle(WidgetTester tester) async {
+  await tester.pumpAndSettle(
+    const Duration(milliseconds: 50),
+    EnginePhase.sendSemanticsUpdate,
+    const Duration(seconds: 5),
+  );
+  expect(tester.takeException(), isNull);
+}
+
+Finder _action(String name) => find.byKey(ValueKey('web-recovery-$name'));
+
+T _button<T extends Widget>(WidgetTester tester, String name) => tester
+    .widget<T>(find.descendant(of: _action(name), matching: find.byType(T)));
+
+AppLocalizations _strings(WidgetTester tester) =>
+    AppLocalizations.of(tester.element(find.byType(WebApiRecoveryScreen)));
+
+Finder _dialogButton(String label) => find.descendant(
+  of: find.byType(AlertDialog),
+  matching: find.widgetWithText(TextButton, label),
+);
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'Recovery controller keeps unknown and settles only explicit tombstone',
+    () async {
+      final transport = _RecoveryTransport();
+      final repository = _repository(transport);
+      addTearDown(repository.close);
+      await repository.initialize();
+      var resolved = 0;
+      final controller = WebApiRecoveryController(
+        repository,
+        onResolved: () => resolved++,
+      );
+      addTearDown(controller.dispose);
+      await controller.recover();
+      expect(repository.pendingOperation?.operationId, _operationId);
+      expect(resolved, 0);
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+      transport.notCommitted = true;
+      await controller.recover(resolve: true);
+      expect(repository.pendingOperation, isNull);
+      expect(resolved, 1);
+    },
+  );
+
+  test(
+    'Recovery controller sends nothing across origin store or session boundaries',
+    () async {
+      for (final boundary in ['origin', 'store', 'session']) {
+        final transport = _RecoveryTransport();
+        final repository = _repository(
+          transport,
+          origin: boundary == 'origin' ? 'https://different.test' : _origin,
+          storeId: boundary == 'store' ? 'different-store' : 'recovery-store',
+        );
+        addTearDown(repository.close);
+        await repository.initialize();
+        var resumed = false;
+        final controller = WebApiRecoveryController(
+          repository,
+          onResolved: () => resumed = true,
+        );
+        addTearDown(controller.dispose);
+        if (boundary == 'session') {
+          repository.client.beginSession();
+          repository.client.bindStore('recovery-store');
+        }
+        final before = transport.requests.length;
+        await controller.recover();
+        await controller.recover(resolve: true);
+        await controller.recover(replay: true);
+        expect(controller.canRecover, isFalse);
+        expect(controller.canReplay, isFalse);
+        expect(transport.requests.length, before);
+        expect(repository.pendingOperation?.operationId, _operationId);
+        expect(resumed, isFalse);
+      }
+    },
+  );
+
+  testWidgets(
+    'Web bootstrap recovery gates a draft on 404 then resumes only committed receipt with zero POST',
+    (tester) async {
+      final transport = _RecoveryTransport()
+        ..receiptData = const {
+          'id': '9007199254740993',
+          'type': 'custom',
+          'label': 'recovered profile',
+          'autoUpdateDurationMillis': 0,
+        };
+      final repository = _repository(
+        transport,
+        path: '/api/v1/profiles:create',
+        drafts: const [ApiDraftBinding(ApiIdentity.profile, _draftId)],
+      );
+      addTearDown(repository.close);
+      // The repository's queue and this memory transport belong to the same fake zone.
+      await repository.initialize();
+      var resumed = false;
+      final gate = waitForWebApiRecovery(
+        repository,
+      ).then((_) => resumed = true);
+      await tester.pump();
+      await _settle(tester);
+      expect(repository.pendingOperation?.operationId, _operationId);
+      expect(
+        repository.identities.isBound(ApiIdentity.profile, _draftId),
+        isFalse,
+      );
+      expect(resumed, isFalse);
+      expect(_action('replay'), findsNothing);
+      await tester.tap(_action('read'));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('web-recovery-error')), findsOneWidget);
+      expect(find.textContaining('PRIVATE-MESSAGE'), findsNothing);
+      expect(repository.pendingOperation?.operationId, _operationId);
+      expect(
+        repository.identities.isBound(ApiIdentity.profile, _draftId),
+        isFalse,
+      );
+      expect(resumed, isFalse);
+      expect(
+        transport.requests.every((request) => request.method == 'GET'),
+        isTrue,
+      );
+      expect(
+        transport.requests.map((request) => request.path),
+        everyElement(anyOf('/api/v1/meta', '/api/v1/operations/$_operationId')),
+      );
+      transport.committed = true;
+      await tester.tap(_action('read'));
+      await _settle(tester);
+      await gate;
+      expect(repository.pendingOperation, isNull);
+      expect(resumed, isTrue);
+      expect(
+        repository.identities.encode(ApiIdentity.profile, _draftId),
+        '9007199254740993',
+      );
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'Web bootstrap explicit tombstone locks every action until atomic resolve without replay',
+    (tester) async {
+      final transport = _RecoveryTransport();
+      final repository = _repository(transport);
+      addTearDown(repository.close);
+      await repository.initialize();
+      transport.notCommitted = true;
+      transport.replyGate = Completer<void>();
+      var resumed = false;
+      await tester.pumpWidget(
+        WebApiRecoveryApp(
+          repository: repository,
+          onResolved: () => resumed = true,
+        ),
+      );
+      await _settle(tester);
+      await tester.tap(_action('resolve'));
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      expect(resumed, isFalse);
+      expect(repository.pendingOperation?.operationId, _operationId);
+      expect(_button<OutlinedButton>(tester, 'read').onPressed, isNull);
+      expect(_button<FilledButton>(tester, 'resolve').onPressed, isNull);
+      expect(_button<TextButton>(tester, 'ack').onPressed, isNull);
+      expect(_action('replay'), findsNothing);
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+      transport.replyGate!.complete();
+      await _settle(tester);
+      expect(repository.pendingOperation, isNull);
+      expect(resumed, isTrue);
+      final writes = transport.requests
+          .where((request) => request.method == 'POST')
+          .toList();
+      expect(writes, hasLength(1));
+      expect(writes.single.path, '/api/v1/operations/$_operationId:resolve');
+      expect(jsonDecode(writes.single.body!), {
+        'intent': 'resolve-unknown-result',
+      });
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  for (final boundary in ['store', 'origin', 'session']) {
+    testWidgets(
+      'Web bootstrap $boundary mismatch disables network and acknowledgement requires cancel-or-confirm',
+      (tester) async {
+        final transport = _RecoveryTransport();
+        final repository = _repository(
+          transport,
+          storeId: boundary == 'store'
+              ? 'different-original-store'
+              : 'recovery-store',
+          origin: boundary == 'origin' ? 'https://original.test' : _origin,
+        );
+        addTearDown(repository.close);
+        await repository.initialize();
+        var resumed = false;
+        await tester.pumpWidget(
+          WebApiRecoveryApp(
+            repository: repository,
+            onResolved: () => resumed = true,
+          ),
+        );
+        await _settle(tester);
+        if (boundary == 'session') {
+          repository.client.beginSession();
+          repository.client.bindStore('recovery-store');
+          await _settle(tester);
+        }
+        final before = transport.requests.length;
+        final l = _strings(tester);
+        expect(_button<OutlinedButton>(tester, 'read').onPressed, isNull);
+        expect(_button<FilledButton>(tester, 'resolve').onPressed, isNull);
+        expect(_action('replay'), findsNothing);
+        await tester.tap(_action('read'));
+        await _settle(tester);
+        expect(transport.requests.length, before);
+        await tester.tap(_action('ack'));
+        await _settle(tester);
+        expect(find.byType(AlertDialog), findsOneWidget);
+        expect(repository.pendingOperation?.operationId, _operationId);
+        expect(resumed, isFalse);
+        await tester.tap(_dialogButton(l.webCancel));
+        await _settle(tester);
+        expect(repository.pendingOperation?.operationId, _operationId);
+        expect(resumed, isFalse);
+        await tester.tap(_action('ack'));
+        await _settle(tester);
+        await tester.tap(_dialogButton(l.webApiAcknowledgeUnrecoverable));
+        await _settle(tester);
+        expect(repository.pendingOperation, isNull);
+        expect(resumed, isTrue);
+        expect(transport.requests.length, before);
+        expect(
+          transport.requests.where((request) => request.method == 'POST'),
+          isEmpty,
+        );
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  for (final (status, code) in [
+    (410, 'operation_expired'),
+    (403, 'operation_forbidden'),
+    (401, 'unauthorized'),
+  ]) {
+    testWidgets(
+      'Web bootstrap $status receipt does not bypass pending gate or reveal server error',
+      (tester) async {
+        final transport = _RecoveryTransport()
+          ..errorStatus = status
+          ..errorCode = code;
+        final repository = _repository(
+          transport,
+          path: status == 403
+              ? '/api/v1/sources:authorize'
+              : '/api/v1/runtime:apply',
+        );
+        addTearDown(repository.close);
+        await repository.initialize();
+        var resumed = false;
+        await tester.pumpWidget(
+          WebApiRecoveryApp(
+            repository: repository,
+            onResolved: () => resumed = true,
+          ),
+        );
+        await _settle(tester);
+        final before = transport.requests.length;
+        expect(repository.pendingOperation?.operationId, _operationId);
+        expect(resumed, isFalse);
+        expect(_action('replay'), findsNothing);
+        await tester.tap(_action('read'));
+        await _settle(tester);
+        expect(repository.pendingOperation?.operationId, _operationId);
+        expect(resumed, isFalse);
+        expect(find.textContaining('PRIVATE-MESSAGE'), findsNothing);
+        if (status == 401) {
+          expect(_button<OutlinedButton>(tester, 'read').onPressed, isNull);
+          expect(_button<FilledButton>(tester, 'resolve').onPressed, isNull);
+          expect(transport.requests.length, before);
+          expect(transport.unauthorizedNotifications, 1);
+        } else {
+          expect(transport.requests.length, before + 1);
+        }
+        expect(_button<TextButton>(tester, 'ack').onPressed, isNotNull);
+        expect(
+          transport.requests.where((request) => request.method == 'POST'),
+          isEmpty,
+        );
+        if (status == 403) {
+          final l = _strings(tester);
+          await tester.tap(_action('ack'));
+          await _settle(tester);
+          expect(repository.pendingOperation?.operationId, _operationId);
+          await tester.tap(_dialogButton(l.webApiAcknowledgeUnrecoverable));
+          await _settle(tester);
+          expect(repository.pendingOperation, isNull);
+          expect(resumed, isTrue);
+          expect(transport.requests.length, before + 1);
+        }
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
+  testWidgets(
+    'Web bootstrap same-session retry sends identical memory body and operation ID without exposing payload',
+    (tester) async {
+      final transport = _RecoveryTransport();
+      final repository = _repository(transport, pending: false);
+      addTearDown(repository.close);
+      await repository.initialize();
+      transport.loseCommandReply = true;
+      await expectLater(
+        repository.client.command('/api/v1/runtime:apply', {
+          'secret': 'PRIVATE-PAYLOAD',
+        }, operationId: _operationId),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final body = repository.pendingOperation!.body;
+      expect(body, isNotNull);
+      var resumed = false;
+      await tester.pumpWidget(
+        WebApiRecoveryApp(
+          repository: repository,
+          onResolved: () => resumed = true,
+        ),
+      );
+      await _settle(tester);
+      expect(_action('replay'), findsOneWidget);
+      expect(find.textContaining('PRIVATE-PAYLOAD'), findsNothing);
+      transport.loseCommandReply = false;
+      transport.committed = true;
+      await tester.tap(_action('replay'));
+      await _settle(tester);
+      expect(repository.pendingOperation, isNull);
+      expect(resumed, isTrue);
+      final writes = transport.requests
+          .where((request) => request.method == 'POST')
+          .toList();
+      expect(writes, hasLength(2));
+      expect(
+        writes.map((request) => request.path),
+        everyElement('/api/v1/runtime:apply'),
+      );
+      expect(writes.map((request) => request.body), everyElement(body));
+      expect(jsonDecode(writes.last.body!)['operationId'], _operationId);
+      expect(find.textContaining('PRIVATE-PAYLOAD'), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+}

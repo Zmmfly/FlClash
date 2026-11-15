@@ -1,0 +1,149 @@
+import 'package:fl_clash/web_api/index.dart';
+
+import 'source_consent.dart';
+
+class WebSourceGrant {
+  const WebSourceGrant({
+    required this.authorizationId,
+    required this.expiresAt,
+    this.importOperationId,
+  });
+
+  final String authorizationId;
+  final DateTime expiresAt;
+  final String? importOperationId;
+}
+
+class WebSourceWorkflows {
+  WebSourceWorkflows(this.repository) {
+    repository.registerExternalReceipt(
+      '/api/v1/sources:authorize',
+      decodeGrant,
+    );
+  }
+
+  final WebApiRepository repository;
+
+  Future<WebSourceConsentPreparation> prepare({
+    required String purpose,
+    Map<String, Object?>? key,
+    String? url,
+    String? importJobId,
+    String? sourceReference,
+    required ApiEditVersion editVersion,
+  }) async {
+    repository.requireEditVersion(editVersion);
+    final receipt = await repository.queryExternal('/api/v1/sources:prepare', {
+      'expectedRevision': editVersion.revision,
+      'purpose': purpose,
+      if (key != null) 'key': key,
+      if (url != null) 'url': url,
+      if (importJobId != null) 'importJobId': importJobId,
+      if (sourceReference != null) 'sourceReference': sourceReference,
+    });
+    repository.requireEditVersion(editVersion);
+    if (receipt.revision != editVersion.revision) {
+      throw const WebApiException(
+        'source_revision_conflict',
+        'The source changed during preparation',
+      );
+    }
+    final data = apiObject(receipt.data);
+    final result = WebSourceConsentPreparation.decode(data);
+    if (result.purpose != purpose) {
+      throw const WebApiProtocolException(
+        'Source preparation changed its purpose',
+      );
+    }
+    if (key != null) {
+      final returned = apiObject(data['key']);
+      if (returned.length != key.length ||
+          key.entries.any((entry) => returned[entry.key] != entry.value)) {
+        throw const WebApiProtocolException(
+          'Source preparation changed its resource',
+        );
+      }
+    }
+    return result;
+  }
+
+  Future<WebSourceGrant> authorize(
+    WebSourceConsentPreparation preparation, {
+    required ApiEditVersion editVersion,
+  }) {
+    if (!preparation.expiresAt.isAfter(DateTime.now())) {
+      throw const WebApiException(
+        'source_preparation_invalid',
+        'The source preparation expired; prepare it again',
+      );
+    }
+    return repository.executeExternalCommand(
+      '/api/v1/sources:authorize',
+      {
+        'preparationId': preparation.preparationId,
+        'urlDigest': preparation.urlDigest,
+        'intent': 'authorize-server-private-source',
+      },
+      decodeGrant,
+      editVersion: editVersion,
+    );
+  }
+
+  /// No UI by default: background work never grants access to private sources.
+  Future<WebSourceGrant?> prepareAndConfirm({
+    required String purpose,
+    Map<String, Object?>? key,
+    String? url,
+    String? importJobId,
+    String? sourceReference,
+    required ApiEditVersion editVersion,
+    Future<bool> Function(WebSourceConsentPreparation)? confirm,
+  }) async {
+    final preparation = await prepare(
+      purpose: purpose,
+      key: key,
+      url: url,
+      importJobId: importJobId,
+      sourceReference: sourceReference,
+      editVersion: editVersion,
+    );
+    if (!preparation.requiresPrivateNetworkConfirmation) return null;
+    if (confirm == null) {
+      throw const WebApiException(
+        'source_authorization_required',
+        'This private source requires an explicit server-network decision',
+      );
+    }
+    if (!await confirm(preparation)) {
+      throw const WebApiException(
+        'source_authorization_cancelled',
+        'Server-network authorization was cancelled',
+      );
+    }
+    repository.requireEditVersion(editVersion);
+    return authorize(preparation, editVersion: editVersion);
+  }
+
+  WebSourceGrant decodeGrant(Object? value) {
+    final data = apiObject(value, 'source authorization');
+    final id = data['authorizationId'];
+    final expiry = data['expiresAt'];
+    final operation = data['importOperationId'];
+    final parsed = expiry is String ? DateTime.tryParse(expiry) : null;
+    if (id is! String ||
+        !RegExp(r'^[A-Za-z0-9_-]{43}$').hasMatch(id) ||
+        parsed == null ||
+        operation != null && operation is! String) {
+      throw const WebApiProtocolException(
+        'Invalid source authorization receipt',
+      );
+    }
+    return WebSourceGrant(
+      authorizationId: id,
+      expiresAt: parsed,
+      importOperationId: operation == null
+          ? null
+          : requireApiOperationId(operation as String),
+    );
+  }
+}

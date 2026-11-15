@@ -1,0 +1,203 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+const webUtilityRepository = 'chen08209/FlClash';
+const webUtilityMaxImageBytes = 32 << 20;
+final _stableReleaseTag = RegExp(
+  r'^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$',
+);
+final _releaseAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$');
+final _sourceId = RegExp(r'^(0|[1-9][0-9]{0,77})$');
+
+String utilityString(Object? value, String field) {
+  if (value is! String) throw WebApiProtocolException('Invalid $field');
+  return value;
+}
+
+DateTime utilityTime(Object? value, String field) {
+  final parsed = DateTime.tryParse(utilityString(value, field));
+  if (parsed == null || !parsed.isUtc) {
+    throw WebApiProtocolException('Invalid $field');
+  }
+  return parsed;
+}
+
+String utilitySourceId(String url) => BigInt.parse(
+  crypto.sha256.convert(utf8.encode(url)).toString(),
+  radix: 16,
+).toString();
+
+class WebUtilityReleaseAsset {
+  const WebUtilityReleaseAsset(this.name, this.size, this.url);
+  final String name;
+  final int size;
+  final Uri url;
+}
+
+class WebUtilityRelease {
+  const WebUtilityRelease({
+    required this.tagName,
+    required this.version,
+    required this.name,
+    required this.body,
+    required this.publishedAt,
+    required this.releaseUrl,
+    required this.assets,
+    required this.checkedAt,
+  });
+  final String tagName;
+  final String version;
+  final String name;
+  final String body;
+  final DateTime publishedAt;
+  final Uri releaseUrl;
+  final List<WebUtilityReleaseAsset> assets;
+  final DateTime checkedAt;
+
+  static WebUtilityRelease decode(Object? value) {
+    final data = apiObject(value, 'release');
+    final tag = utilityString(data['tagName'], 'release.tagName');
+    final version = utilityString(data['version'], 'release.version');
+    final releaseUrl = utilityString(data['releaseUrl'], 'release.releaseUrl');
+    const base = 'https://github.com/$webUtilityRepository/releases/';
+    if (data['provider'] != 'github' ||
+        data['repository'] != webUtilityRepository ||
+        data['updatePolicy'] != 'server-image' ||
+        !_stableReleaseTag.hasMatch(tag) ||
+        version != tag.substring(1) ||
+        releaseUrl != '${base}tag/$tag') {
+      throw const WebApiProtocolException('Untrusted release metadata');
+    }
+    final name = utilityString(data['name'], 'release.name');
+    final body = utilityString(data['body'], 'release.body');
+    final rows = apiList(data['assets']);
+    if (name.length > 1024 ||
+        utf8.encode(body).length > 256 << 10 ||
+        rows.length > 128) {
+      throw const WebApiProtocolException('Oversized release metadata');
+    }
+    final seen = <String>{};
+    final assets = <WebUtilityReleaseAsset>[];
+    for (final row in rows) {
+      final asset = apiObject(row, 'release.asset');
+      final filename = utilityString(asset['name'], 'asset.name');
+      final size = apiInteger(asset['size'], 'asset.size');
+      final url = utilityString(asset['url'], 'asset.url');
+      if (!_releaseAssetName.hasMatch(filename) ||
+          filename.contains('..') ||
+          !seen.add(filename) ||
+          size < 0 ||
+          size > 1099511627776 ||
+          url !=
+              '${base}download/$tag/${Uri.encodeComponent(filename).replaceAll('%2B', '+')}') {
+        throw const WebApiProtocolException('Untrusted release asset');
+      }
+      assets.add(WebUtilityReleaseAsset(filename, size, Uri.parse(url)));
+    }
+    return WebUtilityRelease(
+      tagName: tag,
+      version: version,
+      name: name,
+      body: body,
+      publishedAt: utilityTime(data['publishedAt'], 'release.publishedAt'),
+      releaseUrl: Uri.parse(releaseUrl),
+      assets: List.unmodifiable(assets),
+      checkedAt: utilityTime(data['checkedAt'], 'release.checkedAt'),
+    );
+  }
+
+  Map<String, dynamic> toUpdateResult() => {
+    'tag_name': tagName,
+    'body': body,
+    'web_release_url': releaseUrl.toString(),
+    'web_update_policy': 'server-image',
+  };
+}
+
+class WebUtilityIpQuality {
+  const WebUtilityIpQuality(this.quality, this.checkedAt);
+  final IpQuality quality;
+  final DateTime checkedAt;
+
+  static WebUtilityIpQuality decode(Object? value, String expectedIp) {
+    final data = apiObject(value, 'ipQuality');
+    final quality = IpQuality.fromJson(
+      apiObject(data['quality'], 'ipQuality.quality'),
+    );
+    if (data['ip'] != expectedIp || quality.ip != expectedIp) {
+      throw const WebApiProtocolException('Mismatched IP quality result');
+    }
+    return WebUtilityIpQuality(
+      quality,
+      utilityTime(data['checkedAt'], 'ipQuality.checkedAt'),
+    );
+  }
+}
+
+class WebUtilityImage {
+  const WebUtilityImage(this.bytes, this.mediaType, this.sha256, this.sourceId);
+  final Uint8List bytes;
+  final String mediaType;
+  final String sha256;
+  final String sourceId;
+
+  static WebUtilityImage decode(Object? value, String url) {
+    final data = apiObject(value, 'iconImage');
+    final encoded = utilityString(data['bytes'], 'iconImage.bytes');
+    if (encoded.length > ((webUtilityMaxImageBytes + 2) ~/ 3) * 4) {
+      throw const WebApiProtocolException('Oversized icon image');
+    }
+    final Uint8List bytes;
+    try {
+      bytes = base64Decode(encoded);
+    } on FormatException {
+      throw const WebApiProtocolException('Invalid icon image bytes');
+    }
+    final size = apiInteger(data['size'], 'iconImage.size');
+    final media = utilityString(data['mediaType'], 'iconImage.mediaType');
+    final digest = utilityString(data['sha256'], 'iconImage.sha256');
+    final source = utilityString(data['sourceId'], 'iconImage.sourceId');
+    if (bytes.isEmpty ||
+        bytes.length > webUtilityMaxImageBytes ||
+        bytes.length != size ||
+        crypto.sha256.convert(bytes).toString() != digest ||
+        !_sourceId.hasMatch(source) ||
+        source != utilitySourceId(url) ||
+        !const {
+          'image/png',
+          'image/jpeg',
+          'image/gif',
+          'image/webp',
+          'image/svg+xml',
+        }.contains(media)) {
+      throw const WebApiProtocolException('Invalid icon image envelope');
+    }
+    return WebUtilityImage(bytes, media, digest, source);
+  }
+}
+
+class WebUtilityIconRegistration {
+  const WebUtilityIconRegistration(this.url, this.sourceId);
+  final String url;
+  final String sourceId;
+
+  static WebUtilityIconRegistration decode(Object? value) {
+    final data = apiObject(value, 'iconRegistration');
+    final url = utilityString(data['url'], 'iconRegistration.url');
+    final source = utilityString(data['sourceId'], 'iconRegistration.sourceId');
+    final accessed = utilityString(
+      data['lastAccessed'],
+      'iconRegistration.lastAccessed',
+    );
+    if (source != utilitySourceId(url) ||
+        !_sourceId.hasMatch(source) ||
+        BigInt.tryParse(accessed) == null) {
+      throw const WebApiProtocolException('Invalid icon registration');
+    }
+    return WebUtilityIconRegistration(url, source);
+  }
+}

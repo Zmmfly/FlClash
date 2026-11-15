@@ -1,0 +1,5 @@
+import 'package:fl_clash/database/database.dart';
+import 'package:fl_clash/web_workflows/backup.dart';
+
+Future<void> clearAppData() =>
+    WebBackupWorkflows(database.repository).resetApplication();

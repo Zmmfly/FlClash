@@ -1,0 +1,377 @@
+import 'dart:convert';
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
+
+import 'package:fl_clash/web_api/client.dart';
+import 'package:fl_clash/web_api/errors.dart';
+import 'package:fl_clash/web_api/journal.dart';
+import 'package:fl_clash/web_api/operation.dart';
+
+@JS('globalThis')
+external JSObject get _global;
+
+void _expect(bool value, String description) {
+  if (!value) throw StateError(description);
+}
+
+Future<WebApiException> _failure(Future<Object?> future) async {
+  try {
+    await future;
+  } on WebApiException catch (error) {
+    return error;
+  }
+  throw StateError('Expected a typed API failure');
+}
+
+Future<void> _bind(WebApiClient client) async {
+  final receipt = await client.read('/api/v1/meta');
+  final data = receipt.data as Map;
+  client.bindStore(data['storeId'] as String);
+  client.observeRevision(receipt.revision);
+}
+
+Future<List<String>> _run() async {
+  final checks = <String>[];
+  for (final (path, payload) in [
+    (
+      '/api/v1/profiles:create',
+      <String, Object?>{
+        'profile': {
+          'label': 'redirect307',
+          'ageSecretKey': 'synthetic-307-body-secret',
+        },
+      },
+    ),
+    (
+      '/api/v1/rules:create',
+      <String, Object?>{
+        'rule': {
+          'content': 'redirect308',
+          'ruleTarget': 'synthetic-308-body-secret',
+        },
+      },
+    ),
+  ]) {
+    final journal = MemoryApiOperationJournal();
+    final client = WebApiClient(journal: journal);
+    await _bind(client);
+    final error = await _failure(client.command(path, payload));
+    _expect(
+      error is WebApiUnknownCommitException,
+      'redirect is an unknown commit, not a followed request',
+    );
+    final pending = client.pendingOperation!;
+    _expect(
+      pending.origin == client.origin && pending.storeId == client.boundStoreId,
+      'redirect journal scope',
+    );
+    _expect(journal.read()!.body == null, 'redirect journal never stores body');
+    final resolved = await _failure(
+      client.resolveOperation(pending.operationId),
+    );
+    _expect(
+      resolved.code == 'operation_not_committed' &&
+          client.pendingOperation == null,
+      'atomic redirect tombstone',
+    );
+    await client.close();
+    checks.add(
+      path == '/api/v1/profiles:create'
+          ? '307 does not follow'
+          : '308 does not follow',
+    );
+  }
+
+  final journal = createApiOperationJournal();
+  journal.clear();
+  final client = WebApiClient(journal: journal);
+  await _bind(client);
+  final lost = await _failure(
+    client.command('/api/v1/profiles:update', {
+      'id': '9007199254740993',
+      'profile': {
+        'label': 'commit-loss',
+        'ageSecretKey': 'synthetic-committed-body-secret',
+      },
+    }),
+  );
+  _expect(
+    lost is WebApiUnknownCommitException,
+    'committed response really lost',
+  );
+  final operationId = client.pendingOperation!.operationId;
+  _expect(
+    client.pendingOperation!.body != null,
+    'same-session exact replay body exists only in memory',
+  );
+  final serialized = jsonEncode(journal.read()!.toJournal());
+  _expect(
+    !serialized.contains('synthetic-committed-body-secret') &&
+        !serialized.contains('commit-loss'),
+    'persistent journal is body-free',
+  );
+  final unauthorized = await _failure(client.read('/api/v1/force-401'));
+  _expect(
+    unauthorized.status == 401 && !client.isActive,
+    '401 ends only the old session',
+  );
+  _expect(
+    client.pendingOperation!.operationId == operationId &&
+        client.pendingOperation!.body == null,
+    '401 preserves operation but erases sensitive body',
+  );
+  _expect(
+    journal.read()!.operationId == operationId,
+    '401 preserves durable journal',
+  );
+  client.beginSession();
+  await client.query('/api/v1/test:login', {});
+  await _bind(client);
+  final receipt = await client.resolveOperation(operationId);
+  _expect(
+    receipt.operationId == operationId,
+    'reauth resolves original operation',
+  );
+  _expect(
+    (receipt.data as Map)['id'] == '9007199254740993',
+    'receipt ID remains an exact decimal string',
+  );
+  client.completeOperation(receipt);
+  _expect(
+    journal.read() == null,
+    'only explicit receipt settlement removes journal',
+  );
+  checks.add('HTTP commit-loss -> 401 -> reauth -> original receipt');
+
+  final slow = _failure(client.read('/api/v1/slow-read'));
+  await client.read('/api/v1/wait-for-slow');
+  client.endSession();
+  client.beginSession();
+  await _bind(client);
+  await client.query('/api/v1/test:release-slow', {});
+  final stale = await slow;
+  _expect(
+    stale is WebApiSessionException,
+    'old HTTP epoch cannot publish after reauth',
+  );
+  checks.add('old HTTP result rejected');
+
+  final lostAgain = await _failure(
+    client.command('/api/v1/profiles:update', {
+      'id': '9007199254740993',
+      'profile': {'label': 'commit-loss-store-change'},
+    }),
+  );
+  _expect(lostAgain is WebApiUnknownCommitException, 'second response loss');
+  final oldStoreOperation = client.pendingOperation!.operationId;
+  client.endSession();
+  client.beginSession();
+  await client.query('/api/v1/test:switch-store', {});
+  await _bind(client);
+  final wrongStore = await _failure(client.resolveOperation(oldStoreOperation));
+  _expect(
+    wrongStore.code == 'operation_store_changed',
+    'new store cannot resolve or replay old operation',
+  );
+  _expect(
+    journal.read()!.operationId == oldStoreOperation,
+    'store mismatch keeps journal',
+  );
+  final wrongOrigin = WebApiClient(
+    journal: journal,
+    origin: 'https://different-origin.invalid',
+  );
+  wrongOrigin.bindStore(client.boundStoreId!);
+  final wrongOriginError = await _failure(
+    wrongOrigin.resolveOperation(oldStoreOperation),
+  );
+  _expect(
+    wrongOriginError.code == 'operation_origin_changed',
+    'origin mismatch fails before HTTP',
+  );
+  await wrongOrigin.close();
+  client.ackPendingUnrecoverable(
+    oldStoreOperation,
+    intent: 'acknowledge-unrecoverable-operation',
+  );
+  _expect(
+    journal.read() == null,
+    'user acknowledgement is explicit, not a claimed noncommit',
+  );
+  checks.add('store/origin mismatch never replays');
+
+  await _bind(client);
+  final sourceLost = await _failure(
+    client.command('/api/v1/sources:authorize', {
+      'preparationId': 'lost-source',
+      'urlDigest': 'synthetic-digest',
+      'intent': 'authorize-server-private-source',
+    }),
+  );
+  _expect(sourceLost is WebApiUnknownCommitException, 'source response loss');
+  final sourceOperation = client.pendingOperation!.operationId;
+  client.endSession();
+  client.beginSession();
+  await client.query('/api/v1/test:login', {});
+  await _bind(client);
+  final sourceForbidden = await _failure(
+    client.recoverOperation(sourceOperation),
+  );
+  _expect(
+    sourceForbidden.status == 403 &&
+        client.pendingOperation!.operationId == sourceOperation,
+    'old source session requires acknowledgement',
+  );
+  client.ackPendingUnrecoverable(
+    sourceOperation,
+    intent: 'acknowledge-unrecoverable-operation',
+  );
+  checks.add('source session 403 keeps journal until explicit acknowledgement');
+
+  for (final (committed, reuseId) in [
+    (false, false),
+    (true, false),
+    (false, true),
+  ]) {
+    final delayedJournal = MemoryApiOperationJournal();
+    final delayed = WebApiClient(journal: delayedJournal);
+    await _bind(delayed);
+    final original = await _failure(
+      delayed.command(
+        committed ? '/api/v1/profiles:update' : '/api/v1/profiles:create',
+        {
+          if (committed) 'id': '9007199254740993',
+          'profile': {
+            'label': committed ? 'commit-loss-delayed' : 'never-dispatched',
+          },
+        },
+      ),
+    );
+    _expect(
+      original is WebApiUnknownCommitException,
+      'delayed resolve starts with an unknown command',
+    );
+    final oldId = delayed.pendingOperation!.operationId;
+    await delayed.query('/api/v1/test:hold-resolve', {});
+    final late = _failure(delayed.resolveOperation(oldId));
+    await delayed.query('/api/v1/test:wait-resolve', {});
+    delayed.ackPendingUnrecoverable(
+      oldId,
+      intent: 'acknowledge-unrecoverable-operation',
+    );
+    final currentReceipt = await delayed.command('/api/v1/profiles:create', {
+      'profile': {'label': 'fresh-pending'},
+    }, operationId: reuseId ? oldId : null);
+    final currentId = delayed.pendingOperation!.operationId;
+    await delayed.query('/api/v1/test:release-resolve', {});
+    final lateError = await late;
+    _expect(
+      lateError is WebApiOperationSupersededException,
+      'old resolve cannot accept a receipt or tombstone for a new pending instance',
+    );
+    _expect(
+      delayed.pendingOperation!.operationId == currentId &&
+          delayedJournal.read()!.operationId == currentId,
+      'new journal survives late resolve',
+    );
+    var forgedRejected = false;
+    try {
+      delayed.completeOperation(
+        ApiReceipt(
+          revision: currentReceipt.revision,
+          data: currentReceipt.data,
+          operationId: currentId,
+        ),
+      );
+    } on WebApiProtocolException {
+      forgedRejected = true;
+    }
+    _expect(
+      forgedRejected && delayed.pendingOperation != null,
+      'manufactured receipt cannot clear pending',
+    );
+    delayed.completeOperation(currentReceipt);
+    await delayed.close();
+  }
+  checks.add('late success/tombstone/same-ID resolve cannot clear new pending');
+
+  final epochJournal = MemoryApiOperationJournal();
+  final epochClient = WebApiClient(journal: epochJournal);
+  await _bind(epochClient);
+  final previousReceipt = await epochClient.command('/api/v1/profiles:create', {
+    'profile': {'label': 'epoch-proof'},
+  });
+  final epochId = epochClient.pendingOperation!.operationId;
+  epochClient.endSession();
+  epochClient.beginSession();
+  await _bind(epochClient);
+  var epochRejected = false;
+  try {
+    epochClient.completeOperation(previousReceipt);
+  } on WebApiProtocolException {
+    epochRejected = true;
+  }
+  _expect(
+    epochRejected && epochClient.pendingOperation!.operationId == epochId,
+    'old epoch receipt cannot settle current pending',
+  );
+  final another = WebApiClient(journal: MemoryApiOperationJournal());
+  await _bind(another);
+  final foreignReceipt = await another.read('/api/v1/operations/$epochId');
+  var foreignRejected = false;
+  try {
+    epochClient.completeOperation(foreignReceipt);
+  } on WebApiProtocolException {
+    foreignRejected = true;
+  }
+  _expect(
+    foreignRejected && epochClient.pendingOperation != null,
+    'another client receipt is not authority',
+  );
+  epochClient.completeOperation(await epochClient.recoverOperation(epochId));
+  await another.close();
+  await epochClient.close();
+  checks.add('old epoch and foreign-client receipts rejected');
+
+  final stats = (await client.read('/api/v1/test-stats')).data as Map;
+  _expect(
+    stats['leakRequests'] == 0,
+    '307/308 must cause zero second-origin requests',
+  );
+  _expect(stats['refererRequests'] == 0, 'business fetch sends no referrer');
+  _expect(
+    (stats['committedWrites'] as num) >= 2 && stats['duplicateCommits'] == 0,
+    'lost responses do not create duplicate commits',
+  );
+  _expect(
+    stats['wrongStoreReceiptRequests'] == 0,
+    'store mismatch never reaches receipt HTTP',
+  );
+  final notified = _global
+      .getProperty<JSNumber>('__authNotifications'.toJS)
+      .toDartInt;
+  _expect(
+    notified == 1,
+    '401 uses the unified optional auth gate exactly once',
+  );
+  await client.close();
+  checks.add('no body egress and no referrer');
+  return checks;
+}
+
+Future<void> main() async {
+  Map<String, Object?> result;
+  try {
+    result = {'ok': true, 'checks': await _run()};
+  } catch (error, stack) {
+    result = {
+      'ok': false,
+      'error': error.toString(),
+      'stack': stack.toString(),
+    };
+  }
+  final document = _global.getProperty<JSObject>('document'.toJS);
+  document
+      .getProperty<JSObject>('body'.toJS)
+      .setProperty('textContent'.toJS, jsonEncode(result).toJS);
+}

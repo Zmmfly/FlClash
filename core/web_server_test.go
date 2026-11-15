@@ -2,7 +2,7 @@
 
 package core
 
-// WEBPANEL.md and README Web capability claims are exercised through these public routes and RPCs.
+// Public typed routes and event WS are exercised here; legacy RPC helpers are internal unit boundaries.
 
 import (
 	"bytes"
@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -29,7 +30,7 @@ import (
 
 func newWebTestServer(t *testing.T) *WebServer {
 	t.Helper()
-	s, err := NewWebServer(WebServerOptions{DataDir: filepath.Join(t.TempDir(), "data"), Username: "admin", Password: "correct horse", EmbeddedFS: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("test panel")}, "app.js": &fstest.MapFile{Data: []byte("test script")}}})
+	s, err := NewWebServer(WebServerOptions{DataDir: filepath.Join(t.TempDir(), "data"), Username: "admin", Password: "correct horse", SafeMode: true, EmbeddedFS: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("test panel")}, "app.js": &fstest.MapFile{Data: []byte("test script")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +63,7 @@ func webLogin(t *testing.T, s *WebServer) *http.Cookie {
 
 func TestWebAuthenticationFullRouteMatrix(t *testing.T) {
 	s := newWebTestServer(t)
-	routes := []string{"/ws/core", "/ws/unknown", "/api/auth/session", "/api/auth/logout", "/api/auth/credentials", "/api/fs/snapshot", "/api/fs/interfaces", "/api/fs/stat?path=/data", "/api/fs/read?path=/data/config.yaml", "/api/fs/write?path=/data/test", "/api/fs/mkdir?path=/data/dir", "/api/fs/delete?path=/data/dir", "/api/fs/rename", "/api/fs/copy", "/api/http-proxy", "/api/unknown"}
+	routes := []string{"/ws/core", "/ws/v1/events", "/api/v1/meta", "/api/v1/profiles", "/api/v1/profiles:create", "/ws/unknown", "/api/auth/session", "/api/auth/logout", "/api/auth/credentials", "/api/fs/snapshot", "/api/fs/interfaces", "/api/fs/stat?path=/data", "/api/fs/read?path=/data/config.yaml", "/api/fs/write?path=/data/test", "/api/fs/mkdir?path=/data/dir", "/api/fs/delete?path=/data/dir", "/api/fs/rename", "/api/fs/copy", "/api/http-proxy", "/api/unknown"}
 	for _, path := range routes {
 		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions} {
 			w := webRequest(s, method, path, "{}", nil)
@@ -102,7 +103,7 @@ func TestWebAuthenticationFullRouteMatrix(t *testing.T) {
 	if err != nil || len(raw) < 32 {
 		t.Fatal("session token has insufficient entropy")
 	}
-	for _, path := range []string{"/api/auth/session", "/", "/app.js", "/deep/link", "/api/fs/snapshot"} {
+	for _, path := range []string{"/api/auth/session", "/", "/app.js", "/deep/link", "/api/v1/meta", "/api/v1/profiles"} {
 		if w := webRequest(s, "GET", path, "", cookie); w.Code != 200 {
 			t.Errorf("authenticated %s = %d %s", path, w.Code, w.Body.String())
 		}
@@ -160,7 +161,7 @@ func TestWebLoginRateLimitIsGloballyBounded(t *testing.T) {
 func TestWebOriginAndMethodPolicy(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
-	for _, path := range []string{"/login", "/api/auth/login", "/api/auth/logout", "/api/fs/write?path=/data/a", "/ws/core"} {
+	for _, path := range []string{"/login", "/api/auth/login", "/api/auth/logout", "/api/v1/profiles:create", "/ws/v1/events", "/api/fs/write?path=/data/a", "/ws/core"} {
 		r := httptest.NewRequest("POST", "http://panel.test"+path, strings.NewReader("{}"))
 		r.AddCookie(cookie)
 		r.Header.Set("Origin", "http://evil.test")
@@ -181,16 +182,29 @@ func TestWebOriginAndMethodPolicy(t *testing.T) {
 			t.Errorf("bad origin %q accepted", origin)
 		}
 	}
-	for _, path := range []string{"/api/auth/logout", "/api/fs/write?path=/data/a", "/api/fs/mkdir?path=/data/a", "/api/fs/delete?path=/data/a", "/api/fs/copy", "/api/fs/rename", "/api/http-proxy"} {
+	for _, path := range []string{"/api/auth/logout", "/api/v1/profiles:create"} {
 		if w := webRequest(s, "GET", path, "", cookie); w.Code != 405 {
 			t.Errorf("GET mutation %s = %d", path, w.Code)
 		}
 	}
-	for _, path := range []string{"/api/auth/session", "/api/fs/read?path=/data/a", "/api/fs/stat?path=/data", "/api/fs/snapshot", "/api/fs/interfaces", "/ws/core"} {
-		if w := webRequest(s, "POST", path, "", cookie); w.Code != 405 {
+	for _, path := range []string{"/api/auth/session", "/api/v1/meta", "/api/v1/profiles"} {
+		r := httptest.NewRequest("POST", "http://panel.test"+path, strings.NewReader("{}"))
+		r.AddCookie(cookie)
+		r.Header.Set("Origin", "http://panel.test")
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		if w.Code != 405 {
 			t.Errorf("POST read %s = %d", path, w.Code)
 		}
 	}
+	for _, path := range []string{"/api/fs/read?path=/data/a", "/api/fs/write?path=/data/a", "/api/fs/mkdir?path=/data/a", "/api/fs/delete?path=/data/a", "/api/fs/copy", "/api/fs/rename", "/api/http-proxy", "/ws/core"} {
+		for _, method := range []string{"GET", "POST", "PUT", "DELETE"} {
+			if w := webRequest(s, method, path, "{}", cookie); w.Code != 404 {
+				t.Errorf("retired %s %s = %d", method, path, w.Code)
+			}
+		}
+	}
+
 	s.opts.SecureCookie = true
 	r := httptest.NewRequest("POST", "http://panel.test/api/auth/login", strings.NewReader(`{"username":"admin","password":"correct horse"}`))
 	r.Header.Set("Origin", "https://panel.test")
@@ -204,74 +218,45 @@ func TestWebOriginAndMethodPolicy(t *testing.T) {
 func TestWebFilesVirtualRootsSymlinksAndProtocol(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
-	for _, p := range []string{"/etc/passwd", "/tmpx/file", "/data/../secret", "/tmp/../../secret", "relative", "/data/a\\b", "/data/.tmp/a"} {
-		for _, op := range []string{"read", "write", "mkdir", "delete", "stat"} {
-			method := "POST"
-			if op == "read" || op == "stat" {
-				method = "GET"
-			}
-			w := webRequest(s, method, "/api/fs/"+op+"?path="+url.QueryEscape(p), "test", cookie)
-			if w.Code != 400 {
-				t.Errorf("%s %s = %d", op, p, w.Code)
-			}
-		}
-	}
 	outside := t.TempDir()
-	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("OUTSIDE"), 0600); err != nil {
+	secret := filepath.Join(outside, "secret")
+	if err := os.WriteFile(secret, []byte("OUTSIDE"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.data.Symlink(outside, "escape"); err != nil {
 		t.Fatal(err)
 	}
-	for _, op := range []string{"read", "write", "mkdir", "stat", "delete"} {
-		method := "POST"
-		if op == "read" || op == "stat" {
-			method = "GET"
-		}
-		w := webRequest(s, method, "/api/fs/"+op+"?path=/data/escape/secret", "overwritten", cookie)
-		if w.Code == 200 {
-			t.Errorf("symlink %s succeeded", op)
-		}
-	}
-	data, _ := os.ReadFile(filepath.Join(outside, "secret"))
-	if string(data) != "OUTSIDE" {
-		t.Fatal("outside file changed")
-	}
-	for _, p := range []string{"/data", "/tmp", "/tmp/.", "/data//"} {
-		if w := webRequest(s, "POST", "/api/fs/delete?path="+url.QueryEscape(p), "", cookie); w.Code != 400 {
-			t.Fatalf("deleted root %s", p)
-		}
-		for _, body := range []string{`{"from":"` + p + `","to":"/data/other"}`, `{"from":"/data/other","to":"` + p + `"}`} {
-			if w := webRequest(s, "POST", "/api/fs/rename", body, cookie); w.Code != 400 {
-				t.Fatalf("renamed root %s: %d", p, w.Code)
+	for _, p := range []string{"/etc/passwd", "/tmpx/file", "/data/../secret", "/tmp/../../secret", "relative", "/data/a\\b", "/data/.tmp/a", "/data/escape/secret", "/data", "/tmp", "/tmp/.", "/data//", "/data/nested/test.txt"} {
+		for _, op := range []string{"read", "write", "mkdir", "delete", "stat"} {
+			for _, method := range []string{"GET", "POST"} {
+				w := webRequest(s, method, "/api/fs/"+op+"?path="+url.QueryEscape(p), "overwritten", cookie)
+				if w.Code != 404 {
+					t.Fatalf("retired %s %s: %d", op, p, w.Code)
+				}
 			}
 		}
 	}
-	for _, p := range []string{"/data/nested/test.txt", "/tmp/test.txt"} {
-		if w := webRequest(s, "POST", "/api/fs/write?path="+p, "hello", cookie); w.Code != 200 {
-			t.Fatal(w.Body.String())
-		}
-		if w := webRequest(s, "GET", "/api/fs/read?path="+p, "", cookie); w.Code != 200 || w.Body.String() != "hello" || w.Header().Get("X-File-Mtime") == "" {
-			t.Fatal("read protocol failed")
-		}
-		if w := webRequest(s, "GET", "/api/fs/stat?path="+p, "", cookie); w.Code != 200 || !strings.Contains(w.Body.String(), `"exists":true`) {
-			t.Fatal("stat protocol failed")
+	for _, op := range []string{"rename", "copy", "snapshot", "interfaces"} {
+		if w := webRequest(s, "POST", "/api/fs/"+op, `{"from":"/data/escape/secret","to":"/tmp/copy"}`, cookie); w.Code != 404 {
+			t.Fatal(w.Code)
 		}
 	}
-	if w := webRequest(s, "POST", "/api/fs/write?path=/data/nested/test.txt&mode=append", " world", cookie); w.Code != 200 {
-		t.Fatal(w.Code)
+	data, _ := os.ReadFile(secret)
+	if string(data) != "OUTSIDE" {
+		t.Fatal("retired filesystem changed private authority")
 	}
-	if w := webRequest(s, "POST", "/api/fs/copy", `{"from":"/data/nested/test.txt","to":"/tmp/copy.txt"}`, cookie); w.Code != 200 {
-		t.Fatal(w.Body.String())
+	body, _ := json.Marshal(webAPITestMutation("0", "server-profile", map[string]any{"profile": webAPITestProfile("typed")}))
+	r := httptest.NewRequest("POST", "http://panel.test/api/v1/profiles:create", bytes.NewReader(body))
+	r.AddCookie(cookie)
+	r.Header.Set("Origin", "http://panel.test")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("typed write: %d %s", w.Code, w.Body.String())
 	}
-	if w := webRequest(s, "POST", "/api/fs/rename", `{"from":"/tmp/copy.txt","to":"/data/moved.txt"}`, cookie); w.Code != 200 {
-		t.Fatal(w.Body.String())
-	}
-	if w := webRequest(s, "GET", "/api/fs/read?path=/data/moved.txt", "", cookie); w.Body.String() != "hello world" {
-		t.Fatal(w.Body.String())
-	}
-	if w := webRequest(s, "GET", "/api/fs/snapshot", "", cookie); w.Code != 200 || strings.Contains(w.Body.String(), "OUTSIDE") {
-		t.Fatal("snapshot leaked symlink")
+	if w := webRequest(s, "GET", "/api/v1/profiles", "", cookie); w.Code != 200 || !strings.Contains(w.Body.String(), "typed") || strings.Contains(w.Body.String(), "OUTSIDE") {
+		t.Fatal("typed read lost resource or exposed file authority")
 	}
 }
 
@@ -330,7 +315,7 @@ func webDial(t *testing.T, server *httptest.Server, cookie *http.Cookie, origin 
 		header.Set("Origin", origin)
 	}
 	dialer := ws.Dialer{Timeout: 3 * time.Second, Header: ws.HandshakeHeaderHTTP(header)}
-	conn, _, _, err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/core")
+	conn, _, _, err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/v1/events")
 	return conn, nil, err
 }
 
@@ -353,12 +338,12 @@ func TestWebSocketAuthenticationOriginLogoutExpiryAndSize(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
-	payload := []byte(`{"id":"one","method":"core.shutdown"}`)
+	payload := []byte(`{"type":"subscribe","topics":["commit"]}`)
 	if err := wsutil.WriteClientMessage(conn, ws.OpText, payload); err != nil {
 		t.Fatal(err)
 	}
 	response, _, err := wsutil.ReadServerData(conn)
-	if err != nil || !bytes.Contains(response, []byte(`"result":true`)) {
+	if err != nil || !bytes.Contains(response, []byte(`"type":"snapshot"`)) {
 		t.Fatalf("RPC response: %s %v", response, err)
 	}
 	if w := webRequest(s, "POST", "/api/auth/logout", "", cookie); w.Code != 204 {
@@ -396,40 +381,31 @@ func TestWebSocketAuthenticationOriginLogoutExpiryAndSize(t *testing.T) {
 	}
 }
 
-func TestWebProxyPreservesProtocolAndVerifiesTLS(t *testing.T) {
+func TestWebRetiredProxyHasNoUpstreamOrFilesystemEffects(t *testing.T) {
 	s := newWebTestServer(t)
 	cookie := webLogin(t, s)
+	var calls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer subscription" {
-			t.Error("upstream headers lost")
-		}
-		w.Header().Set("X-Test", "yes")
+		calls.Add(1)
 		w.WriteHeader(201)
 		io.WriteString(w, "download")
 	}))
 	defer upstream.Close()
-	body, _ := json.Marshal(webProxyRequest{URL: upstream.URL, Headers: map[string]string{"Authorization": "Bearer subscription"}, SavePath: "/data/download"})
-	w := webRequest(s, "POST", "/api/http-proxy", string(body), cookie)
-	var response webProxyResponse
-	if json.Unmarshal(w.Body.Bytes(), &response) != nil || !response.OK || response.StatusCode != 201 || response.SavedSize != 8 || !response.InlinedBody {
-		t.Fatal(w.Body.String())
-	}
-	if w := webRequest(s, "GET", "/api/fs/read?path=/data/download", "", cookie); w.Body.String() != "download" {
-		t.Fatal(w.Body.String())
-	}
-	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "insecure") }))
+	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); io.WriteString(w, "insecure") }))
 	defer tls.Close()
-	body, _ = json.Marshal(webProxyRequest{URL: tls.URL})
-	w = webRequest(s, "POST", "/api/http-proxy", string(body), cookie)
-	response = webProxyResponse{}
-	if json.Unmarshal(w.Body.Bytes(), &response) != nil || response.OK || response.Error == "" {
-		t.Fatal("untrusted upstream TLS certificate accepted")
-	}
-	for _, p := range []string{"/etc/pwn", "/tmpx/pwn", "/data/../pwn"} {
-		body, _ = json.Marshal(webProxyRequest{URL: upstream.URL, SavePath: p})
-		if w := webRequest(s, "POST", "/api/http-proxy", string(body), cookie); w.Code != 400 {
-			t.Fatal("proxy path escape accepted")
+	for _, endpoint := range []string{upstream.URL, tls.URL} {
+		for _, p := range []string{"/data/download", "/etc/pwn", "/tmpx/pwn", "/data/../pwn"} {
+			body, _ := json.Marshal(webProxyRequest{URL: endpoint, Headers: map[string]string{"Authorization": "Bearer synthetic"}, SavePath: p})
+			if w := webRequest(s, "POST", "/api/http-proxy", string(body), cookie); w.Code != 404 {
+				t.Fatalf("retired relay: %d", w.Code)
+			}
 		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("retired relay contacted upstream")
+	}
+	if _, err := s.data.Stat("download"); !os.IsNotExist(err) {
+		t.Fatal("retired relay persisted bytes")
 	}
 }
 

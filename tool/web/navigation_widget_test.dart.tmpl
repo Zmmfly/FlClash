@@ -1,0 +1,380 @@
+import 'dart:async';
+import 'dart:ui' show SemanticsFlag;
+
+import 'package:fl_clash/ui/icons/icons.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/web_auth/auth_client.dart';
+import 'package:fl_clash/web_auth/logout_navigation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:prism_ui/navigation_action.dart';
+import 'package:test/test.dart' as runner;
+
+import 'web_account_test.dart' as account;
+
+// WEBPANEL.md: logout is an action in Web navigation, never a selected page or a top-bar menu.
+enum Layout { expanded, compact, overlay, dock, bar }
+
+const destinations = [
+  SidebarDestination(glyph: AppGlyphs.dashboard, label: 'Dashboard'),
+  SidebarDestination(glyph: AppGlyphs.proxies, label: 'Proxies'),
+  SidebarDestination(glyph: AppGlyphs.tools, label: 'Tools'),
+];
+
+class NavigationFixture extends StatefulWidget {
+  const NavigationFixture({super.key, required this.layout});
+
+  final Layout layout;
+
+  @override
+  State<NavigationFixture> createState() => NavigationFixtureState();
+}
+
+class NavigationFixtureState extends State<NavigationFixture> {
+  int selected = 1;
+  bool expanded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    expanded = widget.layout == Layout.expanded;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final action = webLogoutNavigationAction(context);
+    if (widget.layout == Layout.dock || widget.layout == Layout.bar) {
+      return Scaffold(
+        title: 'Page',
+        body: Column(
+          children: [
+            const Expanded(child: Center(child: Text('Body'))),
+            if (widget.layout == Layout.dock)
+              NavigationDock(
+                action: action,
+                destinations: [
+                  for (final item in destinations)
+                    NavigationDockDestination(
+                      glyph: item.glyph,
+                      label: item.label,
+                    ),
+                ],
+                selectedIndex: selected,
+                onSelected: (index) => setState(() => selected = index),
+              )
+            else
+              NavigationBar(
+                action: action,
+                destinations: [
+                  for (final item in destinations)
+                    NavigationDestination(
+                      icon: GlyphIcon(item.glyph),
+                      label: item.label,
+                    ),
+                ],
+                selectedIndex: selected,
+                onDestinationSelected: (index) =>
+                    setState(() => selected = index),
+              ),
+          ],
+        ),
+      );
+    }
+    return Row(
+      children: [
+        NavigationSidebar(
+          footerAction: action,
+          destinations: destinations,
+          expanded: expanded,
+          selectedIndex: selected,
+          onSelected: (index) => setState(() => selected = index),
+          onToggle: widget.layout == Layout.overlay
+              ? null
+              : () => setState(() => expanded = !expanded),
+        ),
+        const Expanded(
+          child: Scaffold(
+            title: 'Page',
+            body: Center(child: Text('Body')),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class NavigationBinding extends AutomatedTestWidgetsFlutterBinding {
+  @override
+  void reportExceptionNoticed(FlutterErrorDetails details) {
+    runner.registerException(
+      details.toString(),
+      details.stack ?? StackTrace.current,
+    );
+  }
+}
+
+Future<GlobalKey<NavigationFixtureState>> pumpNavigation(
+  WidgetTester tester,
+  Layout layout, {
+  account.FakeAuth? client,
+  bool withScope = true,
+  Brightness brightness = Brightness.light,
+}) async {
+  await account.size(
+    tester,
+    Size(
+      layout == Layout.dock || layout == Layout.bar
+          ? 320
+          : layout == Layout.overlay
+          ? 840
+          : 1280,
+      800,
+    ),
+  );
+  final key = GlobalKey<NavigationFixtureState>();
+  await tester.pumpWidget(
+    account.host(
+      NavigationFixture(key: key, layout: layout),
+      navigationClient: withScope ? client ?? account.FakeAuth() : null,
+      brightness: brightness,
+    ),
+  );
+  await tester.pumpAndSettle();
+  return key;
+}
+
+Finder logoutButton() => find.bySemanticsLabel('Log out').hitTestable().last;
+
+NavigationAction actionOf(WidgetTester tester, Layout layout) =>
+    switch (layout) {
+      Layout.dock =>
+        tester.widget<NavigationDock>(find.byType(NavigationDock)).action!,
+      Layout.bar =>
+        tester.widget<NavigationBar>(find.byType(NavigationBar)).action!,
+      _ =>
+        tester
+            .widget<NavigationSidebar>(find.byType(NavigationSidebar))
+            .footerAction!,
+    };
+
+Future<void> openOverlay(WidgetTester tester) async {
+  final label = UiLocalizations.of(
+    tester.element(find.byType(NavigationSidebar)),
+  ).showMore;
+  await tester.tap(
+    find
+        .byWidgetPredicate(
+          (widget) => widget is Tooltip && widget.message == label,
+        )
+        .first,
+  );
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  NavigationBinding();
+  for (final layout in Layout.values) {
+    for (final brightness in Brightness.values) {
+      testWidgets(
+        '$layout $brightness exposes enabled named navigation action without changing destinations',
+        (tester) async {
+          final client = account.FakeAuth();
+          final key = await pumpNavigation(
+            tester,
+            layout,
+            client: client,
+            brightness: brightness,
+          );
+          if (layout == Layout.overlay) await openOverlay(tester);
+          final button = logoutButton();
+          final data = tester.getSemantics(button).getSemanticsData();
+          expect(data.label, 'Log out');
+          expect(data.hasFlag(SemanticsFlag.isButton), isTrue);
+          expect(data.hasFlag(SemanticsFlag.isEnabled), isTrue);
+          expect(data.hasFlag(SemanticsFlag.isSelected), isFalse);
+          expect(key.currentState!.selected, 1);
+          expect(client.sessions, 0);
+          expect(client.logouts, 0);
+          if (layout == Layout.dock) {
+            expect(
+              tester
+                  .widget<NavigationDock>(find.byType(NavigationDock))
+                  .destinations
+                  .length,
+              3,
+            );
+          } else if (layout == Layout.bar) {
+            expect(
+              tester
+                  .widget<NavigationBar>(find.byType(NavigationBar))
+                  .destinations
+                  .length,
+              3,
+            );
+          } else {
+            expect(
+              tester
+                  .widget<NavigationSidebar>(find.byType(NavigationSidebar))
+                  .destinations,
+              destinations,
+            );
+            expect(
+              tester.getSize(find.byType(NavigationSidebar)).width,
+              layout == Layout.expanded ? 220 : 48,
+            );
+          }
+          await tester.tap(button);
+          await tester.pumpAndSettle();
+          expect(find.text('Log out of this Web panel?'), findsOneWidget);
+          expect(client.logouts, 0);
+          expect(key.currentState!.selected, 1);
+          await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+          await tester.pumpAndSettle();
+          expect(client.logouts, 0);
+          expect(client.redirects, isEmpty);
+          expect(actionOf(tester, layout).onPressed, isNotNull);
+          expect(tester.takeException(), isNull);
+        },
+      );
+    }
+  }
+
+  for (final layout in [Layout.dock, Layout.bar]) {
+    testWidgets(
+      '$layout keeps every destination width and reserves the action row in layout',
+      (tester) async {
+        await pumpNavigation(tester, layout, withScope: false);
+        final before = tester.getRect(find.text('Proxies'));
+        final oldHeight = tester
+            .getSize(
+              find.byType(
+                layout == Layout.dock ? NavigationDock : NavigationBar,
+              ),
+            )
+            .height;
+        await tester.pumpWidget(const SizedBox.shrink());
+        await pumpNavigation(tester, layout);
+        final after = tester.getRect(find.text('Proxies'));
+        expect(after.width, before.width);
+        expect(after.left, before.left);
+        final context = tester.element(find.byType(NavigationFixture));
+        expect(
+          tester
+              .getSize(
+                find.byType(
+                  layout == Layout.dock ? NavigationDock : NavigationBar,
+                ),
+              )
+              .height,
+          oldHeight + NavigationActionRow.heightOf(context),
+        );
+        expect(
+          NavigationDock.insetOf(context, hasAction: true),
+          NavigationDock.insetOf(context) +
+              NavigationActionRow.heightOf(context),
+        );
+        expect(find.text('Log out'), findsOneWidget);
+      },
+    );
+  }
+
+  for (final layout in [Layout.dock, Layout.bar]) {
+    testWidgets(
+      '$layout at 390 has a localized accessible action in navigation',
+      (tester) async {
+        await account.size(tester, const Size(390, 844));
+        await tester.pumpWidget(
+          account.host(
+            NavigationFixture(layout: layout),
+            navigationClient: account.FakeAuth(),
+            locale: const Locale('zh', 'CN'),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final data = tester
+            .getSemantics(find.bySemanticsLabel('退出登录').hitTestable().last)
+            .getSemanticsData();
+        expect(data.label, '退出登录');
+        expect(data.hasFlag(SemanticsFlag.isEnabled), isTrue);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets(
+    'shared scope prevents duplicate confirmation and requests across pending navigation actions',
+    (tester) async {
+      final client = account.FakeAuth()..logoutWait = Completer<void>();
+      final key = await pumpNavigation(tester, Layout.expanded, client: client);
+      final callback = actionOf(tester, Layout.expanded).onPressed!;
+      callback();
+      callback();
+      await tester.pumpAndSettle();
+      expect(find.text('Log out of this Web panel?'), findsOneWidget);
+      expect(client.logouts, 0);
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Log out').hitTestable().last,
+      );
+      await tester.pump();
+      callback();
+      await tester.pump();
+      expect(client.logouts, 1);
+      expect(actionOf(tester, Layout.expanded).onPressed, isNull);
+      expect(actionOf(tester, Layout.expanded).isLoading, isTrue);
+      expect(key.currentState!.selected, 1);
+      client.logoutWait!.complete();
+      await tester.pumpAndSettle();
+      expect(client.redirects, [false]);
+      expect(actionOf(tester, Layout.expanded).onPressed, isNotNull);
+    },
+  );
+
+  testWidgets(
+    'failure uses native feedback and unlocks navigation for a successful retry',
+    (tester) async {
+      final client = account.FakeAuth()
+        ..logoutError = const WebAuthException('request_failed');
+      await pumpNavigation(tester, Layout.bar, client: client);
+      await tester.tap(logoutButton());
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Log out').hitTestable().last,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('The request failed. Please retry.'), findsOneWidget);
+      expect(client.redirects, isEmpty);
+      expect(actionOf(tester, Layout.bar).onPressed, isNull);
+      await tester.tap(find.widgetWithText(TextButton, 'Confirm'));
+      await tester.pumpAndSettle();
+      expect(actionOf(tester, Layout.bar).onPressed, isNotNull);
+      client.logoutError = null;
+      await tester.tap(logoutButton());
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Log out').hitTestable().last,
+      );
+      await tester.pumpAndSettle();
+      expect(client.logouts, 2);
+      expect(client.redirects, [false]);
+    },
+  );
+
+  testWidgets(
+    'pending completion after scope disposal never updates a disposed widget',
+    (tester) async {
+      final client = account.FakeAuth()..logoutWait = Completer<void>();
+      await pumpNavigation(tester, Layout.expanded, client: client);
+      await tester.tap(logoutButton());
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(TextButton, 'Log out').hitTestable().last,
+      );
+      await tester.pump();
+      await tester.pumpWidget(const SizedBox.shrink());
+      client.logoutWait!.complete();
+      await tester.pump();
+      expect(client.redirects, [false]);
+      expect(tester.takeException(), isNull);
+    },
+  );
+}

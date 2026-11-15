@@ -1,0 +1,355 @@
+import 'dart:convert';
+
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+
+import 'errors.dart';
+import 'identity.dart';
+import 'draft_ids.dart' show maxSafeLocalId;
+import 'records.dart';
+import 'json.dart';
+
+export 'json.dart';
+
+class ApiModelCodec {
+  ApiModelCodec(this.identities);
+
+  final ApiIdentityRegistry identities;
+
+  int id(ApiIdentity kind, Object? value, [String path = 'id']) =>
+      identities.decode(kind, value, path: path);
+
+  String wireId(ApiIdentity kind, int value, [String path = 'id']) =>
+      identities.encode(kind, value, path: path);
+
+  Profile profile(Object? value) {
+    final json = apiObject(value, 'profile');
+    final raw = json.remove('overridesRawDocument');
+    if (raw != null && (raw is! String || json['overrides'] != null)) {
+      throw const WebApiProtocolException(
+        'Invalid unreadable profile overrides',
+      );
+    }
+    json['id'] = id(ApiIdentity.profile, json['id'], 'profile.id');
+    if (json['scriptId'] case final scriptId?) {
+      json['scriptId'] = id(ApiIdentity.script, scriptId, 'profile.scriptId');
+    }
+    final durationMillis = apiInteger(
+      json.remove('autoUpdateDurationMillis'),
+      'profile.autoUpdateDurationMillis',
+    );
+    if (durationMillis.abs() >
+        maxSafeLocalId ~/ Duration.microsecondsPerMillisecond) {
+      throw const WebApiProtocolException(
+        'Profile duration exceeds exact Web model precision',
+      );
+    }
+    json['autoUpdateDuration'] =
+        durationMillis * Duration.microsecondsPerMillisecond;
+    if (json['subscriptionInfo'] case final info?) {
+      final counters = apiObject(info, 'profile.subscriptionInfo');
+      json['subscriptionInfo'] = {
+        for (final key in ['upload', 'download', 'total'])
+          key: _readOnlyQuantity(counters[key], 'subscriptionInfo.$key'),
+        'expire': _expirySeconds(counters['expire']),
+      };
+    }
+    if (json['overrides'] == null) json.remove('overrides');
+    final result = Profile.fromJson(json);
+    return raw is String
+        ? result.copyWith(
+            overrides: ProfileOverrides(
+              dialerProxies: DialerProxyOverrides.invalidDocument(raw),
+            ),
+          )
+        : result;
+  }
+
+  Map<String, Object?> profileInput(Profile value) {
+    final dialers = value.overrides.dialerProxies;
+    return {
+      'type': value.type.name,
+      'label': value.label,
+      'currentGroupName': value.currentGroupName,
+      'url': value.url,
+      'ageSecretKey': value.ageSecretKey,
+      'extendType': value.extendType.name,
+      'scriptId': value.scriptId == null
+          ? null
+          : wireId(ApiIdentity.script, value.scriptId!, 'profile.scriptId'),
+      'matchTarget': value.matchTarget,
+      'autoUpdateDurationMillis': value.autoUpdateDuration.inMilliseconds,
+      'autoUpdate': value.autoUpdate,
+      'selectedMap': value.selectedMap,
+      if (dialers.isUnreadable) ...{
+        'overrides': null,
+        'overridesRawDocument': dialers.rawDocument,
+      } else
+        'overrides': _jsonObject(value.overrides.toJson()),
+    };
+  }
+
+  Rule rule(Object? value) {
+    final json = apiObject(value, 'rule');
+    final action = json['ruleAction'];
+    final actions = RuleAction.values.asNameMap();
+    if (action is! String || !actions.containsKey(action)) {
+      throw const WebApiProtocolException('Unknown rule action');
+    }
+    return Rule(
+      id: id(ApiIdentity.rule, json['id'], 'rule.id'),
+      profileId: json['profileId'] == null
+          ? null
+          : id(ApiIdentity.profile, json['profileId'], 'rule.profileId'),
+      ruleAction: actions[action]!,
+      content: json['content'] as String?,
+      ruleTarget: json['ruleTarget'] as String?,
+      ruleProvider: json['ruleProvider'] as String?,
+      subRule: json['subRule'] as String?,
+      noResolve: json['noResolve'] as bool? ?? false,
+      src: json['src'] as bool? ?? false,
+      order: json['order'] as String?,
+    );
+  }
+
+  Map<String, Object?> ruleInput(Rule value, {int? profileId}) => {
+    'profileId': (profileId ?? value.profileId) == null
+        ? null
+        : wireId(
+            ApiIdentity.profile,
+            (profileId ?? value.profileId)!,
+            'rule.profileId',
+          ),
+    'ruleAction': value.ruleAction.name,
+    'content': value.content,
+    'ruleTarget': value.ruleTarget,
+    'ruleProvider': value.ruleProvider,
+    'subRule': value.subRule,
+    'noResolve': value.noResolve,
+    'src': value.src,
+  };
+
+  ProxyGroup proxyGroup(Object? value) {
+    final json = apiObject(value, 'proxyGroup');
+    return ProxyGroup.fromJson({
+      ...apiObject(json['definition'], 'proxyGroup.definition'),
+      'id': id(ApiIdentity.proxyGroup, json['id'], 'proxyGroup.id'),
+      'profileId': id(
+        ApiIdentity.profile,
+        json['profileId'],
+        'proxyGroup.profileId',
+      ),
+      'memberLayout': json['memberLayout'],
+      'order': json['order'],
+    });
+  }
+
+  Map<String, Object?> proxyGroupInput(ProxyGroup value) {
+    final definition = _jsonObject(value.toJson())
+      ..remove('id')
+      ..remove('profileId')
+      ..remove('order')
+      ..remove('memberLayout');
+    return {'definition': definition, 'memberLayout': value.memberLayout};
+  }
+
+  CustomProxy customProxy(Object? value) {
+    final json = apiObject(value, 'customProxy');
+    json['id'] = id(ApiIdentity.customProxy, json['id'], 'customProxy.id');
+    return CustomProxy.fromJson(json);
+  }
+
+  Map<String, Object?> customProxyInput(CustomProxy value) => {
+    'definition': value.definition,
+    'emptyOptions': [for (final field in value.emptyOptions) field.name],
+  };
+
+  ProxyDialer proxyDialer(Object? value) {
+    final json = apiObject(value, 'proxyDialer');
+    return ProxyDialer(
+      profileId: id(
+        ApiIdentity.profile,
+        json['profileId'],
+        'proxyDialer.profileId',
+      ),
+      proxyId: id(
+        ApiIdentity.customProxy,
+        json['proxyId'],
+        'proxyDialer.proxyId',
+      ),
+      target: json['target'] as String,
+    );
+  }
+
+  Script script(Object? value) {
+    final json = apiObject(value, 'script');
+    return Script(
+      id: id(ApiIdentity.script, json['id'], 'script.id'),
+      label: json['label'] as String,
+      lastUpdateTime: DateTime.parse(json['lastUpdateTime'] as String),
+      url: json['url'] as String?,
+      order: json['order'] as int?,
+    );
+  }
+
+  Map<String, Object?> scriptInput(Script value) => {
+    'label': value.label,
+    'url': value.url,
+  };
+
+  ClashProvider clashProvider(Object? value) {
+    final json = apiObject(value, 'clashProvider');
+    return ClashProvider(
+      id: id(ApiIdentity.clashProvider, json['id'], 'clashProvider.id'),
+      label: json['label'] as String,
+      url: json['url'] as String? ?? '',
+      behavior: RuleProviderBehavior.values.byName(json['behavior'] as String),
+      format: RuleProviderFormat.values.byName(json['format'] as String),
+      order: json['order'] as int?,
+    );
+  }
+
+  Map<String, Object?> clashProviderInput(ClashProvider value) => {
+    'label': value.label,
+    'url': value.url,
+  };
+
+  IconSet iconSet(Object? value) {
+    final json = apiObject(value, 'iconSet');
+    return IconSet(
+      id: id(ApiIdentity.iconSet, json['id'], 'iconSet.id'),
+      name: json['name'] as String,
+      url: json['url'] as String? ?? '',
+      icons: [
+        for (final item in apiList(json['icons']))
+          IconSetIcon.fromJson(apiObject(item)),
+      ],
+      lastUpdateTime: json['lastUpdateTime'] == null
+          ? null
+          : DateTime.parse(json['lastUpdateTime'] as String),
+      order: json['order'] as int?,
+    );
+  }
+
+  Map<String, Object?> iconSetInput(IconSet value) => {
+    'name': value.name,
+    'url': value.url,
+    'icons': [for (final icon in value.icons) icon.toJson()],
+  };
+
+  MitmModule mitmModule(Object? value) {
+    final json = apiObject(value, 'mitmModule');
+    return MitmModule(
+      id: id(ApiIdentity.mitmModule, json['id'], 'mitmModule.id'),
+      name: json['name'] as String,
+      description: json['description'] as String? ?? '',
+      url: json['url'] as String?,
+      enabled: json['enabled'] as bool? ?? true,
+      order: json['order'] as int?,
+      arguments: Map<String, String>.from(apiObject(json['arguments'])),
+      resources: Map<String, String>.from(apiObject(json['resources'])),
+      system: json['system'] as String?,
+      scripts: apiInteger(json['scripts'], 'mitmModule.scripts'),
+      lastUpdateTime: DateTime.parse(json['lastUpdateTime'] as String),
+    );
+  }
+
+  Map<String, Object?> mitmModuleInput(MitmModule value) => {
+    'name': value.name,
+    'description': value.description,
+    'url': value.url,
+    'enabled': value.enabled,
+    'arguments': value.arguments,
+    'system': value.system,
+  };
+
+  IconRecord iconRecord(Object? value) {
+    final json = apiObject(value, 'iconRecord');
+    return IconRecord(
+      url: json['url'] as String,
+      lastAccessed: _safeInt64(json['lastAccessed'], 'iconRecord.lastAccessed'),
+    );
+  }
+
+  IpQualityRecord ipQualityRecord(Object? value) {
+    final json = apiObject(value, 'ipQualityRecord');
+    return IpQualityRecord(
+      ip: json['ip'] as String,
+      quality: IpQuality.fromJson(apiObject(json['quality'])),
+      checkedAt: DateTime.parse(json['checkedAt'] as String),
+    );
+  }
+
+  Map<int, T> localIdKeys<T>(ApiIdentity kind, Map<String, T> source) => {
+    for (final entry in source.entries) id(kind, entry.key): entry.value,
+  };
+
+  Map<String, T> wireIdKeys<T>(ApiIdentity kind, Map<int, T> source) => {
+    for (final entry in source.entries) wireId(kind, entry.key): entry.value,
+  };
+
+  Map<String, int> profileProviderValues(Map<String, Object?> source) => {
+    for (final entry in source.entries)
+      entry.key: id(ApiIdentity.profile, entry.value, 'profileProviders.value'),
+  };
+
+  Map<String, String> wireProfileProviderValues(Map<String, int> source) => {
+    for (final entry in source.entries)
+      entry.key: wireId(
+        ApiIdentity.profile,
+        entry.value,
+        'profileProviders.value',
+      ),
+  };
+
+  Map<String, Object?> localConfigIdentities(Map<String, Object?> source) => {
+    ...source,
+    if (source['currentProfileId'] != null)
+      'currentProfileId': id(
+        ApiIdentity.profile,
+        source['currentProfileId'],
+        'config.currentProfileId',
+      ),
+  };
+
+  Map<String, Object?> wireConfigIdentities(Map<String, Object?> source) => {
+    ...source,
+    if (source['currentProfileId'] != null)
+      'currentProfileId': wireId(
+        ApiIdentity.profile,
+        source['currentProfileId'] as int,
+        'config.currentProfileId',
+      ),
+  };
+
+  Map<String, Object?> _jsonObject(Object value) =>
+      apiObject(jsonDecode(jsonEncode(value)));
+  int _safeInt64(Object? value, String path) {
+    final integer = BigInt.parse(requireWireId(value, path));
+    if (integer.abs() > BigInt.from(maxSafeLocalId)) {
+      throw WebApiProtocolException(
+        'Quantity or clock exceeds exact Web model precision at $path',
+      );
+    }
+    return integer.toInt();
+  }
+
+  int _expirySeconds(Object? value) {
+    final seconds = BigInt.parse(
+      requireWireId(value, 'subscriptionInfo.expire'),
+    );
+    if (seconds.abs() > BigInt.from(8640000000000)) {
+      throw const WebApiException(
+        'quantity_unrepresentable',
+        'Subscription expiry is outside the Web date range',
+      );
+    }
+    return seconds.toInt();
+  }
+
+  int _readOnlyQuantity(Object? value, String path) {
+    final integer = BigInt.parse(requireWireId(value, path));
+    if (integer.abs() <= BigInt.from(maxSafeLocalId)) return integer.toInt();
+    return integer.toDouble().round();
+  }
+}

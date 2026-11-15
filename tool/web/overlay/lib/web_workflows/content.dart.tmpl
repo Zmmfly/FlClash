@@ -1,0 +1,1446 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/common/exception.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+import 'resource.dart';
+import 'source_consent.dart';
+import 'sources.dart';
+
+class WebContentSummary {
+  const WebContentSummary({
+    required this.ref,
+    required this.mediaType,
+    required this.sha256,
+    required this.size,
+    this.modifiedAt,
+  });
+
+  final WebContentRef ref;
+  final String mediaType;
+  final String sha256;
+  final int size;
+  final DateTime? modifiedAt;
+}
+
+class WebContentDocument {
+  const WebContentDocument({
+    required this.summary,
+    required this.bytes,
+    required this.encrypted,
+    required this.editVersion,
+  });
+
+  final WebContentSummary summary;
+  final Uint8List bytes;
+  final bool encrypted;
+  final ApiEditVersion editVersion;
+}
+
+class WebContentMutation implements ApiCanonicalProjectionCarrier {
+  const WebContentMutation({
+    required this.summary,
+    this.profile,
+    this.script,
+    this.ruleProvider,
+    this.mitmModule,
+  });
+
+  final WebContentSummary summary;
+  final Profile? profile;
+  final Script? script;
+  final ClashProvider? ruleProvider;
+  final MitmModule? mitmModule;
+
+  @override
+  Iterable<ApiCanonicalProjection> get canonicalProjections => [
+    if (profile != null)
+      ApiCanonicalProjection(
+        ApiIdentity.profile,
+        profile!,
+        path: const ['profile'],
+      ),
+    if (script != null)
+      ApiCanonicalProjection(
+        ApiIdentity.script,
+        script!,
+        path: const ['script'],
+      ),
+    if (ruleProvider != null)
+      ApiCanonicalProjection(
+        ApiIdentity.clashProvider,
+        ruleProvider!,
+        path: const ['ruleProvider'],
+      ),
+    if (mitmModule != null)
+      ApiCanonicalProjection(
+        ApiIdentity.mitmModule,
+        mitmModule!,
+        path: const ['mitmModule'],
+      ),
+  ];
+}
+
+class WebProfileContentResult implements ApiCanonicalProjectionCarrier {
+  const WebProfileContentResult(this.profile);
+  final Profile profile;
+
+  @override
+  Iterable<ApiCanonicalProjection> get canonicalProjections => [
+    ApiCanonicalProjection(ApiIdentity.profile, profile),
+  ];
+}
+
+class WebCustomSourcePreparation {
+  const WebCustomSourcePreparation({
+    required this.profileId,
+    required this.operationId,
+    required this.requestDigest,
+    required this.dependencies,
+    required this.droppedSubRules,
+    required this.editVersion,
+  });
+  final int profileId;
+  final String operationId;
+  final String requestDigest;
+  final List<Object?> dependencies;
+  final int droppedSubRules;
+  final ApiEditVersion editVersion;
+}
+
+class WebDetachedModuleResult implements ApiCanonicalProjectionCarrier {
+  const WebDetachedModuleResult(this.module, this.key);
+  final MitmModule module;
+  final WebContentRef key;
+  @override
+  Iterable<ApiCanonicalProjection> get canonicalProjections => [
+    ApiCanonicalProjection(
+      ApiIdentity.mitmModule,
+      module,
+      path: const ['mitmModule'],
+    ),
+  ];
+}
+
+class WebCustomImportResult implements ApiCanonicalProjectionCarrier {
+  const WebCustomImportResult(this.profile);
+  final Profile profile;
+
+  @override
+  Iterable<ApiCanonicalProjection> get canonicalProjections => [
+    ApiCanonicalProjection(
+      ApiIdentity.profile,
+      profile,
+      path: const ['profile'],
+    ),
+  ];
+}
+
+class WebContentWorkflows {
+  WebContentWorkflows(this.repository, {this.confirmSource}) {
+    repository.registerExternalReceipt('/api/v1/content', decodeMutation);
+    repository.registerExternalReceipt('/api/v1/content:write', decodeMutation);
+    repository.registerExternalReceipt(
+      '/api/v1/content:refresh',
+      decodeMutation,
+    );
+    repository.registerExternalReceipt(
+      '/api/v1/profiles:import',
+      _profileReceipt,
+    );
+    repository.registerExternalReceipt(
+      '/api/v1/profiles:clone',
+      _profileReceipt,
+    );
+    for (final resource in ['scripts', 'rule-providers', 'mitm-modules']) {
+      repository.registerExternalReceipt(
+        '/api/v1/$resource:import',
+        decodeMutation,
+      );
+    }
+    repository.registerExternalReceipt(
+      '/api/v1/mitm-modules:detach',
+      _decodeDetached,
+    );
+    repository.registerExternalReceipt(
+      '/api/v1/profiles:import-custom',
+      _customResult,
+    );
+    for (final command in ['attach', 'arguments']) {
+      repository.registerExternalReceipt(
+        '/api/v1/mitm-modules:$command',
+        decodeMutation,
+      );
+    }
+  }
+
+  final WebApiRepository repository;
+  final Future<bool> Function(WebSourceConsentPreparation)? confirmSource;
+
+  Future<WebContentDocument> read(
+    WebContentRef ref, {
+    ApiEditVersion? editVersion,
+  }) async {
+    final receipt = await repository.readExternal(ref.endpoint(repository));
+    if (editVersion != null && editVersion.revision != receipt.revision) {
+      throw const WebApiException(
+        'edit_snapshot_mismatch',
+        'The resource changed; reload before editing',
+      );
+    }
+    return _document(receipt, ref);
+  }
+
+  WebContentDocument _document(ApiReceipt receipt, WebContentRef ref) {
+    final data = apiObject(receipt.data, 'content');
+    final summary = _summary(data, expected: ref);
+    final body = _bytes(data['bytes']);
+    if (body.length != summary.size ||
+        crypto.sha256.convert(body).toString() != summary.sha256 ||
+        data['encrypted'] is! bool) {
+      throw const WebApiProtocolException('Invalid content body');
+    }
+    return WebContentDocument(
+      summary: summary,
+      bytes: body,
+      encrypted: data['encrypted'] as bool,
+      editVersion: repository.captureReadVersion(
+        receipt,
+        kind: ref.kind.identity,
+      ),
+    );
+  }
+
+  Future<Uint8List> bytes(
+    WebContentRef ref, {
+    ApiEditVersion? editVersion,
+  }) async => (await read(ref, editVersion: editVersion)).bytes;
+
+  Future<String> text(WebContentRef ref, {ApiEditVersion? editVersion}) async =>
+      utf8.decode(await bytes(ref, editVersion: editVersion));
+
+  Future<FileInfo> info(WebContentRef ref) async {
+    final document = await read(ref);
+    return FileInfo(
+      size: document.summary.size,
+      lastModified: document.summary.modifiedAt,
+    );
+  }
+
+  Future<Uint8List> download(WebContentRef ref) async =>
+      (await repository.readAttachmentExternal(
+        ref.endpoint(repository, download: true),
+      )).bytes;
+
+  Future<WebContentDocument> decryptProfile(
+    Profile profile, {
+    required ApiEditVersion editVersion,
+  }) async {
+    repository.requireReadVersion(editVersion);
+    final receipt = await repository.queryExternal('/api/v1/content:decrypt', {
+      'id': repository.codec.wireId(ApiIdentity.profile, profile.id),
+      if (profile.ageSecretKey.isNotEmpty) 'ageSecretKey': profile.ageSecretKey,
+    });
+    if (receipt.revision != editVersion.revision ||
+        repository.revision != editVersion.revision) {
+      throw const WebApiException(
+        'edit_snapshot_mismatch',
+        'The encrypted source changed; explicitly reload it',
+      );
+    }
+    final document = _document(
+      receipt,
+      WebContentRef(WebContentKind.profile, profile.id),
+    );
+    if (document.encrypted)
+      throw const WebApiProtocolException(
+        'The decrypted response is still encrypted',
+      );
+    return document;
+  }
+
+  Future<Uint8List> editableProfileBytes(
+    Profile profile, {
+    required ApiEditVersion editVersion,
+  }) async {
+    final document = await read(
+      WebContentRef(WebContentKind.profile, profile.id),
+      editVersion: editVersion,
+    );
+    return document.encrypted
+        ? (await decryptProfile(profile, editVersion: editVersion)).bytes
+        : document.bytes;
+  }
+
+  Future<void> validateProfileDraft(
+    List<int> bytes, {
+    required ApiEditVersion editVersion,
+    int? profileId,
+    String ageSecretKey = '',
+  }) async {
+    repository.requireEditVersion(editVersion);
+    if (bytes.length > 32 * 1024 * 1024)
+      throw const WebApiException(
+        'content_too_large',
+        'Profile exceeds its input budget',
+      );
+    final receipt = await repository.queryExternal(
+      '/api/v1/profiles:validate',
+      {
+        'expectedRevision': editVersion.revision,
+        if (profileId != null)
+          'profileId': repository.codec.wireId(ApiIdentity.profile, profileId),
+        'bytes': base64Encode(bytes),
+        if (ageSecretKey.isNotEmpty) 'ageSecretKey': ageSecretKey,
+      },
+    );
+    repository.requireEditVersion(editVersion);
+    if (receipt.revision != editVersion.revision ||
+        repository.revision != editVersion.revision) {
+      throw const WebApiException(
+        'edit_snapshot_mismatch',
+        'The profile changed during validation',
+      );
+    }
+    final data = apiObject(receipt.data, 'profile validation');
+    final digest = data['sha256'];
+    if (data['valid'] != true ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest)) {
+      throw const WebApiProtocolException('Invalid profile validation result');
+    }
+    final counts = apiObject(data['counts']);
+    for (final name in ['outbounds', 'ruleProviders', 'subRules']) {
+      if (apiInteger(counts[name], 'profile validation.$name') < 0)
+        throw const WebApiProtocolException('Invalid validation count');
+    }
+  }
+
+  Future<WebContentMutation> write(
+    WebContentRef ref,
+    List<int> bytes, {
+    required ApiEditVersion editVersion,
+    Map<String, Object?>? metadata,
+    Map<String, List<int>> attachments = const {},
+    List<String> detachReferences = const [],
+  }) => repository.runIntent(() async {
+    final payload = <String, Object?>{
+      'key': _key(ref),
+      'bytes': base64Encode(bytes),
+      if (metadata != null) 'metadata': metadata,
+      if (attachments.isNotEmpty) 'attachments': _attachments(attachments),
+      if (detachReferences.isNotEmpty) 'detachReferences': detachReferences,
+    };
+    if (ref.kind == WebContentKind.mitmModule) {
+      return _preparedCommand(
+        ref,
+        '/api/v1/content:prepare-write',
+        '/api/v1/content:write',
+        payload,
+        editVersion,
+      );
+    }
+    return repository.executeExternalCommand(
+      '/api/v1/content:write',
+      payload,
+      (value) => _decodeFor(ref, value),
+      editVersion: editVersion,
+    );
+  });
+
+  Future<WebContentMutation> _preparedCommand(
+    WebContentRef ref,
+    String preparationPath,
+    String commandPath,
+    Map<String, Object?> payload,
+    ApiEditVersion version, {
+    List<ApiDraftBinding> drafts = const [],
+  }) async {
+    final chunkAttachments = payload['attachments'] == null
+        ? const <Object?>[]
+        : apiList(payload['attachments']);
+    final rootPayload = {...payload}..remove('attachments');
+    var receipt = await repository.queryExternal(preparationPath, {
+      'expectedRevision': version.revision,
+      ...rootPayload,
+    });
+    if (receipt.revision != version.revision) {
+      throw const WebApiException(
+        'revision_conflict',
+        'The module changed during preparation',
+      );
+    }
+    var preparation = apiObject(receipt.data, 'content preparation');
+    final job = preparation['preparedJobId'];
+    var digest = preparation['requestDigest'];
+    final expiry = preparation['expiresAt'];
+    final expires = expiry is String ? DateTime.tryParse(expiry) : null;
+    if (job is! String ||
+        job != preparation['operationId'] ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+        preparation['contentSha256'] is! String ||
+        !RegExp(
+          r'^[0-9a-f]{64}$',
+        ).hasMatch(preparation['contentSha256'] as String) ||
+        expires == null ||
+        !expires.isAfter(DateTime.now())) {
+      throw const WebApiProtocolException('Invalid prepared content proof');
+    }
+    final operationId = repository.registerPreparedOperation(receipt, version);
+    final allowedAttachments = preparation['attachmentReferences'] == null
+        ? const <Object?>[]
+        : apiList(preparation['attachmentReferences']);
+    var uploadedBytes = 0;
+    for (final value in chunkAttachments) {
+      final attachment = apiObject(value, 'module attachment');
+      final reference = attachment['sourceReference'];
+      final encoded = attachment['bytes'];
+      if (reference is! String ||
+          !allowedAttachments.contains(reference) ||
+          encoded is! String) {
+        throw const WebApiProtocolException(
+          'Attachment is not declared by the immutable module',
+        );
+      }
+      final bytes = base64Decode(encoded);
+      uploadedBytes += bytes.length;
+      if (bytes.length > 16 * 1024 * 1024 ||
+          uploadedBytes > 128 * 1024 * 1024) {
+        throw const WebApiException(
+          'content_too_large',
+          'Module attachment budget exceeded',
+        );
+      }
+      final uploaded = await repository.queryExternal(
+        '/api/v1/content-preparations/${Uri.encodeComponent(job)}/attachments',
+        {
+          'expectedRevision': version.revision,
+          'requestDigest': digest,
+          'sourceReference': reference,
+          'bytes': encoded,
+        },
+      );
+      final rotated = apiObject(uploaded.data, 'rotated module preparation');
+      if (uploaded.revision != version.revision ||
+          rotated['preparedJobId'] != job ||
+          rotated['operationId'] != operationId ||
+          rotated['contentSha256'] != preparation['contentSha256'] ||
+          rotated['requestDigest'] is! String ||
+          !RegExp(
+            r'^[0-9a-f]{64}$',
+          ).hasMatch(rotated['requestDigest'] as String)) {
+        throw const WebApiProtocolException(
+          'Attachment publication changed the prepared module',
+        );
+      }
+      if (repository.registerPreparedOperation(uploaded, version) !=
+          operationId) {
+        throw const WebApiProtocolException(
+          'Attachment publication changed its operation',
+        );
+      }
+      receipt = uploaded;
+      preparation = rotated;
+      digest = rotated['requestDigest'];
+    }
+    final authorizationIds = <String>[];
+    final seen = <String>{};
+    final dependencies = apiList(preparation['dependencies']);
+    if (dependencies.length > 1000)
+      throw const WebApiProtocolException('Too many module dependencies');
+    for (final value in dependencies) {
+      final dependency = apiObject(value, 'content dependency');
+      final reference = dependency['sourceReference'];
+      final urlDigest = dependency['urlDigest'];
+      if (reference is! String ||
+          !seen.add(reference) ||
+          !RegExp(r'^dependency-[0-9a-f]{32}$').hasMatch(reference) ||
+          urlDigest is! String ||
+          !RegExp(r'^[0-9a-f]{64}$').hasMatch(urlDigest)) {
+        throw const WebApiProtocolException(
+          'Invalid module dependency identity',
+        );
+      }
+      final sources = WebSourceWorkflows(repository);
+      final source = await sources.prepare(
+        purpose: 'mitm-resource-import',
+        importJobId: job,
+        sourceReference: reference,
+        editVersion: version,
+      );
+      if (source.urlDigest != urlDigest)
+        throw const WebApiProtocolException(
+          'Prepared module dependency changed',
+        );
+      if (source.requiresPrivateNetworkConfirmation) {
+        final confirm = confirmSource;
+        if (confirm == null)
+          throw const WebApiException(
+            'source_authorization_required',
+            'A private module dependency requires explicit server-network consent',
+          );
+        if (!await confirm(source))
+          throw const WebApiException(
+            'source_authorization_cancelled',
+            'Server-network authorization was cancelled',
+          );
+        authorizationIds.add(
+          (await sources.authorize(
+            source,
+            editVersion: version,
+          )).authorizationId,
+        );
+      }
+    }
+    return repository.executeExternalCommand(
+      commandPath,
+      {
+        if (payload['key'] != null) 'key': payload['key'],
+        if (payload['id'] != null) 'id': payload['id'],
+        'preparedJobId': job,
+        'requestDigest': digest,
+        'authorizationIds': authorizationIds,
+      },
+      (value) => _decodeFor(ref, value),
+      editVersion: version,
+      operationId: operationId,
+      drafts: drafts,
+    );
+  }
+
+  Future<WebContentMutation> refresh(
+    WebContentRef ref, {
+    required ApiEditVersion editVersion,
+    Map<String, Object?>? metadata,
+    String? authorizationId,
+  }) => repository.runIntent(() async {
+    final existing = await _storedSource(ref, editVersion);
+    String? proposed;
+    if (metadata != null) {
+      for (final field in ['profile', 'script', 'ruleProvider', 'mitmModule']) {
+        if (metadata[field] != null) {
+          final value = apiObject(metadata[field])['url'];
+          if (value != null && value is! String)
+            throw const WebApiProtocolException('Invalid metadata source');
+          proposed = value as String?;
+        }
+      }
+    }
+    final prospective = proposed != null && proposed != existing;
+    final grant = authorizationId == null
+        ? await WebSourceWorkflows(repository).prepareAndConfirm(
+            purpose:
+                '${_sourcePurpose(ref.kind)}-${prospective ? 'import' : 'refresh'}',
+            key: _key(ref),
+            url: prospective ? proposed : null,
+            editVersion: editVersion,
+            confirm: confirmSource,
+          )
+        : null;
+    return repository.executeExternalCommand(
+      '/api/v1/content:refresh',
+      {
+        'key': _key(ref),
+        'purpose': ref.kind == WebContentKind.mitmResource
+            ? 'resource'
+            : 'source',
+        if (metadata != null) 'metadata': metadata,
+        if (authorizationId ?? grant?.authorizationId case final id?)
+          'authorizationId': id,
+      },
+      (value) => _decodeFor(ref, value),
+      editVersion: editVersion,
+      operationId: grant?.importOperationId,
+    );
+  });
+
+  Future<String?> _storedSource(
+    WebContentRef ref,
+    ApiEditVersion version,
+  ) async {
+    Object? original;
+    String? source;
+    switch (ref.kind) {
+      case WebContentKind.profile:
+        final profile = await repository.profiles(id: ref.id).getSingleOrNull();
+        original = profile;
+        source = profile?.url;
+      case WebContentKind.script:
+        final script = (await repository.catalog(repository.scripts).get())
+            .where((row) => row.id == ref.id)
+            .firstOrNull;
+        original = script;
+        source = script?.url;
+      case WebContentKind.ruleProvider:
+        final provider = (await repository.catalog(repository.providers).get())
+            .where((row) => row.id == ref.id)
+            .firstOrNull;
+        original = provider;
+        source = provider?.url;
+      case WebContentKind.mitmModule:
+      case WebContentKind.mitmResource:
+        final module = (await repository.catalog(repository.modules).get())
+            .where((row) => row.id == ref.id)
+            .firstOrNull;
+        original = module;
+        source = module?.url;
+    }
+    if (original == null)
+      throw const WebApiException(
+        'resource_missing',
+        'The content owner no longer exists',
+      );
+    if (repository.captureEditVersion(ref.kind.identity, original).revision !=
+        version.revision) {
+      throw const WebApiException(
+        'source_revision_conflict',
+        'The content owner changed; keep the draft and reload',
+      );
+    }
+    return source;
+  }
+
+  String _sourcePurpose(WebContentKind kind) => switch (kind) {
+    WebContentKind.profile => 'profile',
+    WebContentKind.script => 'script',
+    WebContentKind.ruleProvider => 'rule-provider',
+    WebContentKind.mitmModule => 'mitm-module',
+    WebContentKind.mitmResource => 'mitm-resource',
+  };
+
+  Future<Profile> importProfile(
+    Profile draft, {
+    List<int>? bytes,
+    List<String>? links,
+    ApiEditVersion? editVersion,
+  }) async {
+    final version =
+        editVersion ?? repository.captureCreateVersion(ApiIdentity.profile);
+    repository.identities.registerDraft(ApiIdentity.profile, draft.id);
+    final grant = bytes == null && links == null
+        ? await WebSourceWorkflows(repository).prepareAndConfirm(
+            purpose: 'profile-import',
+            url: draft.url,
+            editVersion: version,
+            confirm: confirmSource,
+          )
+        : null;
+    final source = bytes != null
+        ? <String, Object?>{'kind': 'file', 'bytes': base64Encode(bytes)}
+        : links != null
+        ? <String, Object?>{'kind': 'share', 'links': links}
+        : <String, Object?>{
+            'kind': 'url',
+            'url': draft.url,
+            if (grant != null) 'authorizationId': grant.authorizationId,
+          };
+    try {
+      final canonical = await repository.executeExternalCommand(
+        '/api/v1/profiles:import',
+        {
+          'label': draft.label,
+          'ageSecretKey': draft.ageSecretKey,
+          'source': source,
+        },
+        _profileReceipt,
+        editVersion: version,
+        operationId: grant?.importOperationId,
+        drafts: [ApiDraftBinding(ApiIdentity.profile, draft.id)],
+      );
+      return canonical.profile;
+    } on WebApiException catch (error) {
+      if (error.code == 'age_secret_key_required')
+        throw const AgeSecretKeyRequiredException();
+      rethrow;
+    }
+  }
+
+  Future<Profile> cloneProfile(
+    Profile original, {
+    required ApiEditVersion editVersion,
+    String? label,
+  }) async => (await repository.executeExternalCommand(
+    '/api/v1/profiles:clone',
+    {
+      'id': repository.codec.wireId(ApiIdentity.profile, original.id),
+      if (label != null) 'label': label,
+    },
+    _profileReceipt,
+    editVersion: editVersion,
+  )).profile;
+
+  Future<Profile> writeProfile(
+    Profile draft,
+    List<int> bytes, {
+    required ApiEditVersion editVersion,
+  }) async {
+    if (!repository.identities.isBound(ApiIdentity.profile, draft.id)) {
+      return importProfile(draft, bytes: bytes, editVersion: editVersion);
+    }
+    final result = await write(
+      WebContentRef(WebContentKind.profile, draft.id),
+      bytes,
+      metadata: {'profile': _profileInput(draft)},
+      editVersion: editVersion,
+    );
+    return result.profile!;
+  }
+
+  WebProfileContentResult _profileReceipt(Object? value) =>
+      WebProfileContentResult(repository.codec.profile(value));
+
+  Map<String, Object?> _profileInput(Profile profile) => {
+    for (final entry in repository.codec.profileInput(profile).entries)
+      if (!const {
+        'lastUpdateDate',
+        'subscriptionInfo',
+        'order',
+      }.contains(entry.key))
+        entry.key: entry.value,
+  };
+
+  Future<Script> saveScript(
+    Script draft,
+    String? content, {
+    bool refresh = false,
+    required ApiEditVersion editVersion,
+  }) async {
+    final ref = WebContentRef(WebContentKind.script, draft.id);
+    final metadata = repository.codec.scriptInput(draft);
+    if (repository.identities.isBound(ApiIdentity.script, draft.id)) {
+      if (content != null)
+        return (await write(
+          ref,
+          utf8.encode(content),
+          metadata: {'script': metadata},
+          editVersion: editVersion,
+        )).script!;
+      if (refresh)
+        return (await this.refresh(
+          ref,
+          metadata: {'script': metadata},
+          editVersion: editVersion,
+        )).script!;
+      return repository.saveCatalog(
+        repository.scripts,
+        draft,
+        editVersion: editVersion,
+      );
+    }
+    final source = content != null
+        ? <String, Object?>{
+            'kind': 'file',
+            'bytes': base64Encode(utf8.encode(content)),
+          }
+        : <String, Object?>{'kind': 'url', 'url': draft.url};
+    if (content == null && (!refresh || draft.url == null))
+      throw ArgumentError('A new script needs content or a URL source');
+    final result = await _importResource(
+      ref,
+      'scripts',
+      draft.label,
+      source,
+      metadata: metadata,
+      editVersion: editVersion,
+    );
+    return result.script!;
+  }
+
+  Future<Script> importScriptUrl(
+    String url, {
+    required String fallbackLabel,
+    required ApiEditVersion editVersion,
+  }) => repository.runIntent(() async {
+    final last =
+        Uri.tryParse(
+          url,
+        )?.pathSegments.where((part) => part.isNotEmpty).lastOrNull ??
+        '';
+    final dot = last.lastIndexOf('.');
+    final base = (dot > 0 ? last.substring(0, dot) : last).trim();
+    final existing = await repository.catalog(repository.scripts).get();
+    var label = base.isEmpty ? fallbackLabel : base;
+    final stem = label;
+    for (
+      var number = 1;
+      existing.any((script) => script.label == label);
+      number++
+    ) {
+      label = '$stem ($number)';
+    }
+    return saveScript(
+      Script.create(label: label, url: url),
+      null,
+      refresh: true,
+      editVersion: editVersion,
+    );
+  });
+
+  Future<ClashProvider> saveRuleProvider(
+    ClashProvider draft, {
+    List<int>? bytes,
+    bool refresh = false,
+    required ApiEditVersion editVersion,
+  }) async {
+    final ref = WebContentRef(WebContentKind.ruleProvider, draft.id);
+    final metadata = repository.codec.clashProviderInput(draft);
+    if (repository.identities.isBound(ApiIdentity.clashProvider, draft.id)) {
+      if (bytes != null)
+        return (await write(
+          ref,
+          bytes,
+          metadata: {'ruleProvider': metadata},
+          editVersion: editVersion,
+        )).ruleProvider!;
+      if (refresh)
+        return (await this.refresh(
+          ref,
+          metadata: {'ruleProvider': metadata},
+          editVersion: editVersion,
+        )).ruleProvider!;
+      return repository.saveCatalog(
+        repository.providers,
+        draft,
+        editVersion: editVersion,
+      );
+    }
+    if (bytes == null && (!refresh || !draft.isRemote))
+      throw ArgumentError('A new rule provider needs content or a URL source');
+    final source = bytes != null
+        ? <String, Object?>{'kind': 'file', 'bytes': base64Encode(bytes)}
+        : <String, Object?>{'kind': 'url', 'url': draft.url};
+    return (await _importResource(
+      ref,
+      'rule-providers',
+      draft.label,
+      source,
+      metadata: metadata,
+      editVersion: editVersion,
+    )).ruleProvider!;
+  }
+
+  Future<MitmModule> saveModule(
+    MitmModule draft,
+    String? content, {
+    bool refresh = false,
+    bool first = false,
+    Map<String, List<int>> attachments = const {},
+    required ApiEditVersion editVersion,
+  }) => repository.runIntent(() async {
+    final ref = WebContentRef(WebContentKind.mitmModule, draft.id);
+    final bound = repository.identities.isBound(
+      ApiIdentity.mitmModule,
+      draft.id,
+    );
+    final WebContentMutation result;
+    if (bound) {
+      if (content != null) {
+        result = await write(
+          ref,
+          utf8.encode(content),
+          attachments: attachments,
+          editVersion: editVersion,
+        );
+      } else if (refresh) {
+        result = await this.refresh(ref, editVersion: editVersion);
+      } else {
+        return repository.saveCatalog(
+          repository.modules,
+          draft,
+          editVersion: editVersion,
+        );
+      }
+    } else {
+      if (content == null && (!refresh || draft.url == null))
+        throw ArgumentError('A new module needs content or a URL source');
+      final source = content != null
+          ? <String, Object?>{
+              'kind': 'file',
+              'bytes': base64Encode(utf8.encode(content)),
+            }
+          : <String, Object?>{'kind': 'url', 'url': draft.url};
+      result = await _importResource(
+        ref,
+        'mitm-modules',
+        draft.name,
+        source,
+        attachments: attachments,
+        editVersion: editVersion,
+      );
+    }
+    final canonical = result.mitmModule!;
+    if (!bound && first) {
+      try {
+        final modules = await repository.catalog(repository.modules).get();
+        if (modules.firstOrNull?.id != canonical.id) {
+          await repository.reorderCatalog(
+            repository.modules,
+            [
+              canonical.id,
+              for (final module in modules)
+                if (module.id != canonical.id) module.id,
+            ],
+            editVersion: repository.captureCollectionVersion(
+              ApiIdentity.mitmModule,
+              modules,
+            ),
+          );
+        }
+        return (await repository.catalog(repository.modules).get()).firstWhere(
+          (module) => module.id == canonical.id,
+        );
+      } on WebApiUnknownCommitException {
+        rethrow;
+      } on WebApiPendingOperationException {
+        rethrow;
+      } catch (_) {
+        // Content is already committed: never report this as an unsaved create.
+        throw WebApiException(
+          'committed_refresh_failed',
+          'The module was saved; reload its current order',
+          revision: repository.revision,
+        );
+      }
+    }
+    return canonical;
+  });
+
+  Future<WebContentMutation> _importResource(
+    WebContentRef ref,
+    String resource,
+    String label,
+    Map<String, Object?> source, {
+    Map<String, Object?>? metadata,
+    Map<String, List<int>> attachments = const {},
+    required ApiEditVersion editVersion,
+  }) async {
+    final bound = repository.identities.isBound(ref.kind.identity, ref.id);
+    if (!bound) repository.identities.registerDraft(ref.kind.identity, ref.id);
+    final field = switch (ref.kind) {
+      WebContentKind.script => 'script',
+      WebContentKind.ruleProvider => 'ruleProvider',
+      WebContentKind.mitmModule => 'mitmModule',
+      _ => throw ArgumentError('Unsupported resource import owner'),
+    };
+    final grant = source['kind'] == 'url'
+        ? await WebSourceWorkflows(repository).prepareAndConfirm(
+            purpose: '${_sourcePurpose(ref.kind)}-import',
+            key: bound ? _key(ref) : null,
+            url: source['url'] as String,
+            editVersion: editVersion,
+            confirm: confirmSource,
+          )
+        : null;
+    final importPayload = <String, Object?>{
+      if (bound) 'id': ref.wireId(repository),
+      'label': label,
+      'source': {
+        ...source,
+        if (grant != null) 'authorizationId': grant.authorizationId,
+      },
+      if (metadata != null) 'metadata': metadata,
+      if (attachments.isNotEmpty) 'attachments': _attachments(attachments),
+      if (resource == 'mitm-modules' && grant?.importOperationId != null)
+        'operationId': grant!.importOperationId,
+    };
+    if (resource == 'mitm-modules') {
+      return _preparedCommand(
+        ref,
+        '/api/v1/mitm-modules:prepare-import',
+        '/api/v1/mitm-modules:import',
+        importPayload,
+        editVersion,
+        drafts: bound
+            ? const []
+            : [
+                ApiDraftBinding(ref.kind.identity, ref.id, path: [field]),
+              ],
+      );
+    }
+    return repository.executeExternalCommand(
+      '/api/v1/$resource:import',
+      {
+        if (bound) 'id': ref.wireId(repository),
+        'label': label,
+        'source': {
+          ...source,
+          if (grant != null) 'authorizationId': grant.authorizationId,
+        },
+        if (metadata != null) 'metadata': metadata,
+        if (attachments.isNotEmpty) 'attachments': _attachments(attachments),
+      },
+      (value) => _decodeFor(ref, value),
+      editVersion: editVersion,
+      drafts: bound
+          ? const []
+          : [
+              ApiDraftBinding(ref.kind.identity, ref.id, path: [field]),
+            ],
+      operationId: grant?.importOperationId,
+    );
+  }
+
+  Future<String> ruleProviderText(
+    ClashProvider provider, {
+    required ApiEditVersion editVersion,
+  }) async {
+    final receipt = await repository.readExternal(
+      '/api/v1/rule-providers/${repository.codec.wireId(ApiIdentity.clashProvider, provider.id)}/preview',
+    );
+    if (receipt.revision != editVersion.revision)
+      throw const WebApiException(
+        'edit_snapshot_mismatch',
+        'Reload the provider before previewing',
+      );
+    final data = apiObject(receipt.data, 'rule provider preview');
+    if (repository.codec.id(ApiIdentity.clashProvider, data['id']) !=
+            provider.id ||
+        data['text'] is! String ||
+        data['behavior'] != provider.behavior.name ||
+        data['format'] != provider.format.name) {
+      throw const WebApiProtocolException('Mismatched rule provider preview');
+    }
+    return data['text'] as String;
+  }
+
+  Future<WebCustomSourcePreparation> prepareCustomUrl(
+    Profile original,
+    String url, {
+    required ApiEditVersion editVersion,
+  }) => repository.runIntent(() async {
+    final id = repository.codec.wireId(ApiIdentity.profile, original.id);
+    final sources = WebSourceWorkflows(repository);
+    final grant = await sources.prepareAndConfirm(
+      purpose: 'custom-profile-import',
+      key: {'kind': 'profile', 'id': id},
+      url: url,
+      editVersion: editVersion,
+      confirm: confirmSource,
+    );
+    final receipt = await repository
+        .queryExternal('/api/v1/profiles:prepare-custom-import', {
+          'expectedRevision': editVersion.revision,
+          'profileId': id,
+          'url': url,
+          if (grant != null) 'authorizationId': grant.authorizationId,
+        });
+    final data = apiObject(receipt.data, 'custom source preparation');
+    final operationId = repository.registerPreparedOperation(
+      receipt,
+      editVersion,
+    );
+    final digest = data['requestDigest'];
+    if (receipt.revision != editVersion.revision ||
+        data['profileId'] != id ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest)) {
+      throw const WebApiProtocolException(
+        'Custom source preparation changed its original target',
+      );
+    }
+    final summary = apiObject(data['summary'], 'custom import summary');
+    for (final field in [
+      'proxyProviders',
+      'ruleProviders',
+      'proxies',
+      'proxyGroups',
+      'rules',
+      'droppedSubRules',
+    ]) {
+      if (apiInteger(summary[field], field) < 0)
+        throw const WebApiProtocolException('Invalid custom import summary');
+    }
+    return WebCustomSourcePreparation(
+      profileId: original.id,
+      operationId: operationId,
+      requestDigest: digest,
+      dependencies: apiList(data['dependencies']),
+      droppedSubRules: apiInteger(
+        summary['droppedSubRules'],
+        'droppedSubRules',
+      ),
+      editVersion: editVersion,
+    );
+  });
+
+  Future<Profile> commitCustomUrl(WebCustomSourcePreparation prepared) =>
+      repository.runIntent(() async {
+        final grants = <String>[];
+        final seen = <String>{};
+        for (final value in prepared.dependencies) {
+          final data = apiObject(value, 'custom source dependency');
+          final reference = data['sourceReference'];
+          if (reference is! String ||
+              reference.isEmpty ||
+              reference.length > 256 ||
+              !seen.add(reference) ||
+              data['urlDigest'] is! String) {
+            throw const WebApiProtocolException(
+              'Invalid custom import dependency reference',
+            );
+          }
+          final sources = WebSourceWorkflows(repository);
+          final source = await sources.prepare(
+            purpose: 'custom-profile-dependency',
+            importJobId: prepared.operationId,
+            sourceReference: reference,
+            editVersion: prepared.editVersion,
+          );
+          if (source.urlDigest != data['urlDigest'])
+            throw const WebApiProtocolException('Custom dependency changed');
+          if (source.requiresPrivateNetworkConfirmation) {
+            final confirm = confirmSource;
+            if (confirm == null)
+              throw const WebApiException(
+                'source_authorization_required',
+                'Explicit source consent required',
+              );
+            if (!await confirm(source))
+              throw const WebApiException(
+                'source_authorization_cancelled',
+                'Source consent cancelled',
+              );
+            grants.add(
+              (await sources.authorize(
+                source,
+                editVersion: prepared.editVersion,
+              )).authorizationId,
+            );
+          }
+        }
+        return (await repository.executeExternalCommand(
+          '/api/v1/profiles:import-custom',
+          {
+            'id': repository.codec.wireId(
+              ApiIdentity.profile,
+              prepared.profileId,
+            ),
+            'preparedJobId': prepared.operationId,
+            'requestDigest': prepared.requestDigest,
+            'authorizationIds': grants,
+          },
+          _customResult,
+          editVersion: prepared.editVersion,
+          operationId: prepared.operationId,
+        )).profile;
+      });
+
+  Future<Profile> importCustomProfile(
+    int profileId,
+    Map<String, Object?> custom, {
+    required ApiEditVersion editVersion,
+  }) async => (await repository.executeExternalCommand(
+    '/api/v1/profiles:import-custom',
+    {
+      'id': repository.codec.wireId(ApiIdentity.profile, profileId),
+      'custom': custom,
+    },
+    _customResult,
+    editVersion: editVersion,
+  )).profile;
+
+  WebCustomImportResult _customResult(Object? value) {
+    final data = apiObject(value, 'custom profile import');
+    for (final (field, kind) in [
+      ('addedProfileIds', ApiIdentity.profile),
+      ('addedRuleProviderIds', ApiIdentity.clashProvider),
+      ('addedProxyIds', ApiIdentity.customProxy),
+      ('groupIds', ApiIdentity.proxyGroup),
+      ('ruleIds', ApiIdentity.rule),
+    ]) {
+      final seen = <String>{};
+      for (final id in apiList(data[field])) {
+        final wire = requireWireId(id, field);
+        if (!seen.add(wire))
+          throw const WebApiProtocolException(
+            'Duplicate custom import receipt identities',
+          );
+        repository.identities.decode(kind, wire);
+      }
+    }
+    return WebCustomImportResult(repository.codec.profile(data['profile']));
+  }
+
+  List<Map<String, Object?>> _attachments(Map<String, List<int>> attachments) =>
+      [
+        for (final entry in attachments.entries)
+          {'sourceReference': entry.key, 'bytes': base64Encode(entry.value)},
+      ];
+
+  Future<Profile> refreshProfile(
+    Profile original, {
+    required ApiEditVersion editVersion,
+  }) async {
+    final result = await refresh(
+      WebContentRef(WebContentKind.profile, original.id),
+      metadata: {'profile': _profileInput(original)},
+      editVersion: editVersion,
+    );
+    return result.profile!;
+  }
+
+  Future<Script> refreshScript(
+    Script original, {
+    required ApiEditVersion editVersion,
+  }) async => (await refresh(
+    WebContentRef(WebContentKind.script, original.id),
+    editVersion: editVersion,
+  )).script!;
+
+  Future<ClashProvider> refreshRuleProvider(
+    ClashProvider original, {
+    required ApiEditVersion editVersion,
+  }) async => (await refresh(
+    WebContentRef(WebContentKind.ruleProvider, original.id),
+    editVersion: editVersion,
+  )).ruleProvider!;
+
+  Future<MitmModule> refreshModule(
+    MitmModule original, {
+    required ApiEditVersion editVersion,
+  }) async => (await refresh(
+    WebContentRef(WebContentKind.mitmModule, original.id),
+    editVersion: editVersion,
+  )).mitmModule!;
+
+  Future<MitmModule> attach(
+    MitmModule original,
+    String reference,
+    List<int> bytes, {
+    required ApiEditVersion editVersion,
+  }) async {
+    final result = await repository.executeExternalCommand(
+      '/api/v1/mitm-modules:attach',
+      {
+        'id': repository.codec.wireId(ApiIdentity.mitmModule, original.id),
+        'sourceReference': reference,
+        'bytes': base64Encode(bytes),
+      },
+      decodeMutation,
+      editVersion: editVersion,
+    );
+    final module = result.mitmModule!;
+    if (result.summary.ref.kind != WebContentKind.mitmResource ||
+        repository.identities.canonical(ApiIdentity.mitmModule, module.id) !=
+            repository.identities.canonical(
+              ApiIdentity.mitmModule,
+              original.id,
+            ) ||
+        module.resources[reference] != result.summary.ref.name ||
+        result.summary.sha256 != crypto.sha256.convert(bytes).toString() ||
+        result.summary.size != bytes.length) {
+      throw const WebApiProtocolException(
+        'Attachment receipt changed its owner reference or bytes',
+      );
+    }
+    return module;
+  }
+
+  Future<MitmModule> detach(
+    MitmModule original,
+    String reference, {
+    required ApiEditVersion editVersion,
+  }) async {
+    final name = original.resources[reference];
+    if (name == null)
+      throw const WebApiException(
+        'resource_missing',
+        'The attachment reference is absent',
+      );
+    final result = await repository.executeExternalCommand(
+      '/api/v1/mitm-modules:detach',
+      {
+        'id': repository.codec.wireId(ApiIdentity.mitmModule, original.id),
+        'sourceReference': reference,
+      },
+      _decodeDetached,
+      editVersion: editVersion,
+    );
+    if (repository.identities.canonical(
+              ApiIdentity.mitmModule,
+              result.module.id,
+            ) !=
+            repository.identities.canonical(
+              ApiIdentity.mitmModule,
+              original.id,
+            ) ||
+        result.key.name != name ||
+        result.module.resources.containsKey(reference)) {
+      throw const WebApiProtocolException(
+        'Detach receipt changed its owner or reference',
+      );
+    }
+    return result.module;
+  }
+
+  WebDetachedModuleResult _decodeDetached(Object? value) {
+    final data = apiObject(value, 'module detach');
+    final module = repository.codec.mitmModule(data['mitmModule']);
+    final key = apiObject(data['detachedKey'], 'detached content key');
+    final id = repository.codec.id(ApiIdentity.mitmModule, key['id']);
+    if (key['kind'] != 'mitm-resource' ||
+        id != module.id ||
+        key['name'] is! String ||
+        (key['name'] as String).isEmpty) {
+      throw const WebApiProtocolException('Invalid detached resource identity');
+    }
+    return WebDetachedModuleResult(
+      module,
+      WebContentRef(
+        WebContentKind.mitmResource,
+        id,
+        name: key['name'] as String,
+      ),
+    );
+  }
+
+  Future<MitmModule> setArguments(
+    MitmModule original,
+    Map<String, String> arguments, {
+    required ApiEditVersion editVersion,
+  }) => repository.runIntent(() async {
+    final result = await _preparedCommand(
+      WebContentRef(WebContentKind.mitmModule, original.id),
+      '/api/v1/mitm-modules:prepare-arguments',
+      '/api/v1/mitm-modules:arguments',
+      {
+        'id': repository.codec.wireId(ApiIdentity.mitmModule, original.id),
+        'arguments': arguments,
+      },
+      editVersion,
+    );
+    return result.mitmModule!;
+  });
+
+  WebContentMutation _decodeFor(WebContentRef expected, Object? value) {
+    final result = decodeMutation(value);
+    if (result.summary.ref.kind != expected.kind ||
+        repository.identities.canonical(
+              expected.kind.identity,
+              result.summary.ref.id,
+            ) !=
+            repository.identities.canonical(
+              expected.kind.identity,
+              expected.id,
+            ) ||
+        expected.kind != WebContentKind.mitmResource &&
+            result.summary.ref.name != expected.name) {
+      throw const WebApiProtocolException(
+        'Content receipt names another resource',
+      );
+    }
+    return result;
+  }
+
+  WebContentMutation decodeMutation(Object? value) {
+    final data = apiObject(value, 'content mutation');
+    final summary = _summary(apiObject(data['content']));
+    final fields = [
+      'profile',
+      'script',
+      'ruleProvider',
+      'mitmModule',
+    ].where((key) => data[key] != null).toList();
+    final expected = switch (summary.ref.kind) {
+      WebContentKind.profile => 'profile',
+      WebContentKind.script => 'script',
+      WebContentKind.ruleProvider => 'ruleProvider',
+      WebContentKind.mitmModule || WebContentKind.mitmResource => 'mitmModule',
+    };
+    if (fields.length != 1 || fields.single != expected) {
+      throw const WebApiProtocolException('Mismatched content owner receipt');
+    }
+    final profile = data['profile'] == null
+        ? null
+        : repository.codec.profile(data['profile']);
+    final script = data['script'] == null
+        ? null
+        : repository.codec.script(data['script']);
+    final provider = data['ruleProvider'] == null
+        ? null
+        : repository.codec.clashProvider(data['ruleProvider']);
+    final module = data['mitmModule'] == null
+        ? null
+        : repository.codec.mitmModule(data['mitmModule']);
+    final owner = profile?.id ?? script?.id ?? provider?.id ?? module?.id;
+    if (owner != summary.ref.id)
+      throw const WebApiProtocolException(
+        'Mismatched content identity receipt',
+      );
+    return WebContentMutation(
+      summary: summary,
+      profile: profile,
+      script: script,
+      ruleProvider: provider,
+      mitmModule: module,
+    );
+  }
+
+  Map<String, Object?> _key(WebContentRef ref) => {
+    'kind': ref.kind.wireName,
+    'id': ref.wireId(repository),
+    if (ref.name != null) 'name': ref.name,
+  };
+
+  WebContentSummary _summary(
+    Map<String, Object?> data, {
+    WebContentRef? expected,
+  }) {
+    final key = apiObject(data['key'], 'content.key');
+    final kind = WebContentKind.values
+        .where((item) => item.wireName == key['kind'])
+        .firstOrNull;
+    if (kind == null)
+      throw const WebApiProtocolException('Unknown content kind');
+    final id = repository.codec.id(kind.identity, key['id'], 'content.key.id');
+    final name = key['name'];
+    if (name != null && name is! String ||
+        kind == WebContentKind.mitmResource && name == null) {
+      throw const WebApiProtocolException('Invalid content resource key');
+    }
+    final ref = WebContentRef(kind, id, name: name as String?);
+    if (expected != null &&
+        (kind != expected.kind || id != expected.id || name != expected.name)) {
+      throw const WebApiProtocolException('Mismatched resource content');
+    }
+    final mediaType = data['mediaType'];
+    final digest = data['sha256'];
+    final size = apiInteger(data['size'], 'content.size');
+    if (size < 0 ||
+        size > 32 * 1024 * 1024 ||
+        mediaType is! String ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest)) {
+      throw const WebApiProtocolException('Invalid content summary');
+    }
+    final modified = data['modifiedAt'];
+    final modifiedAt = modified == null || modified == ''
+        ? null
+        : modified is String
+        ? DateTime.tryParse(modified)
+        : null;
+    if (modified != null && modified != '' && modifiedAt == null)
+      throw const WebApiProtocolException('Invalid content modification time');
+    return WebContentSummary(
+      ref: ref,
+      modifiedAt: modifiedAt,
+      mediaType: mediaType,
+      sha256: digest,
+      size: size,
+    );
+  }
+
+  Uint8List _bytes(Object? value) {
+    if (value is! String || value.length > ((32 * 1024 * 1024 + 2) ~/ 3) * 4)
+      throw const WebApiProtocolException('Invalid encoded content');
+    try {
+      return base64Decode(value);
+    } on FormatException {
+      throw const WebApiProtocolException('Invalid encoded content');
+    }
+  }
+}

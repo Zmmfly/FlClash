@@ -1,0 +1,440 @@
+part of '../action.dart';
+
+@Riverpod(keepAlive: true)
+class ProfilesAction extends _$ProfilesAction {
+  CoreController get _core => ref.read(coreHandlerProvider);
+
+  @override
+  void build() {}
+
+  Future<void> updateCurrentSelectedMap(
+    String groupName,
+    String proxyName,
+  ) async {
+    final current = ref.read(currentProfileProvider);
+    if (current == null || current.selectedMap[groupName] == proxyName) return;
+    final editVersion = database.repository.captureEditVersion(
+      ApiIdentity.profile,
+      current,
+    );
+    await database.repository.saveProfile(
+      current.copyWith(
+        selectedMap: {...current.selectedMap, groupName: proxyName},
+      ),
+      editVersion: editVersion,
+    );
+  }
+
+  Future<void> deleteProfile(int id, {ApiEditVersion? editVersion}) async {
+    final original = ref.read(profilesProvider).getProfile(id);
+    if (original == null) return;
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.profile, original);
+    await WebProfileWorkflow(database.repository).delete(
+      id,
+      editVersion: version,
+      onCommitted: () async {
+        if (ref.read(currentProfileIdProvider) != id) return;
+        final profiles = await database.repository.profiles().get();
+        await reloadWebSettings(ref);
+        if (ref.read(currentProfileIdProvider) == id) {
+          await ref
+              .read(currentProfileIdProvider.notifier)
+              .setValueAsync(profiles.firstOrNull?.id);
+        }
+        if (profiles.isEmpty) {
+          await ref.read(setupActionProvider.notifier).setRunning(false);
+        }
+      },
+    );
+  }
+
+  Future<String?> validateConfigWithData(List<int> data, {required ApiEditVersion editVersion, int? profileId, String ageSecretKey = ''}) async {
+    await WebContentWorkflows(database.repository).validateProfileDraft(data, editVersion: editVersion, profileId: profileId, ageSecretKey: ageSecretKey);
+    return null;
+  }
+
+  Future<void> autoUpdateProfiles() async {
+    for (final id in [
+      for (final profile in ref.read(profilesProvider)) profile.id,
+    ]) {
+      final profile = ref.read(profilesProvider).getProfile(id);
+      if (profile == null || !profile.autoUpdate) continue;
+      final isNotNeedUpdate = profile.lastUpdateDate
+          ?.add(profile.autoUpdateDuration)
+          .isBeforeNow;
+      if (isNotNeedUpdate == false || profile.type != ProfileType.url) {
+        continue;
+      }
+      try {
+        await updateProfile(profile);
+      } catch (e) {
+        commonPrint.log(compactError(e), logLevel: LogLevel.warning);
+      }
+    }
+  }
+
+  Future<Profile> putProfile(
+    Profile profile, {
+    ApiEditVersion? editVersion,
+  }) => WebProfileWorkflow(database.repository).save(
+    profile,
+    editVersion:
+        editVersion ??
+        (database.repository.identities.isBound(ApiIdentity.profile, profile.id)
+            ? database.repository.captureEditVersion(
+                ApiIdentity.profile,
+                profile,
+              )
+            : database.repository.captureCreateVersion(ApiIdentity.profile)),
+    onCommitted: (canonical) async {
+      if (ref.read(currentProfileIdProvider) == null) {
+        await _selectIfNone(canonical.id);
+      }
+    },
+  );
+
+  Future<List<Profile>> providerUsers(Profile profile) async {
+    if (profile.type == ProfileType.custom) {
+      return const [];
+    }
+    final users = await ref
+        .read(clashProvidersActionProvider.notifier)
+        .profilesReferencing(ProviderKind.proxy, profile.realLabel);
+    return [
+      for (final user in users)
+        if (user.id != profile.id) user,
+    ];
+  }
+
+  /// Where a profile's own group takes a name, the name stands for that group.
+  Future<List<Profile>> proxyUsers(Set<String> names) async {
+    final (ruleTargets, dialerTargets) = await (
+      database.rulesDao.targetsNaming(names),
+      database.proxyDialersDao.targetsNaming(names),
+    ).wait;
+    final users = <Profile>[];
+    for (final profile in ref.read(profilesProvider)) {
+      if (profile.type != ProfileType.custom) {
+        continue;
+      }
+      final groups = await database.proxyGroupsDao.query(profile.id).get();
+      final inUse = proxyNamesInUse(
+        names.difference({for (final group in groups) group.name}),
+        groups: groups,
+        ruleTargets: ruleTargets[profile.id] ?? const {},
+        dialerTargets: dialerTargets[profile.id] ?? const {},
+        overrides: profile.overrides,
+      );
+      if (inUse.isNotEmpty) {
+        users.add(profile);
+      }
+    }
+    return users;
+  }
+
+  Future<Set<String>> groupsInUse(int profileId, Set<int> groupIds) async {
+    final groups = await database.proxyGroupsDao.query(profileId).get();
+    final names = {
+      for (final group in groups)
+        if (groupIds.contains(group.id)) group.name,
+    };
+    final (ruleTargets, dialerTargets) = await (
+      database.rulesDao.targetsNaming(names),
+      database.proxyDialersDao.targetsNaming(names),
+    ).wait;
+    return proxyNamesInUse(
+      names,
+      groups: groups.where((group) => !groupIds.contains(group.id)),
+      ruleTargets: ruleTargets[profileId] ?? const {},
+      dialerTargets: dialerTargets[profileId] ?? const {},
+      overrides:
+          ref.read(profilesProvider).getProfile(profileId)?.overrides ??
+          const ProfileOverrides(),
+    );
+  }
+
+  Future<void> updateProfiles() async {
+    for (final id in [
+      for (final profile in ref.read(profilesProvider)) profile.id,
+    ]) {
+      final profile = ref.read(profilesProvider).getProfile(id);
+      if (profile == null || profile.type != ProfileType.url) continue;
+      await updateProfile(profile, showLoading: true);
+    }
+  }
+
+  Future<void> updateProfile(
+    Profile profile, {
+    bool showLoading = false,
+    bool allowSourceConsent = false,
+    ApiEditVersion? editVersion,
+  }) async {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.profile, profile);
+    final updating = ref.read(updatingKeysProvider.notifier);
+    final token = showLoading ? updating.start(profile.updatingKey) : null;
+    try {
+      final canonical = await WebContentWorkflows(
+        database.repository,
+        confirmSource: allowSourceConsent || showLoading ? showWebSourceConsent : null,
+      ).refreshProfile(profile, editVersion: version);
+      if (canonical.id == ref.read(currentProfileIdProvider)) {
+        ref
+            .read(setupActionProvider.notifier)
+            .applyProfileDebounce(silence: true);
+      } else {
+        await ref.read(clashProvidersActionProvider.notifier).applyIfReferenced(
+          ProviderKind.proxy,
+          {canonical.realLabel},
+          force: true,
+        );
+      }
+    } finally {
+      if (token != null) updating.stop(profile.updatingKey, token);
+    }
+  }
+
+  Future<void> addProfileFormFile() async {
+    final version = database.repository.captureCreateVersion(
+      ApiIdentity.profile,
+    );
+    final platformFile = await globalState.safeRun(picker.pickerFile);
+    if (platformFile == null) return;
+    final bytes = await platformFile.readBytes();
+    final profile = await globalState.loadingRun(
+      tag: LoadingTag.profiles,
+      () => _withAgeSecretKey(
+        Profile.normal(label: platformFile.name),
+        (draft) => WebContentWorkflows(
+          database.repository,
+        ).importProfile(draft, bytes: bytes, editVersion: version),
+      ),
+      title: currentAppLocalizations.addProfile,
+    );
+    if (profile == null) return;
+    await _afterImport(profile);
+  }
+
+  Future<int> addCustomProfile(String label) async {
+    return (await putProfile(Profile.custom(label: label))).id;
+  }
+
+  Future<void> touchProfile(int id) => database.repository.drainIntents();
+
+  Future<void> _selectIfNone(int id) async {
+    await reloadWebSettings(ref);
+    if (ref.read(currentProfileIdProvider) == null) {
+      await ref.read(currentProfileIdProvider.notifier).setValueAsync(id);
+    }
+  }
+
+  Future<void> _afterImport(Profile canonical) async {
+    if (ref.read(currentProfileIdProvider) == null) {
+      await _selectIfNone(canonical.id);
+    }
+    _showProfiles();
+  }
+
+  Future<CustomProfileImport> readCustomImport(
+    int profileId,
+    Uint8List bytes,
+  ) async {
+    final profiles = ref.read(profilesProvider);
+    final (ruleProviders, proxies, groupNames) = await (
+      database.clashProvidersDao.query().get(),
+      database.customProxiesDao.query().get(),
+      database.proxyGroupsDao.names(except: profileId).get(),
+    ).wait;
+    final CustomImportApp app = (
+      profileLabels: {
+        for (final profile in profiles) ...[profile.label, profile.realLabel],
+      },
+      profileSources: {
+        for (final profile in profiles)
+          if (profile.type == ProfileType.url)
+            (url: profile.url, ageSecretKey: profile.ageSecretKey):
+                profile.realLabel,
+      },
+      ruleProviderLabels: {
+        for (final provider in ruleProviders) provider.label,
+      },
+      ruleProviderSources: {
+        for (final provider in ruleProviders)
+          if (provider.isRemote)
+            (url: provider.url, ageSecretKey: ''): provider.label,
+      },
+      proxies: [for (final proxy in proxies) proxy.definition],
+      groupNames: groupNames.toSet(),
+    );
+    try {
+      return await compute(readCustomProfileImport, (bytes: bytes, app: app));
+    } on CustomImportException catch (error) {
+      final appLocalizations = currentAppLocalizations;
+      throw MessageException(switch (error.issue) {
+        CustomImportIssue.unreadable => appLocalizations.importConfigInvalid,
+        CustomImportIssue.ruleType => appLocalizations.failedItem(
+          error.item,
+          appLocalizations.ruleTextInvalid,
+        ),
+        CustomImportIssue.entry => appLocalizations.failedItem(
+          error.item,
+          error.detail,
+        ),
+      });
+    }
+  }
+
+  Future<void> importCustomProfile(int profileId, CustomProfileImport config, {required ApiEditVersion editVersion}) async {
+    final codec = database.repository.codec;
+    Map<String, Object?> provider(ImportedProvider value) => {
+      'label': value.label, 'url': value.url, 'ageSecretKey': value.ageSecretKey, 'content': value.content,
+    };
+    await WebContentWorkflows(database.repository).importCustomProfile(profileId, {
+      'proxyProviders': [for (final value in config.proxyProviders) provider(value)],
+      'ruleProviders': [for (final value in config.ruleProviders) provider(value)],
+      'proxies': config.proxies,
+      'dialers': config.dialers,
+      'proxyGroups': [for (final group in config.proxyGroups) codec.proxyGroupInput(group)],
+      'rules': [for (final rule in config.rules) {
+        for (final entry in codec.ruleInput(rule, profileId: profileId).entries)
+          if (entry.key != 'order') entry.key: entry.value,
+      }],
+      'overrides': apiObject(jsonDecode(jsonEncode(config.overrides.toJson()))),
+    }, editVersion: editVersion);
+  }
+
+  void _showProfiles() {
+    if (globalState.navigatorKey.currentState?.canPop() ?? false) {
+      globalState.navigatorKey.currentState?.popUntil((route) => route.isFirst);
+    }
+    ref.read(currentPageLabelProvider.notifier).value = PageLabel.profiles;
+  }
+
+  Future<void> addProfileFromLink(
+    String link, {
+    String? label,
+    String ageSecretKey = '',
+    ApiEditVersion? editVersion,
+  }) async {
+    final version =
+        editVersion ??
+        database.repository.captureCreateVersion(ApiIdentity.profile);
+    final profile = await globalState.loadingRun(
+      tag: LoadingTag.profiles,
+      () => _withAgeSecretKey(
+        Profile.normal(
+          label: label,
+          url: link.isShareLink ? '' : link,
+        ).copyWith(ageSecretKey: ageSecretKey),
+        (draft) => link.isShareLink
+            ? _fromShareLinks(draft, [link], editVersion: version)
+            : _download(draft, editVersion: version),
+      ),
+      title: currentAppLocalizations.addProfile,
+    );
+    if (profile != null) await _afterImport(profile);
+  }
+
+  Future<void> addProfilesFromLinks(
+    List<String> links, {
+    ApiEditVersion? editVersion,
+  }) async {
+    final initial =
+        editVersion ??
+        database.repository.captureCreateVersion(ApiIdentity.profile);
+    final shareLinks = [
+      for (final link in links)
+        if (link.isShareLink) link,
+    ];
+    var first = true;
+    await globalState.batchRun(
+      [
+        for (final (index, link) in links.indexed)
+          if (!link.isShareLink)
+            (url: link, shareLinks: const <String>[], ordinal: index + 1)
+          else if (link == shareLinks.first)
+            (url: '', shareLinks: shareLinks, ordinal: index + 1),
+      ],
+      (item) async {
+        final version = first
+            ? initial
+            : database.repository.captureCreateVersion(ApiIdentity.profile);
+        first = false;
+        final draft = Profile.normal(url: item.url);
+        final canonical = await _withAgeSecretKey(
+          draft,
+          (draft) => item.shareLinks.isEmpty
+              ? _download(draft, editVersion: version)
+              : _fromShareLinks(draft, item.shareLinks, editVersion: version),
+        );
+        await _afterImport(canonical);
+      },
+      // Progress and failure logs must never include subscription/share URLs.
+      label: (item) => '${currentAppLocalizations.addProfile} ${item.ordinal}',
+      concurrency: 1,
+      tag: LoadingTag.profiles,
+    );
+  }
+
+  Future<Profile> _download(
+    Profile profile, {
+    required ApiEditVersion editVersion,
+  }) => WebContentWorkflows(
+    database.repository, confirmSource: showWebSourceConsent,
+  ).importProfile(profile, editVersion: editVersion);
+
+  Future<Profile> _withAgeSecretKey(
+    Profile profile,
+    Future<Profile> Function(Profile profile) save,
+  ) async {
+    try {
+      return await save(profile);
+    } on AgeSecretKeyRequiredException {
+      final key = (await dialogs.showAgeSecretKeyInput())?.trim();
+      if (key == null || key.isEmpty) {
+        rethrow;
+      }
+      return save(profile.copyWith(ageSecretKey: key));
+    }
+  }
+
+  Future<Profile> _fromShareLinks(
+    Profile profile,
+    List<String> links, {
+    required ApiEditVersion editVersion,
+  }) async {
+    final appLocalizations = currentAppLocalizations;
+    final decoded = await _core.decodeShareLinks(links);
+    final taken = {...reservedCustomProxyNames};
+    final proxies = <Map<String, dynamic>>[];
+    for (final definitions in decoded) {
+      if (definitions.isEmpty) {
+        throw MessageException(appLocalizations.shareLinksInvalid);
+      }
+      for (final definition in definitions) {
+        final name = freeProxyName(linkProxyName(definition), taken);
+        proxies.add({...definition, 'name': name});
+      }
+    }
+    final first = proxies.first['name'] as String;
+    final label = proxies.length == 1
+        ? first
+        : appLocalizations.proxiesProfileLabel(first, proxies.length);
+    final config = await encodeYamlTask({'proxies': proxies});
+    return WebContentWorkflows(database.repository).importProfile(
+      profile.copyWith(label: profile.label.takeFirstValid([label])),
+      bytes: utf8.encode(config),
+      editVersion: editVersion,
+    );
+  }
+
+  Future<void> addProfileFormQrCode() async {
+    final version = database.repository.captureCreateVersion(ApiIdentity.profile);
+    final url = await globalState.safeRun(picker.pickerConfigQRCode);
+    if (url == null) return;
+    unawaited(addProfileFromLink(url, editVersion: version));
+  }
+}

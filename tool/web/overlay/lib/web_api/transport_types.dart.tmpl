@@ -1,0 +1,77 @@
+import 'dart:typed_data';
+
+class ApiRequest {
+  const ApiRequest({
+    required this.method,
+    required this.path,
+    this.body,
+    this.cancellation,
+  });
+
+  final String method;
+  final String path;
+  final String? body;
+  final ApiRequestCancellation? cancellation;
+}
+
+final class ApiRequestCancellation {
+  var _cancelled = false;
+  final _listeners = <void Function()>{};
+
+  bool get isCancelled => _cancelled;
+
+  void addListener(void Function() listener) {
+    if (_cancelled) {
+      listener();
+    } else {
+      _listeners.add(listener);
+    }
+  }
+
+  void removeListener(void Function() listener) => _listeners.remove(listener);
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    final listeners = _listeners.toList();
+    _listeners.clear();
+    for (final listener in listeners) {
+      try {
+        listener();
+      } catch (_) {}
+    }
+  }
+}
+
+class ApiResponse {
+  const ApiResponse(this.status, this.body);
+
+  final int status;
+  final String body;
+}
+
+class ApiBinaryResponse {
+  const ApiBinaryResponse(
+    this.status,
+    this.bytes, {
+    this.headers = const {},
+    this.complete = true,
+  });
+
+  final int status;
+  final Uint8List bytes;
+  final Map<String, String> headers;
+  final bool complete;
+}
+
+abstract interface class ApiAttachmentTransport {
+  Future<ApiBinaryResponse> readAttachment(
+    ApiRequest request, {
+    required int maxBytes,
+  });
+}
+
+abstract interface class ApiTransport {
+  Future<ApiResponse> send(ApiRequest request);
+  void close();
+}

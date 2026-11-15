@@ -1,0 +1,79 @@
+part of '../action.dart';
+
+typedef BackupDelivery = Future<bool> Function(Uint8List archive);
+typedef BackupFetch = Future<Uint8List?> Function();
+
+@Riverpod(keepAlive: true)
+class BackupAction extends _$BackupAction {
+  @override
+  void build() {}
+
+  Future<bool> backup(BackupDelivery deliver) async {
+    final choice = await showWebBackupSensitivity(restoring: false);
+    if (choice == null) return false;
+    return deliver(await WebBackupWorkflows(database.repository).download(
+      includeDavCredentials: choice.includeDavCredentials,
+    ));
+  }
+
+  Future<bool> restore(RestoreOption option, BackupFetch fetch) async {
+    final repository = database.repository;
+    final snapshot = await repository.readExternal('/api/v1/meta');
+    final version = repository.captureReadVersion(snapshot);
+    final choice = await showWebBackupSensitivity(
+      restoring: true, allowDavCredentials: option != RestoreOption.onlyProfiles,
+    );
+    if (choice == null) return false;
+    final archive = await fetch();
+    if (archive == null) return false;
+    final strategy = ref.read(appSettingProvider).restoreStrategy;
+    final backups = WebBackupWorkflows(repository);
+    final preview = await backups.prepare(
+      archive,
+      override: strategy == RestoreStrategy.override,
+      onlyProfiles: option == RestoreOption.onlyProfiles,
+      restoreDavCredentials: choice.includeDavCredentials,
+      editVersion: version,
+    );
+    final confirmed = await confirmWebBackupConversion(
+      preview, destructive: strategy == RestoreStrategy.override,
+    );
+    if (confirmed != true) return false;
+    await backups.confirm(preview);
+    await reloadWebSettings(ref);
+    return true;
+  }
+
+  Future<bool> backupToDav() async {
+    final repository = database.repository;
+    final settings = await repository.readExternal('/api/v1/settings');
+    final version = repository.captureReadVersion(settings);
+    final choice = await showWebBackupSensitivity(restoring: false);
+    if (choice == null) return false;
+    await WebDavWorkflows(repository, confirmSource: showWebSourceConsent).backup(
+      includeDavCredentials: choice.includeDavCredentials, editVersion: version);
+    return true;
+  }
+
+  Future<bool> restoreFromDav(RestoreOption option) async {
+    final repository = database.repository;
+    final settings = await repository.readExternal('/api/v1/settings');
+    final version = repository.captureReadVersion(settings);
+    final choice = await showWebBackupSensitivity(restoring: true,
+      allowDavCredentials: option != RestoreOption.onlyProfiles);
+    if (choice == null) return false;
+    final strategy = ref.read(appSettingProvider).restoreStrategy;
+    final dav = WebDavWorkflows(repository, confirmSource: showWebSourceConsent);
+    final prepared = await dav.prepareRestore(
+      override: strategy == RestoreStrategy.override,
+      onlyProfiles: option == RestoreOption.onlyProfiles,
+      restoreDavCredentials: choice.includeDavCredentials,
+      editVersion: version,
+    );
+    if (!await confirmWebBackupConversion(prepared.preview,
+        destructive: strategy == RestoreStrategy.override)) return false;
+    await dav.restore(prepared);
+    await reloadWebSettings(ref);
+    return true;
+  }
+}

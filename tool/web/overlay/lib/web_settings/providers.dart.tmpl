@@ -1,0 +1,60 @@
+import 'dart:async';
+
+import 'package:fl_clash/common/dialog.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/ui/ui.dart' show BannerLevel;
+import 'package:fl_clash/web_api/index.dart';
+import 'package:riverpod/riverpod.dart';
+
+import 'controller.dart';
+
+final webSettings = WebSettingsController(
+  repository: webApiRepository,
+  onFailure: (failure) =>
+      dialogs.showBanner(failure.message, level: BannerLevel.error),
+);
+
+final webSettingsControllerProvider = Provider<WebSettingsController>(
+  (ref) => webSettings,
+);
+final webSettingsInitialConfigProvider = Provider<Config>(
+  (ref) => Config.realFromJson(null),
+);
+final webSettingsConfigProvider = NotifierProvider<WebSettingsConfig, Config>(
+  WebSettingsConfig.new,
+);
+
+class WebSettingsConfig extends Notifier<Config> {
+  @override
+  Config build() {
+    final controller = ref.watch(webSettingsControllerProvider);
+    final subscription = controller.changes.listen((value) {
+      if (ref.mounted) state = value;
+    });
+    ref.onDispose(subscription.cancel);
+    return controller.isLoaded
+        ? controller.config
+        : ref.watch(webSettingsInitialConfigProvider);
+  }
+}
+
+mixin WebSettingsNotifierMixin<T> on AnyNotifier<T, T> {
+  WebSettingsSection get settingsSection;
+  T get value => state;
+  set value(T next) {
+    unawaited(setValueAsync(next).catchError((Object _) {}));
+  }
+
+  void update(T Function(T value) builder) {
+    unawaited(updateAsync(builder).catchError((Object _) {}));
+  }
+
+  ApiEditVersion captureEditVersion() =>
+      ref.read(webSettingsControllerProvider).captureEditVersion();
+  Future<void> setValueAsync(T next, {ApiEditVersion? editVersion}) => ref
+      .read(webSettingsControllerProvider)
+      .set(settingsSection, next, editVersion: editVersion);
+  Future<void> updateAsync(T Function(T value) builder) => ref
+      .read(webSettingsControllerProvider)
+      .update<T>(settingsSection, builder);
+}

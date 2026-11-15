@@ -1,0 +1,115 @@
+import 'dart:async';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/ui/icons/icons.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:flutter/widgets.dart';
+import 'package:prism_ui/navigation_action.dart';
+
+import 'auth_client.dart';
+import 'build_flag.dart';
+
+class WebLogoutScope extends StatefulWidget {
+  const WebLogoutScope({
+    super.key,
+    this.client = const BridgeWebAuthClient(),
+    required this.child,
+  });
+
+  final WebAuthClient client;
+  final Widget child;
+
+  @override
+  State<WebLogoutScope> createState() => _WebLogoutScopeState();
+}
+
+class _WebLogoutScopeState extends State<WebLogoutScope> {
+  bool _busy = false;
+  bool _requesting = false;
+
+  Future<void> logout(BuildContext origin) async {
+    if (_busy || !origin.mounted) return;
+    final l = origin.appLocalizations;
+    setState(() => _busy = true);
+    try {
+      final confirmed = await dialogs.showMessage(
+        context: origin,
+        title: l.webLogout,
+        message: TextSpan(text: l.webLogoutConfirm),
+        confirmText: l.webLogout,
+        cancelText: l.webCancel,
+        destructive: true,
+      );
+      if (confirmed != true || !origin.mounted) return;
+      if (mounted) setState(() => _requesting = true);
+      await widget.client.logout();
+      widget.client.redirectAfterAuth(updated: false);
+    } catch (error) {
+      if (mounted) setState(() => _requesting = false);
+      if (origin.mounted) {
+        await dialogs.showCommonDialog<void>(
+          context: origin,
+          child: Builder(
+            builder: (context) => AlertDialog(
+              title: l.webLogout,
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text(l.confirm),
+                ),
+              ],
+              child: Text(webAuthErrorMessage(l, error)),
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _requesting = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!webPanelBuild) return widget.child;
+    return _WebLogoutData(
+      owner: this,
+      busy: _busy,
+      requesting: _requesting,
+      child: widget.child,
+    );
+  }
+}
+
+class _WebLogoutData extends InheritedWidget {
+  const _WebLogoutData({
+    required this.owner,
+    required this.busy,
+    required this.requesting,
+    required super.child,
+  });
+
+  final _WebLogoutScopeState owner;
+  final bool busy;
+  final bool requesting;
+
+  @override
+  bool updateShouldNotify(_WebLogoutData oldWidget) =>
+      busy != oldWidget.busy || requesting != oldWidget.requesting;
+}
+
+NavigationAction? webLogoutNavigationAction(BuildContext context) {
+  if (!webPanelBuild) return null;
+  final scope = context.dependOnInheritedWidgetOfExactType<_WebLogoutData>();
+  if (scope == null) return null;
+  return NavigationAction(
+    glyph: AppGlyphs.lockOpen,
+    label: context.appLocalizations.webLogout,
+    isLoading: scope.requesting,
+    onPressed: scope.busy ? null : () => unawaited(scope.owner.logout(context)),
+  );
+}

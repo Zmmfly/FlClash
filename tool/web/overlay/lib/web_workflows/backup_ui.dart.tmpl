@@ -1,0 +1,161 @@
+import 'dart:convert';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:flutter/widgets.dart';
+
+import 'backup.dart';
+
+class WebBackupSensitivityChoice {
+  const WebBackupSensitivityChoice({required this.includeDavCredentials});
+
+  final bool includeDavCredentials;
+}
+
+Future<WebBackupSensitivityChoice?> showWebBackupSensitivity({
+  required bool restoring,
+  bool allowDavCredentials = true,
+}) => dialogs.showCommonDialog<WebBackupSensitivityChoice>(
+  child: WebBackupSensitivityDialog(
+    restoring: restoring,
+    allowDavCredentials: allowDavCredentials,
+  ),
+);
+
+/// Web-only consent; the entire DAV tuple is excluded until explicitly chosen.
+class WebBackupSensitivityDialog extends StatefulWidget {
+  const WebBackupSensitivityDialog({
+    super.key,
+    required this.restoring,
+    this.allowDavCredentials = true,
+  });
+
+  final bool restoring;
+  final bool allowDavCredentials;
+
+  @override
+  State<WebBackupSensitivityDialog> createState() =>
+      _WebBackupSensitivityDialogState();
+}
+
+class _WebBackupSensitivityDialogState
+    extends State<WebBackupSensitivityDialog> {
+  bool _includeDavCredentials = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = context.appLocalizations;
+    return AlertDialog(
+      title: l.webBackupSensitiveTitle,
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(l.cancel),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(
+            WebBackupSensitivityChoice(
+              includeDavCredentials:
+                  widget.allowDavCredentials && _includeDavCredentials,
+            ),
+          ),
+          child: Text(l.confirm),
+        ),
+      ],
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        spacing: 12,
+        children: [
+          Text(l.webBackupSensitiveDescription),
+          if (widget.allowDavCredentials)
+            ListItem.checkbox(
+              title: Text(
+                widget.restoring
+                    ? l.webBackupRestoreDavCredentials
+                    : l.webBackupIncludeDavCredentials,
+              ),
+              value: _includeDavCredentials,
+              onChanged: (value) =>
+                  setState(() => _includeDavCredentials = value == true),
+            ),
+          Text(l.webBackupDavExcludedTip),
+        ],
+      ),
+    );
+  }
+}
+
+Future<bool> confirmWebBackupConversion(
+  WebBackupPreview preview, {
+  required bool destructive,
+}) async =>
+    await dialogs.showCommonDialog<bool>(
+      child: WebBackupConversionDialog(
+        preview: preview,
+        destructive: destructive,
+      ),
+    ) ==
+    true;
+
+/// The preview remains read-only; only its independent confirmation may commit.
+class WebBackupConversionDialog extends StatelessWidget {
+  const WebBackupConversionDialog({
+    super.key,
+    required this.preview,
+    required this.destructive,
+  });
+
+  final WebBackupPreview preview;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = context.appLocalizations;
+    return AlertDialog(
+      title: l.webBackupLegacyConversionTitle,
+      destructive: destructive,
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: Text(l.cancel),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: Text(l.webBackupConfirmConversion),
+        ),
+      ],
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 560, maxHeight: 480),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            spacing: 12,
+            children: [
+              Text(l.webBackupLegacyConversionTip),
+              Text(l.webBackupSensitiveDescription),
+              Text(
+                preview.restoreDavCredentials
+                    ? l.webBackupRestoreDavCredentials
+                    : l.webBackupDavExcludedTip,
+              ),
+              for (final change in preview.changes) ...[
+                SelectableText(
+                  '${change.action}: ${change.kind} '
+                  '${change.name ?? change.id ?? ''} (${change.count})',
+                ),
+                if (change.settingsChange != null)
+                  SelectableText(
+                    const JsonEncoder.withIndent(
+                      '  ',
+                    ).convert(change.settingsChange!.toJson()),
+                  ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,312 @@
+import '../web_api/index.dart';
+import 'runtime.dart';
+
+const webRuntimeMappedMethods = <String>{
+  'core.init',
+  'core.initialized',
+  'core.gc',
+  'core.memory',
+  'proxy.list',
+  'proxy.select',
+  'proxy.definition',
+  'proxy.testDelay',
+  'proxy.validate',
+  'proxy.convert',
+  'shareLink.encode',
+  'shareLink.decode',
+  'filter.validate',
+  'geo.update',
+  'traffic.current',
+  'traffic.total',
+  'traffic.reset',
+  'connection.list',
+  'connection.count',
+  'connection.close',
+  'connection.closeAll',
+  'connection.reset',
+  'dns.clearCache',
+  'network.changed',
+  'log.start',
+  'log.stop',
+  'listener.start',
+  'listener.stop',
+  'route.watch',
+  'route.check',
+  'probe.outboundIp',
+  'probe.services',
+  'mitm.certificate',
+  'mitm.generateCertificate',
+  'mitm.validate',
+  'mitm.issueCertificate',
+  'mitm.runScript',
+  'mitm.exchanges',
+  'mitm.exchange',
+  'mitm.body',
+};
+
+Future<Map<String, Object?>> webRuntimeDispatchFrame(
+  Map<String, Object?> frame, {
+  WebRuntimeBinding? binding,
+}) async {
+  final id = frame['id'];
+  final response = <String, Object?>{if (id is String) 'id': id};
+  try {
+    if (frame.keys.any(
+          (key) => key != 'id' && key != 'method' && key != 'arguments',
+        ) ||
+        (id != null && id is! String) ||
+        frame['method'] is! String) {
+      throw const WebApiException(
+        'invalid_arguments',
+        'Invalid browser IPC call',
+      );
+    }
+    final method = frame['method'] as String;
+    if (!webRuntimeMappedMethods.contains(method)) {
+      throw const WebApiException(
+        'unsupported',
+        'This Core method is not mapped to a typed Web resource',
+      );
+    }
+    final runtime = binding ?? WebRuntimeBinding.instance;
+    response['result'] = await _dispatch(runtime, method, frame['arguments']);
+  } on WebApiException catch (error) {
+    response['result'] = null;
+    response['error'] = {
+      'code': error.code,
+      'message': error.message,
+      'details': error is WebApiUnknownCommitException
+          ? {'operationId': error.operationId}
+          : error.details,
+    };
+  } catch (_) {
+    response['result'] = null;
+    response['error'] = {
+      'code': 'invalid_arguments',
+      'message': 'The typed Web request could not be completed',
+      'details': null,
+    };
+  }
+  return response;
+}
+
+Map<String, Object?> _arguments(
+  Object? value,
+  Set<String> required, [
+  Set<String> optional = const {},
+]) {
+  final args = value == null && required.isEmpty
+      ? <String, Object?>{}
+      : apiObject(value, 'arguments');
+  if (args.keys.any(
+        (key) => !required.contains(key) && !optional.contains(key),
+      ) ||
+      required.any((key) => !args.containsKey(key))) {
+    throw const WebApiException(
+      'invalid_arguments',
+      'The Core arguments do not match the typed resource',
+    );
+  }
+  return args;
+}
+
+String _string(Map<String, Object?> args, String key) => args[key] as String;
+bool _bool(Map<String, Object?> args, String key) => args[key] as bool;
+String _queryPath(String resource, Map<String, String> values) =>
+    '$resource?${Uri(queryParameters: values).query}';
+
+Future<Object?> _dispatch(
+  WebRuntimeBinding r,
+  String method,
+  Object? arguments,
+) async {
+  switch (method) {
+    case 'core.init':
+      final args = _arguments(arguments, {'home-dir', 'version'});
+      if (_string(args, 'home-dir') != '/data') {
+        throw const WebApiException(
+          'unsupported_source',
+          'The browser cannot choose the Core home directory',
+        );
+      }
+      apiInteger(args['version'], 'arguments.version');
+      if ((await r.runtimeState())['initialized'] != true) {
+        throw const WebApiException(
+          'core_unavailable',
+          'The server-owned Core has not initialized',
+        );
+      }
+      return null;
+    case 'core.initialized':
+      _arguments(arguments, {});
+      return (await r.runtimeState())['initialized'];
+    case 'core.gc':
+      _arguments(arguments, {});
+      return r.command('core:gc', {});
+    case 'core.memory':
+      _arguments(arguments, {});
+      return r.read('memory');
+    case 'proxy.list':
+      _arguments(arguments, {});
+      return r.read('proxies');
+    case 'proxy.select':
+      final args = _arguments(arguments, {'group-name', 'proxy-name'});
+      return r.selectProxy(
+        _string(args, 'group-name'),
+        _string(args, 'proxy-name'),
+      );
+    case 'proxy.definition':
+      final args = _arguments(arguments, {'name'});
+      return r.read(
+        _queryPath('proxies/definition', {'name': _string(args, 'name')}),
+      );
+    case 'proxy.testDelay':
+      final args = _arguments(arguments, {'proxy-name', 'test-url', 'timeout'});
+      return r.query('proxies:delay', {
+        'proxyName': _string(args, 'proxy-name'),
+        'testUrl': _string(args, 'test-url'),
+        'timeoutMillis': apiInteger(args['timeout'], 'arguments.timeout'),
+      });
+    case 'proxy.validate':
+      final args = _arguments(arguments, {'proxies'});
+      return r.query('proxies:validate', {'proxies': apiList(args['proxies'])});
+    case 'proxy.convert':
+      final args = _arguments(arguments, {'path'});
+      return r.query('proxies:convert', {
+        'content': webRuntimeSources.readEditorBuffer(_string(args, 'path')),
+      });
+    case 'shareLink.encode':
+      final args = _arguments(arguments, {'proxies'});
+      return r.query('share-links:encode', {
+        'proxies': apiList(args['proxies']),
+      });
+    case 'shareLink.decode':
+      final args = _arguments(arguments, {'lines'});
+      return r.query('share-links:decode', {'lines': apiList(args['lines'])});
+    case 'filter.validate':
+      final args = _arguments(arguments, {'filters'});
+      return r.query('filters:validate', {'filters': apiList(args['filters'])});
+    case 'geo.update':
+      final args = _arguments(arguments, {'type'});
+      return r.command('geo:update', {'type': _string(args, 'type')});
+    case 'traffic.current':
+    case 'traffic.total':
+      final args = _arguments(arguments, {'only-proxy'});
+      return r.read(
+        _queryPath('traffic', {
+          'total': (method == 'traffic.total').toString(),
+          'onlyProxy': _bool(args, 'only-proxy').toString(),
+        }),
+      );
+    case 'traffic.reset':
+      _arguments(arguments, {});
+      return r.command('traffic:reset', {});
+    case 'connection.list':
+      _arguments(arguments, {});
+      return r.read('connections');
+    case 'connection.count':
+      _arguments(arguments, {});
+      return r.read('connections/count');
+    case 'connection.close':
+      final args = _arguments(arguments, {'id'});
+      return r.command('connections:close', {'id': _string(args, 'id')});
+    case 'connection.closeAll':
+      _arguments(arguments, {});
+      return r.command('connections:close-all', {});
+    case 'connection.reset':
+      _arguments(arguments, {});
+      return r.command('connections:reset', {});
+    case 'dns.clearCache':
+      _arguments(arguments, {});
+      return r.command('dns:clear-cache', {});
+    case 'network.changed':
+      _arguments(arguments, {});
+      return r.command('network:changed', {});
+    case 'log.start':
+    case 'log.stop':
+      _arguments(arguments, {});
+      r.setTopic('log', method == 'log.start');
+      return null;
+    case 'listener.start':
+    case 'listener.stop':
+      _arguments(arguments, {});
+      return r.command('listener:set-enabled', {
+        'enabled': method == 'listener.start',
+      });
+    case 'route.watch':
+      final args = _arguments(arguments, {'watch'});
+      r.setTopic('route', _bool(args, 'watch'));
+      return r.read('route');
+    case 'route.check':
+      final args = _arguments(arguments, {'routes'});
+      return r.query('route:check', {'routes': apiList(args['routes'])});
+    case 'probe.outboundIp':
+      final args = _arguments(arguments, {'proxy-name', 'urls', 'timeout'});
+      return r.query('probes/outbound-ip', {
+        'proxyName': _string(args, 'proxy-name'),
+        'urls': apiList(args['urls']),
+        'timeoutMillis': apiInteger(args['timeout'], 'arguments.timeout'),
+      });
+    case 'probe.services':
+      final args = _arguments(arguments, {'proxy-name', 'names', 'timeout'});
+      return r.query('probes/services', {
+        'proxyName': _string(args, 'proxy-name'),
+        'names': apiList(args['names']),
+        'timeoutMillis': apiInteger(args['timeout'], 'arguments.timeout'),
+      });
+    case 'mitm.certificate':
+      _arguments(arguments, {});
+      return r.read('mitm/certificate');
+    case 'mitm.generateCertificate':
+      _arguments(arguments, {});
+      return r.command('mitm/certificate:generate', {});
+    case 'mitm.validate':
+      final args = _arguments(arguments, {
+        'hostname',
+        'url-rewrite',
+        'header-rewrite',
+        'body-rewrite',
+        'map-local',
+        'script',
+      });
+      return r.query('mitm:validate', args);
+    case 'mitm.issueCertificate':
+      final args = _arguments(arguments, {'host'});
+      return r.query('mitm/certificate:issue', {'host': _string(args, 'host')});
+    case 'mitm.runScript':
+      final args = _arguments(arguments, {'name'});
+      return r.command('mitm/scripts:run', {
+        'scriptName': _string(args, 'name'),
+      });
+    case 'mitm.exchanges':
+      final args = _arguments(arguments, {'id'});
+      return r.localCapture(
+        await r.read(
+          _queryPath('mitm/captures', {'connectionId': _string(args, 'id')}),
+        ),
+        list: true,
+      );
+    case 'mitm.exchange':
+      final args = _arguments(arguments, {'id'});
+      return r.localCapture(
+        await r.read(
+          _queryPath('mitm/capture', {
+            'id': r.captureWireId(apiInteger(args['id'], 'arguments.id')),
+          }),
+        ),
+      );
+    case 'mitm.body':
+      final args = _arguments(arguments, {'id', 'response'});
+      return r.read(
+        _queryPath('mitm/body', {
+          'id': r.captureWireId(apiInteger(args['id'], 'arguments.id')),
+          'response': _bool(args, 'response').toString(),
+        }),
+      );
+    default:
+      throw const WebApiException(
+        'unsupported',
+        'This Core method has no typed Web mapping',
+      );
+  }
+}

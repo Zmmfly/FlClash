@@ -3,7 +3,11 @@ import 'package:fl_clash/web_auth/account_view.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'web_account_test.dart' as account;
+import 'web_navigation_test.dart' as navigation;
+
 void main() {
+  navigation.NavigationBinding();
   testWidgets('WEB_PANEL defaults off and contributes no account row or text', (
     tester,
   ) async {
@@ -19,4 +23,39 @@ void main() {
     expect(find.byType(Text), findsNothing);
     expect(tester.takeException(), isNull);
   });
+  for (final layout in navigation.Layout.values) {
+    testWidgets(
+      'WEB_PANEL off keeps $layout navigation untouched and without logout',
+      (tester) async {
+        final client = account.FakeAuth();
+        final key = await navigation.pumpNavigation(
+          tester,
+          layout,
+          client: client,
+        );
+        expect(find.text('Log out'), findsNothing);
+        expect(client.sessions, 0);
+        expect(client.logouts, 0);
+        expect(key.currentState!.selected, 1);
+        if (layout == navigation.Layout.dock) {
+          final dock = tester.widget<NavigationDock>(
+            find.byType(NavigationDock),
+          );
+          expect(dock.action, isNull);
+          expect(dock.destinations.length, 3);
+        } else if (layout == navigation.Layout.bar) {
+          final bar = tester.widget<NavigationBar>(find.byType(NavigationBar));
+          expect(bar.action, isNull);
+          expect(bar.destinations.length, 3);
+        } else {
+          final sidebar = tester.widget<NavigationSidebar>(
+            find.byType(NavigationSidebar),
+          );
+          expect(sidebar.footerAction, isNull);
+          expect(sidebar.destinations, navigation.destinations);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 }

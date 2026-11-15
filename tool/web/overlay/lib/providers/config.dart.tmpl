@@ -1,0 +1,139 @@
+import 'package:fl_clash/models/models.dart';
+import 'package:riverpod/riverpod.dart';
+import 'package:fl_clash/web_api/errors.dart';
+import 'package:fl_clash/web_settings/controller.dart';
+import 'package:fl_clash/web_settings/providers.dart';
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+
+part 'generated/config.g.dart';
+
+@riverpod
+class AppSetting extends _$AppSetting
+    with WebSettingsNotifierMixin<AppSettingProps> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.app;
+  @override
+  AppSettingProps build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.appSettingProps),
+  );
+}
+
+@Riverpod(keepAlive: true)
+class WindowSetting extends _$WindowSetting
+    with WebSettingsNotifierMixin<WindowProps> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.window;
+  @override
+  WindowProps build() =>
+      ref.watch(webSettingsConfigProvider.select((value) => value.windowProps));
+}
+
+@riverpod
+class VpnSetting extends _$VpnSetting with WebSettingsNotifierMixin<VpnProps> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.vpn;
+  @override
+  VpnProps build() =>
+      ref.watch(webSettingsConfigProvider.select((value) => value.vpnProps));
+}
+
+@riverpod
+class NetworkSetting extends _$NetworkSetting
+    with WebSettingsNotifierMixin<NetworkProps> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.network;
+  @override
+  NetworkProps build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.networkProps),
+  );
+}
+
+@riverpod
+class ThemeSetting extends _$ThemeSetting
+    with WebSettingsNotifierMixin<ThemeProps> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.theme;
+  @override
+  ThemeProps build() =>
+      ref.watch(webSettingsConfigProvider.select((value) => value.themeProps));
+}
+
+@riverpod
+class CurrentProfileId extends _$CurrentProfileId
+    with WebSettingsNotifierMixin<int?> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.currentProfile;
+  @override
+  int? build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.currentProfileId),
+  );
+}
+
+@riverpod
+class DavSetting extends _$DavSetting with WebSettingsNotifierMixin<DAVProps?> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.dav;
+  @override
+  DAVProps? build() =>
+      ref.watch(webSettingsConfigProvider.select((value) => value.davProps));
+}
+
+@riverpod
+class HotKeyActions extends _$HotKeyActions
+    with WebSettingsNotifierMixin<List<HotKeyAction>> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.hotkeys;
+  @override
+  List<HotKeyAction> build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.hotKeyActions),
+  );
+}
+
+@riverpod
+class ProxiesStyleSetting extends _$ProxiesStyleSetting
+    with WebSettingsNotifierMixin<ProxiesStyleProps> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.proxiesStyle;
+  @override
+  ProxiesStyleProps build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.proxiesStyleProps),
+  );
+}
+
+@Riverpod(name: 'patchClashConfigProvider')
+class _PatchClashConfig extends _$PatchClashConfig
+    with WebSettingsNotifierMixin<PatchClashConfig> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.patch;
+  @override
+  PatchClashConfig build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.patchClashConfig),
+  );
+}
+
+@riverpod
+class ExcludeSSIDs extends _$ExcludeSSIDs
+    with WebSettingsNotifierMixin<List<String>> {
+  @override
+  WebSettingsSection get settingsSection => WebSettingsSection.excludeSSIDs;
+  @override
+  List<String> build() => ref.watch(
+    webSettingsConfigProvider.select((value) => value.excludeSSIDs),
+  );
+}
+
+@Riverpod(name: 'configProvider')
+Config _config(Ref ref) => ref.watch(webSettingsConfigProvider);
+
+void writeConfig(Ref ref, Config config) {
+  throw const WebApiProtocolException(
+    'Whole Config writes are not a Web settings command; use server backup restore',
+  );
+}
+
+Future<void> reloadWebSettings(Ref ref) =>
+    ref.read(webSettingsControllerProvider).load(refresh: true);
+
+List<Override> buildConfigOverrides(Config config) => [
+  webSettingsInitialConfigProvider.overrideWithValue(config),
+];

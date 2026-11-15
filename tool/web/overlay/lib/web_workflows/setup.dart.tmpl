@@ -1,0 +1,694 @@
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/providers/state.dart' show appProxiesPayload;
+import 'package:yaml/yaml.dart' as source_yaml;
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_evaluate/index.dart';
+import 'package:fl_clash/web_runtime/runtime.dart';
+import 'package:fl_clash/web_settings/controller.dart';
+
+import 'source_consent.dart';
+import 'sources.dart';
+
+class WebSetupSourceConsentRequired extends WebApiException {
+  const WebSetupSourceConsentRequired(this.retry)
+    : super(
+        'source_authorization_required',
+        'Explicit foreground preparation is required',
+      );
+  final Future<void> Function()? retry;
+}
+
+/// Kept outside the shared/freezed schema: every field comes from one read.
+class _WebSetupFrame {
+  const _WebSetupFrame({
+    required this.version,
+    required this.profile,
+    required this.settings,
+    required this.selectedMap,
+    required this.options,
+    required this.base,
+    required this.moduleIds,
+    required this.scriptContent,
+    required this.sourceIdentity,
+  });
+
+  final ApiEditVersion version;
+  final Profile? profile;
+  final Config settings;
+  final Map<String, String> selectedMap;
+  final CoreOptions options;
+  final ProfileBase? base;
+  final List<int> moduleIds;
+  final String? scriptContent;
+  final String sourceIdentity;
+}
+
+class _WebSetupCandidate {
+  const _WebSetupCandidate(this.state, this.frame, this.payload);
+  final SetupState state;
+
+  final _WebSetupFrame frame;
+  final Map<String, Object?> payload;
+}
+
+final _setupFrames = Expando<_WebSetupFrame>('web-setup-read-provenance');
+final _setupCandidateStores = Expando<Map<String, _WebSetupCandidate>>(
+  'web-setup-candidates',
+);
+var _nextSetupCandidate = 0;
+
+Map<String, _WebSetupCandidate> _candidates(WebApiRepository repository) {
+  final existing = _setupCandidateStores[repository];
+  if (existing != null) return existing;
+  final candidates = <String, _WebSetupCandidate>{};
+  repository.sessionChanges.listen(
+    (_) => candidates.clear(),
+    onDone: candidates.clear,
+  );
+  _setupCandidateStores[repository] = candidates;
+  return candidates;
+}
+
+typedef WebBuiltProfile = ({
+  String yaml,
+  String md5,
+  ConfigCounts counts,
+  SetupBase? base,
+});
+
+class WebSetupWorkflows {
+  const WebSetupWorkflows(this.repository);
+
+  final WebApiRepository repository;
+
+  Future<SetupState> read(int? profileId) async {
+    final receipt = await repository.readExternal(
+      profileId == null
+          ? '/api/v1/settings'
+          : '/api/v1/profiles/${repository.codec.wireId(ApiIdentity.profile, profileId)}/setup-state',
+    );
+    final data = profileId == null
+        ? null
+        : apiObject(receipt.data, 'setup snapshot');
+    final settings = WebSettingsData.decode(
+      data == null ? receipt.data : data['settings'],
+      repository.codec,
+    ).config;
+    final profile = data == null
+        ? null
+        : repository.codec.profile(data['profile']);
+    if (profile?.id != profileId) {
+      throw const WebApiProtocolException('Setup snapshot has another owner');
+    }
+    final version = repository.captureReadVersion(
+      receipt,
+      kind: profileId == null ? ApiIdentity.configuration : ApiIdentity.profile,
+    );
+    final profileType = profile?.type ?? ProfileType.file;
+    final extendType = profile?.extendType ?? ExtendType.standard;
+    final patch = settings.patchClashConfig;
+    final overrides = profileType == ProfileType.custom
+        ? profile!.overrides.overAppTun(
+            patch.tunOverride,
+            patch.tunOverrideKeys,
+          )
+        : ProfileOverrides(
+            dns: patch.dns,
+            dnsOverrideKeys: patch.dnsOverrideKeys.intersection(
+              DnsOverrideKey.normalProfileKeys,
+            ),
+            tun: patch.tunOverride,
+            tunOverrideKeys: patch.tunOverrideKeys,
+            dialerProxies: extendType == ExtendType.standard
+                ? profile?.overrides.dialerProxies ??
+                      const DialerProxyOverrides()
+                : const DialerProxyOverrides(),
+          );
+    if (overrides.dialerProxies.isUnreadable) {
+      overrides.dialerProxies.validated;
+    }
+    final groups = data == null
+        ? <ProxyGroup>[]
+        : [
+            for (final row in apiList(data['groups']))
+              repository.codec.proxyGroup(row),
+          ];
+    final rules = data == null
+        ? <Rule>[]
+        : [
+            for (final row in apiList(data['rules']))
+              repository.codec.rule(row),
+          ];
+    final globalRules = data == null
+        ? <Rule>[]
+        : [
+            for (final row in apiList(data['globalRules']))
+              repository.codec.rule(row),
+          ];
+    final disabled = data == null
+        ? <int>{}
+        : {
+            for (final id in apiList(data['disabledRuleIds']))
+              repository.codec.id(ApiIdentity.rule, id),
+          };
+    final dialers = data == null
+        ? <ProxyDialer>[]
+        : [
+            for (final row in apiList(data['proxyDialers']))
+              repository.codec.proxyDialer(row),
+          ];
+    if (groups.any((group) => group.profileId != profileId) ||
+        rules.any((rule) => rule.profileId != profileId) ||
+        globalRules.any((rule) => rule.profileId != null) ||
+        dialers.any((dialer) => dialer.profileId != profileId) ||
+        dialers.map((dialer) => dialer.proxyId).toSet().length !=
+            dialers.length) {
+      throw const WebApiProtocolException('Setup snapshot crosses its owner');
+    }
+    final providerValues = data == null
+        ? <String, Object?>{}
+        : apiObject(data['profileProviders'], 'setup profile providers');
+    final providers = {
+      for (final entry in providerValues.entries)
+        entry.key: repository.codec.id(ApiIdentity.profile, entry.value),
+    };
+    final script = data?['script'] == null
+        ? null
+        : repository.codec.script(data!['script']);
+    if (script?.id != profile?.scriptId) {
+      throw const WebApiProtocolException(
+        'Setup script does not match its owner',
+      );
+    }
+    final scriptContent = data?['scriptContent'] == null
+        ? null
+        : _scriptText(data!['scriptContent'], script);
+    if ((script == null) != (scriptContent == null)) {
+      throw const WebApiProtocolException('Setup script content is incomplete');
+    }
+    final modules = data == null
+        ? <MitmModule>[]
+        : [
+            for (final row in apiList(data['mitmModules']))
+              repository.codec.mitmModule(row),
+          ];
+    final base = data?['base'] == null
+        ? null
+        : ProfileBase.fromJson(apiObject(data!['base']));
+    if (profileId != null &&
+        (base == null ||
+            !RegExp(r'^[0-9a-f]{64}$').hasMatch(base.digest) ||
+            base.proxies < 0 ||
+            base.proxyGroups < 0 ||
+            base.rules < 0)) {
+      throw const WebApiProtocolException('Setup source base is incomplete');
+    }
+    final options = data == null
+        ? CoreOptions(
+            testUrl: patch.testUrl,
+            skipCertVerify: !settings.appSettingProps.checkCertificate,
+            delayTestTimeout: settings.appSettingProps.delayTestTimeout,
+            mitmCapture: patch.mitm.capture,
+          )
+        : CoreOptions.fromJson(apiObject(data['options']));
+    final selected = data == null
+        ? <String, String>{}
+        : _strings(data['selectedMap'], 'setup selected map');
+    final state = SetupState(
+      profileId: profileId,
+      profileLastUpdateDate: profile?.lastUpdateDate?.millisecondsSinceEpoch,
+      profileType: profileType,
+      extendType: extendType,
+      rules: profileType == ProfileType.custom ? rules : const [],
+      proxyGroups: profileType == ProfileType.custom ? groups : const [],
+      addedRules:
+          profileType != ProfileType.custom && extendType == ExtendType.standard
+          ? [
+              for (final rule in [...rules, ...globalRules])
+                if (!disabled.contains(rule.id)) rule,
+            ]
+          : const [],
+      script: script,
+      overrides: overrides,
+      clashProviders: data == null
+          ? const []
+          : [
+              for (final row in apiList(data['ruleProviders']))
+                repository.codec.clashProvider(row),
+            ],
+      profileProviders: providers,
+      appProxies: data == null
+          ? const []
+          : [
+              for (final row in apiList(data['customProxies']))
+                repository.codec.customProxy(row),
+            ],
+      proxyDialers: {
+        for (final dialer in dialers) dialer.proxyId: dialer.target,
+      },
+      matchTarget:
+          profileType != ProfileType.custom && extendType == ExtendType.standard
+          ? profile?.matchTarget
+          : null,
+      // Server materializes committed module content/resources by typed binding.
+      mitmModules: const [],
+    );
+    _setupFrames[state] = _WebSetupFrame(
+      version: version,
+      profile: profile,
+      settings: settings,
+      selectedMap: selected,
+      options: options,
+      base: base,
+      moduleIds: mitmFeature && patch.mitm.enable
+          ? [
+              for (final module in modules)
+                if (module.enabled) module.id,
+            ]
+          : const [],
+      scriptContent: scriptContent,
+      sourceIdentity: crypto.sha256
+          .convert(utf8.encode(jsonEncode(data ?? {'settings': receipt.data})))
+          .toString(),
+    );
+    return state;
+  }
+
+  _WebSetupFrame _frame(SetupState state) {
+    final frame = _setupFrames[state];
+    if (frame == null) {
+      throw const WebApiException(
+        'edit_baseline_required',
+        'Read a single authoritative setup snapshot before building',
+      );
+    }
+    return frame;
+  }
+
+  bool sameSource(SetupState a, SetupState b) =>
+      _frame(a).sourceIdentity == _frame(b).sourceIdentity;
+
+  void _requireFrameVersion(_WebSetupFrame frame) {
+    repository.requireReadVersion(frame.version);
+    if (repository.revision != frame.version.revision) {
+      throw const WebApiException(
+        'source_revision_conflict',
+        'The known source revision changed; keep the old draft and explicitly reload',
+      );
+    }
+  }
+
+  PatchClashConfig patchOf(SetupState state, {required bool safeMode}) {
+    final patch = _frame(state).settings.patchClashConfig;
+    return patch.copyWith(
+      // The panel/controller is server-owned, never a candidate listener.
+      externalController: ExternalControllerStatus.close,
+      secret: '',
+      tun: safeMode ? patch.tun.copyWith(enable: false) : patch.tun,
+    );
+  }
+
+  NetworkProps networkOf(SetupState state) =>
+      _frame(state).settings.networkProps;
+
+  SetupParams paramsOf(SetupState state) => SetupParams(
+    selectedMap: _frame(state).selectedMap,
+    options: _frame(state).options,
+  );
+
+  Future<WebBuiltProfile> build(
+    SetupState state, {
+    required String defaultUA,
+    required bool safeMode,
+    Future<bool> Function(WebSourceConsentPreparation)? confirmSource,
+    Future<void> Function()? onForegroundRetry,
+    Set<String> preparedSources = const {},
+  }) async {
+    final frame = _frame(state);
+    _requireFrameVersion(frame);
+    final profile = frame.profile;
+    final payload = <String, Object?>{
+      'profileId': profile == null
+          ? null
+          : repository.codec.wireId(ApiIdentity.profile, profile.id),
+      'selectedMap': frame.selectedMap,
+      'options': frame.options.toJson(),
+    };
+    if (profile == null) {
+      return _retain(
+        state,
+        frame,
+        payload,
+        '',
+        jsonEncode({
+          'settings': frame.settings.patchClashConfig.toJson(),
+          'network': frame.settings.networkProps.toJson(),
+          'options': frame.options.toJson(),
+        }).toMd5(),
+        configCountsOf(const {}),
+      );
+    }
+    final isCustom = profile.type == ProfileType.custom;
+    WebEvaluationResult? evaluation;
+    if (!isCustom &&
+        profile.extendType == ExtendType.script &&
+        frame.scriptContent?.isNotEmpty == true) {
+      evaluation = await WebEvaluateService(repository).evaluateCommitted(
+        profileId: profile.id,
+        scriptId: state.script!.id,
+        editVersion: frame.version,
+      );
+      if (evaluation.evaluationId == null || evaluation.preview) {
+        throw const WebApiProtocolException(
+          'Committed evaluation has no provenance',
+        );
+      }
+    }
+    final prepared = await _prepareProviderSources(
+      frame,
+      evaluation,
+      attempted: preparedSources,
+      confirmSource: confirmSource,
+      onForegroundRetry: onForegroundRetry,
+    );
+    if (prepared != null) {
+      // Refresh admission changes revision. Discard this frame/evaluation rather than restamping it.
+      return build(
+        await read(profile.id),
+        defaultUA: defaultUA,
+        safeMode: safeMode,
+        confirmSource: confirmSource,
+        onForegroundRetry: onForegroundRetry,
+        preparedSources: {...preparedSources, prepared},
+      );
+    }
+    final useBase = !isCustom && evaluation == null;
+    final rawConfig = isCustom
+        ? <String, dynamic>{
+            'proxies': appProxiesPayload(
+              state.appProxies,
+              dialers: state.proxyDialers,
+              groups: state.proxyGroups,
+            ),
+          }
+        : evaluation?.config ?? frame.base!.config;
+    final usedProfiles = {for (final group in state.proxyGroups) ...?group.use};
+    final usedRules = {
+      for (final rule in state.rules) ...rule.ruleSets,
+      if (isCustom) ...state.overrides.ruleSets,
+    };
+    final injectedProfiles = <String, dynamic>{};
+    final injectedRules = <String, dynamic>{};
+    final bindings = <String, Object?>{
+      'profileProviders': <String, String>{},
+      'ruleProviders': <String, String>{},
+      'mitmModules': [
+        for (final id in frame.moduleIds)
+          repository.codec.wireId(ApiIdentity.mitmModule, id),
+      ],
+    };
+    for (final entry in state.profileProviders.entries) {
+      if (!usedProfiles.contains(entry.key)) continue;
+      injectedProfiles[entry.key] = {
+        'type': 'file',
+        ...?state.overrides.proxyProviders[entry.key]?.definition,
+      };
+      (bindings['profileProviders'] as Map<String, String>)[entry.key] =
+          repository.codec.wireId(ApiIdentity.profile, entry.value);
+    }
+    for (final provider in state.clashProviders) {
+      if (!usedRules.contains(provider.label)) continue;
+      injectedRules[provider.label] = {
+        'type': 'file',
+        'behavior': provider.behavior.name,
+        'format': provider.format.name,
+      };
+      (bindings['ruleProviders'] as Map<String, String>)[provider.label] =
+          repository.codec.wireId(ApiIdentity.clashProvider, provider.id);
+    }
+    final network = frame.settings.networkProps;
+    final real = await makeRealProfileTask(
+      MakeRealProfileState(
+        // The Web-staged pure task never constructs or migrates a filesystem path.
+        profilesPath: '',
+        profileId: profile.id,
+        rawConfig: rawConfig,
+        realPatchConfig: patchOf(state, safeMode: safeMode),
+        overrides: state.overrides,
+        bypassPrivateRoute: network.bypassPrivateRoute,
+        keepEmptyDnsOverrides: !isCustom,
+        appendSystemDns: network.appendSystemDns,
+        proxyGroups: state.proxyGroups,
+        rules: state.rules,
+        addedRules: state.addedRules,
+        defaultUA: defaultUA,
+        authentication: network.authentication.credentials,
+        injectedProxyProviders: injectedProfiles,
+        injectedRuleProviders: injectedRules,
+        matchTarget: useBase && state.matchTarget?.trim().isNotEmpty != true
+            ? lastMatchTarget(frame.base!.matchRules)
+            : state.matchTarget,
+        safeMode: safeMode,
+        mitmModules: const [],
+      ),
+    );
+    final dialers = useBase
+        ? state.overrides.dialerProxies.validated
+        : const <String, String>{};
+    final request = <String, Object?>{
+      'id': repository.codec.wireId(ApiIdentity.profile, profile.id),
+      if (useBase) 'overlay': real.yaml else 'candidateYaml': real.yaml,
+      if (evaluation != null) 'evaluationId': evaluation.evaluationId,
+      if (dialers.isNotEmpty) 'dialerProxies': dialers,
+      'resourceBindings': bindings,
+    };
+    final receipt = await repository.queryExternal(
+      '/api/v1/profiles:build',
+      request,
+    );
+    _requireFrameVersion(frame);
+    if (receipt.revision != frame.version.revision) {
+      throw const WebApiException(
+        'source_revision_conflict',
+        'The source changed while building; reload without applying this candidate',
+      );
+    }
+    final built = apiObject(receipt.data, 'built profile');
+    final text = built['yaml'];
+    final digest = built['digest'];
+    if (text is! String ||
+        utf8.encode(text).length > 32 * 1024 * 1024 ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest)) {
+      throw const WebApiProtocolException('Invalid typed profile build');
+    }
+    final parsed = source_yaml.loadYaml(text);
+    if (parsed is! Map)
+      throw const WebApiProtocolException('Built profile is not a mapping');
+    payload.addAll({
+      for (final entry in request.entries)
+        if (entry.key != 'id') entry.key: entry.value,
+    });
+    return _retain(state, frame, payload, text, digest, configCountsOf(parsed));
+  }
+
+  Future<String?> _prepareProviderSources(
+    _WebSetupFrame frame,
+    WebEvaluationResult? evaluation, {
+    required Set<String> attempted,
+    Future<bool> Function(WebSourceConsentPreparation)? confirmSource,
+    Future<void> Function()? onForegroundRetry,
+  }) async {
+    final profile = frame.profile!;
+    final wire = repository.codec.wireId(ApiIdentity.profile, profile.id);
+    final receipt = await repository.readExternal(
+      '/api/v1/runtime/provider-sources?${Uri(queryParameters: {'profileId': wire, if (evaluation != null) 'evaluationId': evaluation.evaluationId!}).query}',
+    );
+    _requireFrameVersion(frame);
+    if (receipt.revision != frame.version.revision)
+      throw const WebApiException(
+        'source_revision_conflict',
+        'Provider source snapshot changed',
+      );
+    final sources = apiList(receipt.data, 'setup provider sources');
+    if (sources.length > 4096)
+      throw const WebApiProtocolException('Provider inventory budget exceeded');
+    final seen = <String>{};
+    for (final value in sources) {
+      final source = apiObject(value, 'setup provider source');
+      final id = source['id'];
+      final version = source['sourceVersion'];
+      final phase = source['phase'];
+      final purpose = source['purpose'];
+      if (id is! String ||
+          !RegExp(r'^[1-9][0-9]{0,77}$').hasMatch(id) ||
+          BigInt.parse(id).bitLength > 256 ||
+          !seen.add(id) ||
+          source['profileId'] != wire ||
+          source['name'] is! String ||
+          version is! String ||
+          !RegExp(r'^[0-9a-f]{64}$').hasMatch(version) ||
+          !const {'proxy-providers', 'rule-providers'}.contains(purpose) ||
+          !const {
+            'ready',
+            'unprepared',
+            'pending',
+            'failed',
+            'unknown',
+          }.contains(phase)) {
+        throw const WebApiProtocolException('Invalid setup provider source');
+      }
+      if (phase == 'ready') continue;
+      if (phase == 'pending' || phase == 'unknown')
+        throw const WebApiException(
+          'provider_preparation_pending',
+          'Resolve the existing provider preparation before another operation',
+        );
+      if (attempted.contains(id) || attempted.length >= 4096)
+        throw const WebApiException(
+          'provider_preparation_unstable',
+          'Provider preparation did not converge',
+        );
+      final sourceService = WebSourceWorkflows(repository);
+      final preparation = await sourceService.prepare(
+        purpose: 'external-provider-refresh',
+        key: {'kind': 'external-provider', 'id': id},
+        editVersion: frame.version,
+      );
+      String? authorizationId;
+      if (preparation.requiresPrivateNetworkConfirmation) {
+        if (confirmSource == null)
+          throw WebSetupSourceConsentRequired(onForegroundRetry);
+        if (!await confirmSource(preparation))
+          throw const WebApiException(
+            'source_authorization_cancelled',
+            'Source permission cancelled',
+          );
+        authorizationId = (await sourceService.authorize(
+          preparation,
+          editVersion: frame.version,
+        )).authorizationId;
+      }
+      final result = apiObject(
+        await WebRuntimeBinding.instance
+            .command('/api/v1/runtime/provider-sources:refresh', {
+              'id': id,
+              'purpose': purpose,
+              if (authorizationId != null) 'authorizationId': authorizationId,
+            }, editVersion: frame.version),
+      );
+      if (result['id'] != id ||
+          result['sourceVersion'] != version ||
+          result['prepared'] != true ||
+          result['requiresApply'] != true) {
+        throw const WebApiProtocolException(
+          'Provider preparation did not confirm its original source',
+        );
+      }
+      return id;
+    }
+    return null;
+  }
+
+  SetupState stateOf(WebBuiltProfile built) {
+    final candidate = _candidates(repository)[built.base?.path];
+    if (candidate == null)
+      throw const WebApiProtocolException('Setup candidate expired');
+    return candidate.state;
+  }
+
+  WebBuiltProfile _retain(
+    SetupState state,
+    _WebSetupFrame frame,
+    Map<String, Object?> payload,
+    String yaml,
+    String digest,
+    ConfigCounts counts,
+  ) {
+    final candidates = _candidates(repository);
+    if (candidates.length >= 16) {
+      throw const WebApiException(
+        'candidate_limit',
+        'Close an existing preview before building another',
+      );
+    }
+    final handle = 'flclash-web-setup:${_nextSetupCandidate++}';
+    candidates[handle] = _WebSetupCandidate(state, frame, payload);
+    return (
+      yaml: yaml,
+      md5: digest,
+      counts: counts,
+      base: SetupBase(path: handle, overlay: ''),
+    );
+  }
+
+  Future<void> apply(WebBuiltProfile built) async {
+    final candidate = _candidates(repository)[built.base?.path];
+    if (candidate == null) {
+      throw const WebApiProtocolException(
+        'The Web setup candidate has expired',
+      );
+    }
+    _requireFrameVersion(candidate.frame);
+    final result = apiObject(
+      await WebRuntimeBinding.instance.command(
+        '/api/v1/runtime:apply',
+        candidate.payload,
+        editVersion: candidate.frame.version,
+      ),
+    );
+    if (result['actualConfig'] == 'default-fallback') {
+      throw const WebApiException(
+        'config_rejected',
+        'The candidate was rejected; the server activated its default configuration',
+      );
+    }
+    final digest = result['digest'];
+    if (result['actualConfig'] != 'candidate' ||
+        result['profileId'] != candidate.payload['profileId'] ||
+        digest is! String ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(digest) ||
+        candidate.frame.profile != null && digest != built.md5) {
+      throw const WebApiProtocolException(
+        'Runtime result does not confirm this candidate',
+      );
+    }
+  }
+
+  void release(WebBuiltProfile? built) {
+    if (built != null) _candidates(repository).remove(built.base?.path);
+  }
+
+  String _scriptText(Object? value, Script? script) {
+    final data = apiObject(value, 'setup script content');
+    final key = apiObject(data['key']);
+    if (script == null ||
+        key['kind'] != 'script' ||
+        repository.codec.id(ApiIdentity.script, key['id']) != script.id ||
+        data['bytes'] is! String ||
+        data['encrypted'] != false) {
+      throw const WebApiProtocolException('Invalid setup script content');
+    }
+    final bytes = base64Decode(data['bytes'] as String);
+    if (bytes.length > 32 * 1024 * 1024 ||
+        data['size'] != bytes.length ||
+        data['sha256'] != crypto.sha256.convert(bytes).toString()) {
+      throw const WebApiProtocolException(
+        'Setup script content digest mismatch',
+      );
+    }
+    return utf8.decode(bytes);
+  }
+
+  Map<String, String> _strings(Object? value, String path) => {
+    for (final entry in apiObject(value, path).entries)
+      entry.key: entry.value is String
+          ? entry.value as String
+          : throw WebApiProtocolException('$path contains a non-string value'),
+  };
+}

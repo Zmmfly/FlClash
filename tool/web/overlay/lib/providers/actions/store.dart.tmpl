@@ -1,0 +1,22 @@
+part of '../action.dart';
+
+@Riverpod(keepAlive: true)
+class StoreAction extends _$StoreAction {
+  @override
+  void build() {}
+
+  Future<void> shakingStore() async {}
+
+  void savePreferencesDebounce() {
+    debouncer.call(FunctionTag.savePreferences, () async {
+      await preferences.saveConfig(ref.read(configProvider));
+    });
+  }
+
+  Future<void> handleClear() async {
+    debouncer.cancel(FunctionTag.savePreferences);
+    await clearAppData();
+    await reloadWebSettings(ref);
+    await ref.read(systemActionProvider.notifier).handleExit(false);
+  }
+}

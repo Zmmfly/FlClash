@@ -12,6 +12,7 @@ services:
       FLCLASH_WEB_LISTEN: 0.0.0.0:8080
       FLCLASH_DATA_DIR: /data
       FLCLASH_WEB_AUTH_FILE: /auth/credentials.json
+      FLCLASH_WEB_API_STORE_DIR: /state
       FLCLASH_WEB_USERNAME: ${FLCLASH_WEB_USERNAME:?Set FLCLASH_WEB_USERNAME in .env}
       FLCLASH_WEB_PASSWORD_FILE: /run/secrets/web_password
       FLCLASH_WEB_SECURE_COOKIE: "${FLCLASH_WEB_SECURE_COOKIE:-false}"
@@ -28,6 +29,11 @@ services:
       - type: bind
         source: ./auth
         target: /auth
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
         bind:
           create_host_path: false
     secrets:

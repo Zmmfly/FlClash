@@ -1,0 +1,14 @@
+import 'identity.dart';
+
+abstract interface class ApiCanonicalProjectionCarrier {
+  Iterable<ApiCanonicalProjection> get canonicalProjections;
+}
+
+final class ApiCanonicalProjection {
+  ApiCanonicalProjection(this.kind, this.model, {List<Object> path = const []})
+    : path = List<Object>.unmodifiable(path);
+
+  final ApiIdentity kind;
+  final Object model;
+  final List<Object> path;
+}

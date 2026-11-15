@@ -1,0 +1,10 @@
+import 'transport_stub.dart'
+    if (dart.library.js_interop) 'transport_browser.dart'
+    as platform;
+import 'transport_types.dart';
+
+export 'transport_types.dart';
+
+ApiTransport createApiTransport() => platform.createApiTransport();
+String currentApiOrigin() => platform.currentApiOrigin();
+void notifyApiUnauthorized() => platform.notifyApiUnauthorized();

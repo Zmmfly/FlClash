@@ -1,0 +1,1604 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_runtime/runtime.dart';
+import 'package:fl_clash/web_workflows/external_providers.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _profileId = '9223372036854775807';
+const _providerId = '9223372036854775807';
+const _opaqueId =
+    '115792089237316195423570985008687907853269984665640564039457584007913129639935';
+const _opaqueRoot = '/api/v1/runtime/provider-sources/$_opaqueId';
+final _version = List.filled(64, 'a').join();
+
+ApiResponse _answer(String revision, Object? data, {String? operationId}) =>
+    ApiResponse(
+      200,
+      jsonEncode({
+        'revision': revision,
+        'data': data,
+        'operationId': ?operationId,
+      }),
+    );
+
+class _ProviderTransport implements ApiTransport {
+  final requests = <ApiRequest>[];
+  final receipts = <String, ApiResponse>{};
+  final operations = <String, Map<String, Object?>>{};
+  final accepted = Completer<void>();
+  String revision = '1';
+  String storeId = 'external-provider-fixture';
+  String sourceVersion = _version;
+  String sourcePhase = 'ready';
+  Uint8List opaqueBytes = Uint8List.fromList(
+    utf8.encode('payload:\n  - example.test\n'),
+  );
+  Uint8List profileBytes = Uint8List.fromList(utf8.encode('proxies: []\n'));
+  Uint8List ruleBytes = Uint8List.fromList(
+    utf8.encode('payload:\n  - example.test\n'),
+  );
+  bool mrs = false;
+  bool privateSource = false;
+  bool loseNextMutation = false;
+  int runtimeReads = 0;
+  int pendingReads = 0;
+  String terminalPhase = 'applied';
+  String? rejectRuntimeCode;
+  Completer<void>? runtimeGate;
+  Map<String, Object?> sourcePatch = {};
+  Map<String, Object?> headPatch = {};
+  Map<String, Object?> contentPatch = {};
+  Map<String, Object?> previewPatch = {};
+  Map<String, Object?> resultPatch = {};
+  Map<String, Object?> acceptedPatch = {};
+  Map<String, Object?> operationPatch = {};
+  Map<String, Object?> managedMutationPatch = {};
+  Object? sourceRows;
+
+  Map<String, Object?> runtimeSnapshotPatch = {};
+  Object? runtimeRows;
+  String? runtimeInventoryError;
+
+  List<Map<String, Object?>> runtimeProviders() => [
+    {
+      'name': 'Managed profile',
+      'type': 'Proxy',
+      'vehicleType': 'File',
+      'count': 5,
+      'updatedAt': '2026-11-15T00:00:00Z',
+      'subscriptionInfo': {
+        'upload': '9007199254740993',
+        'download': '123',
+        'total': _profileId,
+        'expire': '1700000000',
+      },
+      'binding': {'kind': 'profile', 'id': _profileId},
+    },
+    {
+      'name': 'Managed rule set',
+      'type': 'Rule',
+      'vehicleType': 'File',
+      'count': 2,
+      'updatedAt': null,
+      'subscriptionInfo': null,
+      'binding': {'kind': 'rule-provider', 'id': _providerId},
+    },
+    {
+      'name': 'HTTP source',
+      'type': 'Rule',
+      'vehicleType': 'File',
+      'count': 3,
+      'updatedAt': null,
+      'subscriptionInfo': null,
+      'binding': {
+        'kind': 'external-provider',
+        'id': _opaqueId,
+        'profileId': _profileId,
+        'purpose': 'rule-providers',
+        'sourceVersion': _version,
+      },
+    },
+  ];
+
+  Map<String, Object?> profile() => {
+    'id': _profileId,
+    'type': 'url',
+    'label': 'Managed profile',
+    'url': 'https://profile.example.test/source',
+    'autoUpdateDurationMillis': 3600000,
+    'autoUpdate': true,
+    'selectedMap': <String, String>{},
+    'unfoldSet': <String>[],
+    'extendType': 'standard',
+  };
+
+  Map<String, Object?> provider() => {
+    'id': _providerId,
+    'label': 'Managed rule set',
+    'url': 'https://rules.example.test/source',
+    'behavior': 'domain',
+    'format': mrs ? 'mrs' : 'yaml',
+  };
+
+  Map<String, Object?> source() => {
+    'id': _opaqueId,
+    'profileId': _profileId,
+    'name': 'HTTP source',
+    'purpose': 'rule-providers',
+    'sourceVersion': sourceVersion,
+    'phase': sourcePhase,
+    ...sourcePatch,
+  };
+
+  Map<String, Object?> head() => {
+    'source': source(),
+    'prepared': sourcePhase == 'ready',
+    'mediaType': mrs ? 'application/octet-stream' : 'text/plain; charset=utf-8',
+    'size': sourcePhase == 'ready' ? opaqueBytes.length : 0,
+    'sha256': sourcePhase == 'ready'
+        ? crypto.sha256.convert(opaqueBytes).toString()
+        : '',
+    ...headPatch,
+  };
+
+  Map<String, Object?> summary(String kind, Uint8List bytes) => {
+    'key': {'kind': kind, 'id': kind == 'profile' ? _profileId : _providerId},
+    'mediaType': kind == 'profile'
+        ? 'application/yaml'
+        : mrs
+        ? 'application/octet-stream'
+        : 'application/yaml',
+    'size': bytes.length,
+    'sha256': crypto.sha256.convert(bytes).toString(),
+  };
+
+  ApiResponse _error(String code, {int status = 409}) => ApiResponse(
+    status,
+    jsonEncode({
+      'revision': revision,
+      'error': {'code': code, 'message': 'Synthetic provider rejection'},
+    }),
+  );
+
+  ApiResponse _commit(
+    Map<String, Object?> body,
+    Object? data, {
+    bool increment = true,
+  }) {
+    if (body['expectedRevision'] != revision) {
+      return _error('revision_conflict');
+    }
+    if (increment) revision = (BigInt.parse(revision) + BigInt.one).toString();
+    final operationId = body['operationId'] as String;
+    final receipt = _answer(revision, data, operationId: operationId);
+    receipts[operationId] = receipt;
+    if (loseNextMutation) {
+      loseNextMutation = false;
+      throw StateError('Synthetic lost response after durable acceptance');
+    }
+    return receipt;
+  }
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    final path = request.path;
+    if (path == '/api/v1/meta') {
+      return _answer(revision, {
+        'storeId': storeId,
+        'schemaVersion': 1,
+        'revision': revision,
+      });
+    }
+    if (request.method == 'GET' && Uri.parse(path).path == '/api/v1/profiles') {
+      return _answer(revision, [profile()]);
+    }
+    if (path == '/api/v1/clash-providers' && request.method == 'GET') {
+      return _answer(revision, [provider()]);
+    }
+    if (path == '/api/v1/runtime/external-providers') {
+      if (runtimeInventoryError case final error?) return _error(error);
+      return _answer(revision, {
+        'runtimeGeneration': '7',
+        'actualConfig': 'candidate',
+        'providers': runtimeRows ?? runtimeProviders(),
+        ...runtimeSnapshotPatch,
+      });
+    }
+    if (path.startsWith('/api/v1/runtime/provider-sources?profileId=')) {
+      return _answer(revision, sourceRows ?? [source()]);
+    }
+    if (path == _opaqueRoot) return _answer(revision, head());
+    if (path == '$_opaqueRoot/content') {
+      if (sourcePhase != 'ready') return _error('provider_source_unavailable');
+      return _answer(revision, {
+        ...head(),
+        'bytes': base64Encode(opaqueBytes),
+        ...contentPatch,
+      });
+    }
+    if (path == '$_opaqueRoot/preview') {
+      String text;
+      try {
+        text = mrs ? 'example.test\n' : utf8.decode(opaqueBytes);
+      } on FormatException {
+        return _error('invalid_provider_content', status: 422);
+      }
+      return _answer(revision, {
+        'sourceVersion': sourceVersion,
+        'format': mrs ? 'mrs' : 'text',
+        'text': text,
+        'readOnly': mrs,
+        'size': opaqueBytes.length,
+        'sha256': crypto.sha256.convert(opaqueBytes).toString(),
+        ...previewPatch,
+      });
+    }
+    if (path == '/api/v1/rule-providers/$_providerId/preview') {
+      return _answer(revision, {
+        'id': _providerId,
+        'behavior': 'domain',
+        'format': mrs ? 'mrs' : 'yaml',
+        'text': mrs ? 'example.test\n' : utf8.decode(ruleBytes),
+      });
+    }
+    if (path == '/api/v1/content/profile/$_profileId' ||
+        path == '/api/v1/content/rule-provider/$_providerId') {
+      final kind = path.contains('/content/profile/')
+          ? 'profile'
+          : 'rule-provider';
+      final bytes = kind == 'profile' ? profileBytes : ruleBytes;
+      return _answer(revision, {
+        ...summary(kind, bytes),
+        'bytes': base64Encode(bytes),
+        'encrypted': false,
+      });
+    }
+    if (path.startsWith('/api/v1/runtime/operations/')) {
+      final id = path.split('/').last;
+      final operation = operations[id];
+      if (operation == null) throw StateError('Unknown runtime operation $id');
+      runtimeReads++;
+      if (runtimeGate case final gate?) await gate.future;
+      if (runtimeReads <= pendingReads) {
+        return _answer(revision, {...operation, 'phase': 'applying'});
+      }
+      return _answer(revision, {
+        ...operation,
+        'phase': terminalPhase,
+        if (terminalPhase == 'applied')
+          'result': {
+            'id': _opaqueId,
+            'sourceVersion': sourceVersion,
+            'prepared': true,
+            'requiresApply': true,
+            ...resultPatch,
+          },
+        if (terminalPhase != 'applied')
+          'error': {
+            'code': 'effect_unknown',
+            'message': 'Synthetic terminal failure',
+          },
+        ...operationPatch,
+      });
+    }
+    if (path.startsWith('/api/v1/operations/')) {
+      return receipts[path.split('/').last] ??
+          _error('operation_not_found', status: 404);
+    }
+    if (request.method != 'POST') {
+      throw StateError('Unexpected provider read $path');
+    }
+    final body = jsonDecode(request.body!) as Map<String, Object?>;
+    if (path == '/api/v1/sources:prepare') {
+      if (body['expectedRevision'] != revision) {
+        return _error('source_revision_conflict');
+      }
+      return _answer(revision, {
+        'preparationId': List.filled(43, 'P').join(),
+        'urlDigest': List.filled(64, 'b').join(),
+        'purpose': body['purpose'],
+        'key': body['key'],
+        'expiresAt': DateTime.now()
+            .toUtc()
+            .add(const Duration(minutes: 4))
+            .toIso8601String(),
+        'networkView': 'server',
+        'scheme': 'https',
+        'host': 'rules.example.test',
+        'port': 443,
+        'addresses': [privateSource ? '10.0.0.8' : '192.0.2.8'],
+        'requiresPrivateNetworkConfirmation': privateSource,
+      });
+    }
+    if (path == '/api/v1/sources:authorize') {
+      return _commit(body, {
+        'authorizationId': List.filled(43, 'G').join(),
+        'expiresAt': DateTime.now()
+            .toUtc()
+            .add(const Duration(minutes: 3))
+            .toIso8601String(),
+      }, increment: false);
+    }
+    if (path == '/api/v1/content:write' || path == '/api/v1/content:refresh') {
+      final kind = (body['key'] as Map)['kind'] as String;
+      final bytes = path.endsWith(':write')
+          ? base64Decode(body['bytes'] as String)
+          : kind == 'profile'
+          ? profileBytes
+          : ruleBytes;
+      if (kind == 'profile') {
+        profileBytes = bytes;
+      } else {
+        ruleBytes = bytes;
+      }
+      return _commit(body, {
+        'content': summary(kind, bytes),
+        if (kind == 'profile')
+          'profile': profile()
+        else
+          'ruleProvider': provider(),
+        ...managedMutationPatch,
+      });
+    }
+    final action = switch (path) {
+      '$_opaqueRoot:write' => 'write-provider-source',
+      '$_opaqueRoot:sideload' => 'sideload-provider-source',
+      '/api/v1/runtime/provider-sources:refresh' => 'refresh-provider-source',
+      _ => throw StateError('Unexpected provider command $path'),
+    };
+    if (rejectRuntimeCode case final code?) return _error(code);
+    if (body['expectedRevision'] != revision) {
+      return _error('revision_conflict');
+    }
+    if (!path.endsWith(':refresh') && body['sourceVersion'] != sourceVersion) {
+      return _error('source_target_changed');
+    }
+    final operationId = body['operationId'] as String;
+    final operation = <String, Object?>{
+      'operationId': operationId,
+      'desiredRevision': (BigInt.parse(revision) + BigInt.one).toString(),
+      'action': action,
+      'phase': 'pending',
+      'updatedAt': '2026-11-15T00:00:00Z',
+    };
+    operations[operationId] = operation;
+    if (!accepted.isCompleted) accepted.complete();
+    return _commit(body, {...operation, ...acceptedPatch});
+  }
+
+  @override
+  void close() {}
+}
+
+Future<(WebApiRepository, WebExternalProviderWorkflows)> _workflows(
+  _ProviderTransport transport, {
+  bool? consent,
+}) async {
+  final repo = WebApiRepository(
+    transport: transport,
+    journal: MemoryApiOperationJournal(),
+  );
+  await repo.initialize();
+  final helper = WebExternalProviderWorkflows(
+    repo,
+    confirmSource: consent == null ? null : (_) async => consent,
+  );
+  return (repo, helper);
+}
+
+Future<WebOpaqueProviderSource> _opaque(
+  WebApiRepository repo,
+  WebExternalProviderWorkflows helper,
+) async => (await helper.sources(
+  repo.identities.decode(ApiIdentity.profile, _profileId),
+)).single;
+
+List<ApiRequest> _businessPosts(_ProviderTransport transport) => transport
+    .requests
+    .where((r) => r.method == 'POST' && !r.path.startsWith('/api/v1/sources:'))
+    .toList();
+
+void main() {
+  // These tests exercise external_providers.dart's public workflow, not a raw
+  // filesystem/CoreRPC substitute. All URLs and transports are synthetic.
+  test(
+    'external provider contract keeps 256-bit opaque IDs and original read versions',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final source = await _opaque(repo, helper);
+      expect(source.id, _opaqueId);
+      expect(source.purpose, WebExternalProviderPurpose.rules);
+      expect(source.sourceVersion, _version);
+      final head = await helper.head(source);
+      expect(head.prepared, true);
+      expect(identical(head.editVersion, source.editVersion), true);
+      final document = await helper.read(source);
+      expect(document.bytes, transport.opaqueBytes);
+      expect(document.sha256, crypto.sha256.convert(document.bytes).toString());
+      expect(identical(document.editVersion, source.editVersion), true);
+      expect(() => document.bytes[0] = 0, throwsUnsupportedError);
+      final preview = await helper.preview(source);
+      expect(preview.text, utf8.decode(transport.opaqueBytes));
+      expect(preview.format, WebExternalProviderFormat.text);
+      expect(preview.readOnly, false);
+      expect(await helper.download(source), document.bytes);
+      expect(
+        transport.requests.any(
+          (r) =>
+              r.path.contains('/download') ||
+              r.path.contains('/data/') ||
+              r.path.contains('coreRpc'),
+        ),
+        false,
+      );
+    },
+  );
+
+  test(
+    'external provider contract waits HTTP pending through the same operation applied result',
+    () async {
+      final transport = _ProviderTransport()
+        ..runtimeGate = Completer<void>()
+        ..pendingReads = 1;
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final source = await _opaque(repo, helper);
+      final document = await helper.read(source);
+      var completed = false;
+      final writing = helper.write(document, utf8.encode('payload: []\n')).then(
+        (result) {
+          completed = true;
+          return result;
+        },
+      );
+      await transport.accepted.future;
+      expect(completed, false);
+      transport.runtimeGate!.complete();
+      final result = await writing;
+      expect(result.requiresApply, true);
+      expect(result.runtimePreparationConfirmed, true);
+      expect(result.content, null);
+      expect(identical(result.binding, source), true);
+      final command = _businessPosts(transport).single;
+      final body = jsonDecode(command.body!) as Map;
+      expect(body['expectedRevision'], '1');
+      expect(body['sourceVersion'], _version);
+      expect(
+        base64Decode(body['bytes'] as String),
+        utf8.encode('payload: []\n'),
+      );
+      final operationId = body['operationId'];
+      expect(
+        transport.requests
+            .where((r) => r.path == '/api/v1/runtime/operations/$operationId')
+            .length,
+        2,
+      );
+      expect(
+        transport.requests.any((r) => r.path == '/api/v1/runtime/state'),
+        false,
+      );
+    },
+  );
+
+  test(
+    'external provider contract recovers lost pending receipt using the original operation ID',
+    () async {
+      final transport = _ProviderTransport()..loseNextMutation = true;
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final original = await helper.read(await _opaque(repo, helper));
+      final result = await helper.write(original, utf8.encode('payload: []'));
+      expect(result.runtimePreparationConfirmed, true);
+      final body = jsonDecode(_businessPosts(transport).single.body!) as Map;
+      final operationId = body['operationId'];
+      expect(
+        transport.requests.any(
+          (r) => r.path == '/api/v1/operations/$operationId',
+        ),
+        true,
+      );
+      expect(
+        transport.requests.any(
+          (r) => r.path == '/api/v1/runtime/operations/$operationId',
+        ),
+        true,
+      );
+      expect(transport.operations.length, 1);
+    },
+  );
+
+  for (final terminal in ['failed', 'unknown']) {
+    test(
+      'external provider contract never promotes runtime $terminal to a prepared result',
+      () async {
+        final transport = _ProviderTransport()..terminalPhase = terminal;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        final original = await helper.read(await _opaque(repo, helper));
+        await expectLater(
+          helper.write(original, utf8.encode('payload: []')),
+          throwsA(
+            isA<WebApiException>()
+                .having((e) => e.code, 'code', 'effect_unknown')
+                .having((e) => (e.details as Map)['phase'], 'phase', terminal),
+          ),
+        );
+        expect(_businessPosts(transport).length, 1);
+      },
+    );
+  }
+
+  for (final patch in [
+    {'id': '1'},
+    {'sourceVersion': List.filled(64, 'c').join()},
+    {'prepared': false},
+    {'requiresApply': false},
+    {
+      'source': {'id': _opaqueId},
+    },
+  ]) {
+    test(
+      'external provider contract rejects malformed applied result $patch',
+      () async {
+        final transport = _ProviderTransport()..resultPatch = patch;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        final original = await helper.read(await _opaque(repo, helper));
+        await expectLater(
+          helper.sideload(original, [0, 255, 1]),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(_businessPosts(transport).length, 1);
+      },
+    );
+  }
+
+  test(
+    'external provider contract supports opaque MRS preview and only explicit binary sideload',
+    () async {
+      final transport = _ProviderTransport()
+        ..mrs = true
+        ..opaqueBytes = Uint8List.fromList([0x28, 0xb5, 0x2f, 0xfd, 0, 255]);
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final source = await _opaque(repo, helper);
+      final preview = await helper.preview(source);
+      expect(preview.text, 'example.test\n');
+      expect(preview.readOnly, true);
+      expect(preview.format, WebExternalProviderFormat.mrs);
+      await expectLater(
+        helper.write(preview.document, utf8.encode('changed')),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(_businessPosts(transport), isEmpty);
+      final result = await helper.sideload(preview.document, [
+        0x28,
+        0xb5,
+        0x2f,
+        0xfd,
+        0,
+        128,
+        255,
+      ]);
+      expect(result.requiresApply, true);
+      final command = _businessPosts(transport).single;
+      expect(command.path, '$_opaqueRoot:sideload');
+      expect(
+        base64Decode((jsonDecode(command.body!) as Map)['bytes'] as String),
+        [0x28, 0xb5, 0x2f, 0xfd, 0, 128, 255],
+      );
+    },
+  );
+
+  test(
+    'external provider contract preserves arbitrary bytes for download but never invents text',
+    () async {
+      final transport = _ProviderTransport()
+        ..opaqueBytes = Uint8List.fromList([255, 0, 128]);
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final source = await _opaque(repo, helper);
+      final document = await helper.read(source);
+      expect(document.format, WebExternalProviderFormat.binary);
+      expect(await helper.download(source), [255, 0, 128]);
+      await expectLater(
+        helper.preview(source),
+        throwsA(isA<WebApiException>()),
+      );
+      await expectLater(
+        helper.write(document, utf8.encode('changed')),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(_businessPosts(transport), isEmpty);
+    },
+  );
+
+  test(
+    'external provider contract keeps unprepared head explicit and refreshes using fixed purpose consent',
+    () async {
+      final transport = _ProviderTransport()..sourcePhase = 'unprepared';
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final source = await _opaque(repo, helper);
+      final head = await helper.head(source);
+      expect(head.prepared, false);
+      expect(head.size, 0);
+      expect(head.sha256, '');
+      await expectLater(
+        helper.read(source),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'provider_source_unavailable',
+          ),
+        ),
+      );
+      final result = await helper.refresh(head);
+      expect(result.requiresApply, true);
+      expect(result.runtimePreparationConfirmed, true);
+      final prepare =
+          jsonDecode(
+                transport.requests
+                    .firstWhere((r) => r.path == '/api/v1/sources:prepare')
+                    .body!,
+              )
+              as Map;
+      expect(prepare, {
+        'expectedRevision': '1',
+        'purpose': 'external-provider-refresh',
+        'key': {'kind': 'external-provider', 'id': _opaqueId},
+      });
+      final body = jsonDecode(_businessPosts(transport).single.body!) as Map;
+      expect(body['id'], _opaqueId);
+      expect(body['purpose'], 'rule-providers');
+      expect(body['expectedRevision'], '1');
+      expect(body.containsKey('url'), false);
+    },
+  );
+
+  for (final consent in <bool?>[null, false, true]) {
+    test(
+      'external provider contract private refresh consent is explicit: $consent',
+      () async {
+        final transport = _ProviderTransport()..privateSource = true;
+        final (repo, helper) = await _workflows(transport, consent: consent);
+        addTearDown(repo.close);
+        final head = await helper.head(await _opaque(repo, helper));
+        if (consent != true) {
+          await expectLater(
+            helper.refresh(head),
+            throwsA(
+              isA<WebApiException>().having(
+                (e) => e.code,
+                'code',
+                consent == null
+                    ? 'source_authorization_required'
+                    : 'source_authorization_cancelled',
+              ),
+            ),
+          );
+          expect(_businessPosts(transport), isEmpty);
+          expect(
+            transport.requests.any(
+              (r) => r.path == '/api/v1/sources:authorize',
+            ),
+            false,
+          );
+        } else {
+          final result = await helper.refresh(head);
+          expect(result.requiresApply, true);
+          final command =
+              jsonDecode(_businessPosts(transport).single.body!) as Map;
+          expect(command['authorizationId'], List.filled(43, 'G').join());
+          expect(command['expectedRevision'], '1');
+          expect(
+            transport.requests
+                .where((r) => r.path == '/api/v1/sources:authorize')
+                .length,
+            1,
+          );
+        }
+      },
+    );
+  }
+
+  test(
+    'external provider contract managed profile and rule-provider bindings retain distinct identities',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final profile = (await repo.profiles().get()).single;
+      final provider = (await repo.catalog(repo.providers).get()).single;
+      expect(profile.id, isNot(provider.id));
+      final profileBinding = helper.managedProfile(profile);
+      final ruleBinding = helper.managedRuleProvider(provider);
+      final profileDocument = await helper.read(profileBinding);
+      final ruleDocument = await helper.read(ruleBinding);
+      expect(profileDocument.bytes, transport.profileBytes);
+      expect(ruleDocument.bytes, transport.ruleBytes);
+      expect(
+        identical(profileDocument.editVersion, profileBinding.editVersion),
+        true,
+      );
+      expect(
+        identical(ruleDocument.editVersion, ruleBinding.editVersion),
+        true,
+      );
+      expect(
+        (await helper.preview(profileBinding)).text,
+        utf8.decode(transport.profileBytes),
+      );
+      expect(
+        (await helper.preview(ruleBinding)).text,
+        utf8.decode(transport.ruleBytes),
+      );
+      final result = await helper.write(
+        profileDocument,
+        utf8.encode('proxies: []\nrules: []\n'),
+      );
+      expect(result.requiresApply, true);
+      expect(result.runtimePreparationConfirmed, false);
+      expect(result.content!.profile!.id, profile.id);
+      expect(result.content!.ruleProvider, null);
+      final body = jsonDecode(_businessPosts(transport).single.body!) as Map;
+      expect(body['key'], {'kind': 'profile', 'id': _profileId});
+      expect(body['expectedRevision'], '1');
+      expect(
+        transport.requests.any(
+          (r) => r.path.startsWith('/api/v1/runtime/operations/'),
+        ),
+        false,
+      );
+      expect(
+        () => helper.managedProfile(
+          profile.copyWith(label: 'not the canonical row'),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => helper.managedRuleProvider(
+          provider.copyWith(label: 'not the canonical row'),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'external provider contract managed MRS previews typed resource and binary sideload stays in its namespace',
+    () async {
+      final transport = _ProviderTransport()
+        ..mrs = true
+        ..ruleBytes = Uint8List.fromList([0x28, 0xb5, 0x2f, 0xfd, 0, 255]);
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final provider = (await repo.catalog(repo.providers).get()).single;
+      final binding = helper.managedRuleProvider(provider);
+      final preview = await helper.preview(binding);
+      expect(preview.format, WebExternalProviderFormat.mrs);
+      expect(preview.readOnly, true);
+      expect(preview.text, 'example.test\n');
+      expect(
+        transport.requests.any(
+          (r) => r.path == '/api/v1/rule-providers/$_providerId/preview',
+        ),
+        true,
+      );
+      await expectLater(
+        helper.write(preview.document, utf8.encode('not mrs')),
+        throwsA(isA<WebApiException>()),
+      );
+      final bytes = [0x28, 0xb5, 0x2f, 0xfd, 0, 1, 255];
+      final result = await helper.sideload(preview.document, bytes);
+      expect(result.requiresApply, true);
+      expect(result.content!.ruleProvider!.id, provider.id);
+      final body = jsonDecode(_businessPosts(transport).single.body!) as Map;
+      expect(body['key'], {'kind': 'rule-provider', 'id': _providerId});
+      expect(base64Decode(body['bytes'] as String), bytes);
+    },
+  );
+
+  for (final managedProfile in [true, false]) {
+    test(
+      'external provider contract managed refresh uses typed fixed owner: profile=$managedProfile',
+      () async {
+        final transport = _ProviderTransport();
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        final binding = managedProfile
+            ? helper.managedProfile((await repo.profiles().get()).single)
+            : helper.managedRuleProvider(
+                (await repo.catalog(repo.providers).get()).single,
+              );
+        final original = await helper.head(binding);
+        final result = await helper.refresh(original);
+        expect(result.requiresApply, true);
+        expect(result.runtimePreparationConfirmed, false);
+        final prepare =
+            jsonDecode(
+                  transport.requests
+                      .firstWhere((r) => r.path == '/api/v1/sources:prepare')
+                      .body!,
+                )
+                as Map;
+        expect(
+          prepare['purpose'],
+          managedProfile ? 'profile-refresh' : 'rule-provider-refresh',
+        );
+        final command = _businessPosts(transport).single;
+        expect(command.path, '/api/v1/content:refresh');
+        expect((jsonDecode(command.body!) as Map)['expectedRevision'], '1');
+      },
+    );
+  }
+
+  test(
+    'external provider contract managed lost content receipt recovers without another write',
+    () async {
+      final transport = _ProviderTransport()..loseNextMutation = true;
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final binding = helper.managedRuleProvider(
+        (await repo.catalog(repo.providers).get()).single,
+      );
+      final original = await helper.read(binding);
+      final result = await helper.write(original, utf8.encode('payload: []'));
+      expect(result.content!.ruleProvider!.id, binding.provider.id);
+      expect(result.requiresApply, true);
+      final command = _businessPosts(transport).single;
+      final id = (jsonDecode(command.body!) as Map)['operationId'];
+      expect(
+        transport.requests.any((r) => r.path == '/api/v1/operations/$id'),
+        true,
+      );
+    },
+  );
+
+  test(
+    'external provider contract rejects changed managed owner after receipt recovery',
+    () async {
+      final transport = _ProviderTransport()
+        ..managedMutationPatch = {
+          'content': {
+            'key': {'kind': 'profile', 'id': _profileId},
+            'mediaType': 'application/yaml',
+            'size': 0,
+            'sha256': crypto.sha256.convert([]).toString(),
+          },
+          'profile': {
+            'id': _profileId,
+            'type': 'file',
+            'autoUpdateDurationMillis': 0,
+          },
+          'ruleProvider': null,
+        };
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final original = await helper.read(
+        helper.managedRuleProvider(
+          (await repo.catalog(repo.providers).get()).single,
+        ),
+      );
+      final version = original.editVersion;
+      final before = transport.requests.length;
+      late WebApiCommittedProjectionException failure;
+      try {
+        await helper.write(original, utf8.encode('payload: []'));
+        fail(
+          'A committed response naming another owner must not become success',
+        );
+      } on WebApiCommittedProjectionException catch (error) {
+        failure = error;
+      }
+      // The durable command is known committed, but its final canonical
+      // projection is invalid. Preserve that stronger shared-client contract.
+      expect(failure.code, 'committed_refresh_failed');
+      expect(failure.revision, '2');
+      final command = _businessPosts(transport).single;
+      final payload = jsonDecode(command.body!) as Map;
+      expect(failure.operationId, payload['operationId']);
+      expect(payload['key'], {'kind': 'rule-provider', 'id': _providerId});
+      expect(payload['expectedRevision'], '1');
+      expect(repo.pendingOperation, null);
+      expect(repo.revision, '2');
+      expect(identical(original.editVersion, version), true);
+      expect(version.revision, '1');
+      expect(original.binding, isA<WebManagedRuleProvider>());
+      // No compensation/rewrite, automatic apply, fresh read or fresh token.
+      expect(
+        transport.requests
+            .skip(before)
+            .map((row) => '${row.method} ${row.path}')
+            .toList(),
+        ['POST /api/v1/content:write'],
+      );
+    },
+  );
+
+  test(
+    'external provider contract never restamps stale edits from newer global revision or sourceVersion',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final original = await helper.read(await _opaque(repo, helper));
+      transport.revision = '2';
+      await repo.handleCommitEvent({'revision': '2'});
+      await expectLater(
+        helper.write(original, utf8.encode('payload: []')),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(
+        (jsonDecode(_businessPosts(transport).single.body!)
+            as Map)['expectedRevision'],
+        '1',
+      );
+      expect(
+        transport.requests.any((r) => r.path == '/api/v1/runtime/state'),
+        false,
+      );
+      final before = transport.requests.length;
+      await expectLater(
+        helper.read(original.binding),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'edit_snapshot_mismatch',
+          ),
+        ),
+      );
+      expect(transport.requests.length, before + 1);
+    },
+  );
+
+  test(
+    'external provider contract sends the original declaration version after a source changes',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final original = await helper.read(await _opaque(repo, helper));
+      transport.sourceVersion = List.filled(64, 'c').join();
+      await expectLater(
+        helper.write(original, utf8.encode('payload: []')),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'source_target_changed',
+          ),
+        ),
+      );
+      expect(
+        (jsonDecode(_businessPosts(transport).single.body!)
+            as Map)['sourceVersion'],
+        _version,
+      );
+      await expectLater(
+        helper.head(original.binding),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'external provider contract rejects cross-repository and expired-session edits before sending',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final original = await helper.read(await _opaque(repo, helper));
+      final otherTransport = _ProviderTransport();
+      final (otherRepo, otherHelper) = await _workflows(otherTransport);
+      addTearDown(otherRepo.close);
+      await expectLater(
+        otherHelper.write(original, utf8.encode('changed')),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(_businessPosts(otherTransport), isEmpty);
+      repo.endSession();
+      repo.beginSession();
+      await expectLater(
+        helper.write(original, utf8.encode('changed')),
+        throwsA(isA<WebApiSessionException>()),
+      );
+      expect(_businessPosts(transport), isEmpty);
+      expect(
+        () => WebExternalProviderWorkflows(
+          repo,
+          runtime: WebRuntimeBinding.configure(otherRepo),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'external provider contract rejects a replaced store rather than reusing its binding',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final original = await helper.read(await _opaque(repo, helper));
+      transport.storeId = 'replacement-store';
+      await expectLater(repo.onReconnect(), throwsA(isA<WebApiException>()));
+      await expectLater(
+        helper.sideload(original, [0, 1]),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(_businessPosts(transport), isEmpty);
+    },
+  );
+
+  for (final patch in [
+    {'id': '01'},
+    {'id': '0'},
+    {'id': '1$_opaqueId'},
+    {'id': 1},
+    {'profileId': '1'},
+    {'purpose': 'script'},
+    {'sourceVersion': 'not-a-digest'},
+    {'phase': 'applied'},
+    {'path': '/data/private/credentials.json'},
+  ]) {
+    test(
+      'external provider contract rejects malformed or wrong-owner source $patch',
+      () async {
+        final transport = _ProviderTransport()..sourcePatch = patch;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          _opaque(repo, helper),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(_businessPosts(transport), isEmpty);
+        expect(transport.requests.length, 2);
+      },
+    );
+  }
+
+  for (final patch in [
+    {'bytes': 'AA'},
+    {'bytes': 'AA=='},
+    {'size': -1},
+    {'sha256': List.filled(64, '0').join()},
+    {'prepared': false},
+    {
+      'source': {'id': _opaqueId},
+    },
+    {'rawPath': '/data/private/cache'},
+  ]) {
+    test(
+      'external provider contract rejects malformed content $patch',
+      () async {
+        final transport = _ProviderTransport()..contentPatch = patch;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          helper.read(await _opaque(repo, helper)),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(_businessPosts(transport), isEmpty);
+      },
+    );
+  }
+
+  test(
+    'external provider contract rejects duplicate sources and mismatched preview evidence',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      transport.sourceRows = [transport.source(), transport.source()];
+      await expectLater(
+        _opaque(repo, helper),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      transport.sourceRows = null;
+      final source = await _opaque(repo, helper);
+      transport.previewPatch = {'text': 'different source'};
+      await expectLater(
+        helper.preview(source),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      transport.previewPatch = {'sourceVersion': List.filled(64, 'd').join()};
+      await expectLater(
+        helper.preview(source),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(_businessPosts(transport), isEmpty);
+    },
+  );
+
+  test('external provider contract validates byte input before HTTP', () async {
+    final transport = _ProviderTransport();
+    final (repo, helper) = await _workflows(transport);
+    addTearDown(repo.close);
+    final original = await helper.read(await _opaque(repo, helper));
+    await expectLater(
+      helper.sideload(original, [-1, 256]),
+      throwsA(isA<WebApiProtocolException>()),
+    );
+    await expectLater(
+      helper.write(original, [0, 255]),
+      throwsA(isA<WebApiException>()),
+    );
+    expect(_businessPosts(transport), isEmpty);
+  });
+  for (final patch in [
+    {'operationId': 'different-runtime-operation'},
+    {'action': 'refresh-provider-source'},
+    {'desiredRevision': '999'},
+  ]) {
+    test(
+      'external provider contract rejects a cross-operation terminal state $patch',
+      () async {
+        final transport = _ProviderTransport()..operationPatch = patch;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        final original = await helper.read(await _opaque(repo, helper));
+        await expectLater(
+          helper.write(original, utf8.encode('payload: []')),
+          throwsA(isA<WebApiException>()),
+        );
+        expect(_businessPosts(transport).length, 1);
+      },
+    );
+  }
+
+  for (final patch in [
+    {'operationId': 'different-receipt-operation'},
+    {'action': 'refresh-provider-source'},
+    {
+      'phase': 'applied',
+      'result': {
+        'id': _opaqueId,
+        'sourceVersion': _version,
+        'prepared': true,
+        'requiresApply': true,
+      },
+    },
+  ]) {
+    test(
+      'external provider contract rejects an invalid initial pending receipt $patch',
+      () async {
+        final transport = _ProviderTransport()..acceptedPatch = patch;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        final original = await helper.read(await _opaque(repo, helper));
+        await expectLater(
+          helper.write(original, utf8.encode('payload: []')),
+          throwsA(isA<WebApiException>()),
+        );
+        expect(_businessPosts(transport).length, 1);
+        expect(transport.runtimeReads, 0);
+      },
+    );
+  }
+
+  test(
+    'external provider contract retains proxy-provider purpose and rejects oversized input before HTTP',
+    () async {
+      final transport = _ProviderTransport()
+        ..sourcePatch = {'purpose': 'proxy-providers'};
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final source = await _opaque(repo, helper);
+      expect(source.purpose, WebExternalProviderPurpose.proxies);
+      final original = await helper.head(source);
+      await expectLater(
+        helper.sideload(original, Uint8List(32 * 1024 * 1024 + 1)),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'content_too_large',
+          ),
+        ),
+      );
+      expect(_businessPosts(transport), isEmpty);
+      await helper.refresh(original);
+      final body = jsonDecode(_businessPosts(transport).single.body!) as Map;
+      expect(body['purpose'], 'proxy-providers');
+    },
+  );
+  test(
+    'runtime provenance inventory resolves native-shaped rows through explicit typed owner IDs',
+    () async {
+      final transport = _ProviderTransport();
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final snapshot = await helper.runtimeProviders();
+      expect(snapshot.runtimeGeneration, '7');
+      expect(snapshot.actualConfig, 'candidate');
+      expect(snapshot.providers.length, 3);
+      expect(snapshot.providers.every((row) => row.path == null), true);
+      expect(
+        helper.runtimeUpdatedAt(snapshot.providers[0]),
+        DateTime.utc(2026, 11, 15),
+      );
+      expect(helper.runtimeUpdatedAt(snapshot.providers[1]), null);
+      final quantities = helper.runtimeSubscriptionInfo(snapshot.providers[0])!;
+      expect(quantities.upload, '9007199254740993');
+      expect(quantities.total, _profileId);
+      expect(helper.runtimeSubscriptionInfo(snapshot.providers[1]), null);
+      expect(
+        () => snapshot.providers.add(snapshot.providers.first),
+        throwsUnsupportedError,
+      );
+      final profile =
+          await helper.resolveRuntimeBinding(snapshot.providers[0])
+              as WebManagedProfileProvider;
+      final rule =
+          await helper.resolveRuntimeBinding(snapshot.providers[1])
+              as WebManagedRuleProvider;
+      final opaque =
+          await helper.resolveRuntimeBinding(snapshot.providers[2])
+              as WebOpaqueProviderSource;
+      expect(profile.profile.id, isNot(rule.provider.id));
+      expect(
+        repo.codec.wireId(ApiIdentity.profile, profile.profile.id),
+        _profileId,
+      );
+      expect(
+        repo.codec.wireId(ApiIdentity.clashProvider, rule.provider.id),
+        _providerId,
+      );
+      expect(opaque.id, _opaqueId);
+      expect(identical(profile.editVersion, snapshot.editVersion), true);
+      expect(identical(rule.editVersion, snapshot.editVersion), true);
+      expect(identical(opaque.editVersion, snapshot.editVersion), true);
+      final document = await helper.read(rule);
+      expect(identical(document.editVersion, snapshot.editVersion), true);
+      final changed = await helper.write(document, utf8.encode('payload: []'));
+      expect(changed.requiresApply, true);
+      expect(
+        (jsonDecode(_businessPosts(transport).single.body!)
+            as Map)['expectedRevision'],
+        '1',
+      );
+      expect(
+        transport.requests
+            .firstWhere((r) => r.path.contains('external-providers'))
+            .path,
+        '/api/v1/runtime/external-providers',
+      );
+    },
+  );
+
+  test(
+    'runtime provenance never uses a matching native name or raw path as ownership evidence',
+    () async {
+      final transport = _ProviderTransport();
+      final rows = transport.runtimeProviders();
+      rows[0]['name'] = 'duplicate display';
+      rows[1]['name'] = 'duplicate display';
+      transport.runtimeRows = rows;
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final snapshot = await helper.runtimeProviders();
+      final profile = await helper.resolveRuntimeBinding(snapshot.providers[0]);
+      final rule = await helper.resolveRuntimeBinding(snapshot.providers[1]);
+      expect(profile, isA<WebManagedProfileProvider>());
+      expect(rule, isA<WebManagedRuleProvider>());
+      final before = transport.requests.length;
+      final copied = snapshot.providers[0].copyWith(
+        path: '/etc/private',
+        name: 'HTTP source',
+      );
+      final unbound = ExternalProvider(
+        name: 'Managed profile',
+        type: 'Proxy',
+        path: '/data/cache',
+        count: 5,
+        vehicleType: 'File',
+        updateAt: DateTime.utc(2026),
+      );
+      await expectLater(
+        helper.resolveRuntimeBinding(copied),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'edit_baseline_required',
+          ),
+        ),
+      );
+      await expectLater(
+        helper.resolveRuntimeBinding(unbound),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(transport.requests.length, before);
+      expect(
+        transport.requests.any(
+          (r) => r.path.contains('/etc/') || r.path.contains('/data/'),
+        ),
+        false,
+      );
+    },
+  );
+
+  test(
+    'runtime provenance accepts a confirmed default fallback only with an empty provider inventory',
+    () async {
+      final transport = _ProviderTransport()
+        ..runtimeSnapshotPatch = {
+          'actualConfig': 'default-fallback',
+          'providers': <Object?>[],
+        };
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final snapshot = await helper.runtimeProviders();
+      expect(snapshot.actualConfig, 'default-fallback');
+      expect(snapshot.providers, isEmpty);
+      expect(transport.requests.length, 2);
+    },
+  );
+
+  for (final code in [
+    'binding_target_changed',
+    'applied_state_unknown',
+    'runtime_busy',
+  ]) {
+    test(
+      'runtime provenance propagates server $code without guessing a fallback owner',
+      () async {
+        final transport = _ProviderTransport()..runtimeInventoryError = code;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          helper.runtimeProviders(),
+          throwsA(isA<WebApiException>().having((e) => e.code, 'code', code)),
+        );
+        expect(transport.requests.length, 2);
+        expect(_businessPosts(transport), isEmpty);
+      },
+    );
+  }
+
+  for (final patch in [
+    {'runtimeGeneration': 7},
+    {'runtimeGeneration': '-1'},
+    {'actualConfig': 'unconfirmed'},
+    {'actualConfig': 'default-fallback'},
+    {'providers': {}},
+    {'rawPath': '/data/private'},
+  ]) {
+    test(
+      'runtime provenance rejects malformed actual inventory $patch',
+      () async {
+        final transport = _ProviderTransport()..runtimeSnapshotPatch = patch;
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          helper.runtimeProviders(),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(transport.requests.length, 2);
+      },
+    );
+  }
+
+  for (final binding in [
+    {'kind': 'unknown', 'id': '1'},
+    {'kind': 'profile', 'id': _profileId},
+    {'kind': 'rule-provider', 'id': 1},
+    {'kind': 'rule-provider', 'id': '-1'},
+    {'kind': 'rule-provider', 'id': '0'},
+    {'kind': 'rule-provider', 'id': _providerId, 'profileId': _profileId},
+    {
+      'kind': 'external-provider',
+      'id': '01',
+      'profileId': _profileId,
+      'purpose': 'rule-providers',
+      'sourceVersion': _version,
+    },
+    {
+      'kind': 'external-provider',
+      'id': _opaqueId,
+      'profileId': 1,
+      'purpose': 'rule-providers',
+      'sourceVersion': _version,
+    },
+    {
+      'kind': 'external-provider',
+      'id': _opaqueId,
+      'profileId': _profileId,
+      'purpose': 'proxy-providers',
+      'sourceVersion': _version,
+    },
+    {
+      'kind': 'external-provider',
+      'id': _opaqueId,
+      'profileId': _profileId,
+      'purpose': 'rule-providers',
+      'sourceVersion': 'invalid',
+    },
+  ]) {
+    test(
+      'runtime provenance rejects unknown malformed or wrong-kind owner binding $binding',
+      () async {
+        final transport = _ProviderTransport();
+        transport.runtimeRows = [
+          {...transport.runtimeProviders()[2], 'binding': binding},
+        ];
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          helper.runtimeProviders(),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(transport.requests.length, 2);
+      },
+    );
+  }
+
+  for (final patch in [
+    {'count': -1},
+    {'count': 1.5},
+    {'type': 'Provider'},
+    {'vehicleType': ''},
+    {'updatedAt': '2026-02-30T00:00:00Z'},
+    {'updatedAt': '2026-11-15'},
+    {
+      'subscriptionInfo': {
+        'upload': 1,
+        'download': '0',
+        'total': '0',
+        'expire': '0',
+      },
+    },
+    {'path': '/data/private/provider'},
+  ]) {
+    test(
+      'runtime provenance rejects malformed native-shaped metadata $patch',
+      () async {
+        final transport = _ProviderTransport();
+        transport.runtimeRows = [
+          {...transport.runtimeProviders()[0], ...patch},
+        ];
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        await expectLater(
+          helper.runtimeProviders(),
+          throwsA(isA<WebApiProtocolException>()),
+        );
+        expect(transport.requests.length, 2);
+      },
+    );
+  }
+
+  test(
+    'runtime provenance rejects duplicate actual provider identities',
+    () async {
+      final transport = _ProviderTransport();
+      transport.runtimeRows = [
+        transport.runtimeProviders()[0],
+        transport.runtimeProviders()[0],
+      ];
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      await expectLater(
+        helper.runtimeProviders(),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  for (final index in [0, 2]) {
+    test(
+      'runtime provenance keeps the initial runtime-read revision across owner resolution $index',
+      () async {
+        final transport = _ProviderTransport();
+        final (repo, helper) = await _workflows(transport);
+        addTearDown(repo.close);
+        final snapshot = await helper.runtimeProviders();
+        transport.revision = '2';
+        await expectLater(
+          helper.resolveRuntimeBinding(snapshot.providers[index]),
+          throwsA(
+            isA<WebApiException>().having(
+              (e) => e.code,
+              'code',
+              'edit_snapshot_mismatch',
+            ),
+          ),
+        );
+        expect(_businessPosts(transport), isEmpty);
+        expect(snapshot.editVersion.revision, '1');
+      },
+    );
+  }
+
+  test(
+    'runtime provenance rejects wrong metadata owner and changed opaque descriptor',
+    () async {
+      final transport = _ProviderTransport();
+      final rows = transport.runtimeProviders();
+      rows[0]['binding'] = {'kind': 'profile', 'id': '1'};
+      rows[2]['binding'] = {
+        'kind': 'external-provider',
+        'id': _opaqueId,
+        'profileId': _profileId,
+        'purpose': 'rule-providers',
+        'sourceVersion': List.filled(64, 'c').join(),
+      };
+      transport.runtimeRows = rows;
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final snapshot = await helper.runtimeProviders();
+      await expectLater(
+        helper.resolveRuntimeBinding(snapshot.providers[0]),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'binding_target_changed',
+          ),
+        ),
+      );
+      await expectLater(
+        helper.resolveRuntimeBinding(snapshot.providers[2]),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(_businessPosts(transport), isEmpty);
+    },
+  );
+
+  test(
+    'runtime provenance rejects wrong opaque owner and invalidates native rows on session or repository change',
+    () async {
+      final transport = _ProviderTransport();
+      final rows = transport.runtimeProviders();
+      rows[2]['binding'] = {
+        'kind': 'external-provider',
+        'id': _opaqueId,
+        'profileId': '1',
+        'purpose': 'rule-providers',
+        'sourceVersion': _version,
+      };
+      transport.runtimeRows = rows;
+      final (repo, helper) = await _workflows(transport);
+      addTearDown(repo.close);
+      final snapshot = await helper.runtimeProviders();
+      await expectLater(
+        helper.resolveRuntimeBinding(snapshot.providers[2]),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      final otherTransport = _ProviderTransport();
+      final (otherRepo, other) = await _workflows(otherTransport);
+      addTearDown(otherRepo.close);
+      await expectLater(
+        other.resolveRuntimeBinding(snapshot.providers[0]),
+        throwsA(isA<WebApiException>()),
+      );
+      repo.endSession();
+      repo.beginSession();
+      final before = transport.requests.length;
+      await expectLater(
+        helper.resolveRuntimeBinding(snapshot.providers[0]),
+        throwsA(isA<WebApiSessionException>()),
+      );
+      expect(transport.requests.length, before);
+      expect(_businessPosts(transport), isEmpty);
+    },
+  );
+}

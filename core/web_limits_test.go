@@ -6,7 +6,10 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"io"
 	"io/fs"
 	"net"
 	"net/http/httptest"
@@ -38,29 +41,61 @@ func TestWebSessionConnectionAndRPCBounds(t *testing.T) {
 		}
 		clients = append(clients, conn)
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte(`{"id":"ready","method":"core.shutdown"}`)); err != nil {
+		if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte(`{"type":"subscribe","topics":[]}`)); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := wsutil.ReadServerData(conn); err != nil {
+		response, _, err := wsutil.ReadServerData(conn)
+		if err != nil || !bytes.Contains(response, []byte(`"type":"snapshot"`)) {
+			t.Fatalf("event snapshot: %s %v", response, err)
+		}
+		if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte(`{"type":"ping"}`)); err != nil {
 			t.Fatal(err)
+		}
+		response, _, err = wsutil.ReadServerData(conn)
+		if err != nil || !bytes.Contains(response, []byte(`"type":"pong"`)) {
+			t.Fatalf("event ping: %s %v", response, err)
 		}
 	}
 	if conn, _, err := webDial(t, server, cookie, server.URL); err == nil {
 		conn.Close()
 		t.Fatal("WebSocket connection cap exceeded")
 	}
-	for i := 0; i < cap(s.rpcSlots); i++ {
-		s.rpcSlots <- struct{}{}
+	releases := []func(){}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+	for _, control := range []bool{false, true} {
+		capacity, endpoint, lane := webAPIHeavyCapacity, "/api/v1/profiles", "heavy"
+		if control {
+			capacity, endpoint, lane = webAPIControlCapacity, "/api/v1/meta", "control"
+		}
+		for i := 0; i < capacity; i++ {
+			release, err := s.acquireAPIAdmission(context.Background(), control)
+			if err != nil {
+				t.Fatal(err)
+			}
+			releases = append(releases, release)
+		}
+		webAdmissionBusy(t, webRequest(s, "GET", endpoint, "", cookie), lane)
 	}
-	if err := wsutil.WriteClientMessage(clients[0], ws.OpText, []byte(`{"id":"busy","method":"core.shutdown"}`)); err != nil {
+	for _, release := range releases {
+		release()
+	}
+	if err := wsutil.WriteClientMessage(clients[0], ws.OpText, []byte(`{"id":"retired","method":"core.shutdown"}`)); err != nil {
 		t.Fatal(err)
 	}
-	response, _, err := wsutil.ReadServerData(clients[0])
-	for i := 0; i < cap(s.rpcSlots); i++ {
-		<-s.rpcSlots
+	header, err := ws.ReadHeader(clients[0])
+	if err != nil || header.OpCode != ws.OpClose || header.Length < 2 || header.Length > 256 {
+		t.Fatalf("events did not reject RPC with a bounded close frame: %+v %v", header, err)
 	}
-	if err != nil || !bytes.Contains(response, []byte(`"code":"busy"`)) {
-		t.Fatalf("RPC cap: %s %v", response, err)
+	body := make([]byte, header.Length)
+	if _, err := io.ReadFull(clients[0], body); err != nil {
+		t.Fatal(err)
+	}
+	if binary.BigEndian.Uint16(body[:2]) != uint16(ws.StatusPolicyViolation) {
+		t.Fatalf("RPC close code: %d", binary.BigEndian.Uint16(body[:2]))
 	}
 	s.mu.Lock()
 	for len(s.sessions) < webMaxSessions {

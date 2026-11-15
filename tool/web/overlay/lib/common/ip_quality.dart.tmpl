@@ -1,0 +1,58 @@
+import 'package:dio/dio.dart';
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_utilities/index.dart';
+
+typedef IpQualityFailure = ({
+  IpQualitySource source,
+  IpQualitySourceStatus status,
+});
+
+class IpQualityLookupException implements Exception {
+  const IpQualityLookupException(this.failures);
+  final List<IpQualityFailure> failures;
+}
+
+Future<WebUtilityIpQuality> lookupWebIpQuality(
+  String ip, {
+  required CancelToken cancelToken,
+  bool refresh = false,
+}) async {
+  if (cancelToken.isCancelled) throw cancelToken.cancelError!;
+  try {
+    final result = await webUtilities.lookupIpQuality(ip, refresh: refresh);
+    if (cancelToken.isCancelled) throw cancelToken.cancelError!;
+    return result;
+  } on WebApiException catch (error) {
+    if (error.code != 'ip_quality_unavailable') rethrow;
+    final details = apiObject(error.details, 'IP quality failures');
+    final failures = <IpQualityFailure>[];
+    for (final row in apiList(details['failures'])) {
+      final failure = apiObject(row, 'IP quality failure');
+      final source = IpQualitySource.values
+          .where((source) => source.name == failure['source'])
+          .firstOrNull;
+      final status = IpQualitySourceStatus.values
+          .where((status) => status.name == failure['status'])
+          .firstOrNull;
+      if (source == null ||
+          status == null ||
+          failures.any((failure) => failure.source == source)) {
+        throw const WebApiProtocolException(
+          'Invalid IP quality failure source',
+        );
+      }
+      failures.add((source: source, status: status));
+    }
+    throw IpQualityLookupException(List.unmodifiable(failures));
+  }
+}
+
+Future<IpQuality> lookupIpQuality(
+  Dio dio,
+  String ip, {
+  required CancelToken cancelToken,
+  Duration timeout = const Duration(seconds: 8),
+  Duration hedge = const Duration(seconds: 1),
+}) async => (await lookupWebIpQuality(ip, cancelToken: cancelToken)).quality;

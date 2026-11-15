@@ -9,6 +9,28 @@ from unittest.mock import patch
 
 import build
 import stage
+from validate_artifact import ERROR, Finding, Report
+
+
+# The build's artifact gates stay real; this fixture only stands in for the pub
+# resolution the Web tree would get after the cache manager is removed.
+def write_mock_pub_dependencies(cwd):
+    root = Path(cwd)
+    (root / '.dart_tool').mkdir(parents=True, exist_ok=True)
+    (root / '.dart_tool/package_config.json').write_text(
+        json.dumps({'configVersion': 2, 'packages': []}) + '\n')
+    (root / 'pubspec.lock').write_text(
+        '# Mock resolution for the Web dependency set.\n'
+        'packages:\n'
+        '  path:\n'
+        '    dependency: "direct main"\n'
+        '    description:\n'
+        '      name: path\n'
+        '      url: "https://pub.dev"\n'
+        '    source: hosted\n'
+        '    version: "1.9.1"\n'
+        'sdks:\n'
+        '  dart: ">=3.13.0 <4.0.0"\n')
 
 
 # WEBPANEL.md and README Web build claims are exercised through staging and build entrypoints.
@@ -44,6 +66,10 @@ class WebStagingTests(unittest.TestCase):
         return {str(file.relative_to(root)): hashlib.sha256(file.read_bytes()).hexdigest()
                 for file in root.rglob('*') if file.is_file()}
 
+    def digest_sources(self):
+        return {key: value for key, value in self.digest(self.source).items()
+                if not key.startswith(('dist/', 'build/'))}
+
     def test_stage_preserves_native_and_generated_sources_and_controller_default(self):
         before = self.digest(self.source)
         output = stage.stage(self.source, self.output())
@@ -55,12 +81,52 @@ class WebStagingTests(unittest.TestCase):
         self.assertIn('ui.Clip.antiAlias', (output / 'plugins/prism_ui/lib/liquid_glass.dart').read_text())
         self.assertIn('config.setup', (output / 'plugins/rust_api/lib/rust_api.dart').read_text())
         self.assertNotIn('"setupConfig"', (output / 'plugins/rust_api/lib/rust_api.dart').read_text())
+        database_generated = self.source / 'lib/database/generated'
+        self.assertTrue(database_generated.is_dir(),
+                        'The native database generated part must exist to be excluded')
         for file in (self.source / 'lib').rglob('*.dart'):
-            if stage.generated(file):
-                self.assertEqual(file.read_bytes(), (output / file.relative_to(self.source)).read_bytes())
+            if not stage.generated(file):
+                continue
+            relative = file.relative_to(self.source)
+            if file.is_relative_to(database_generated):
+                self.assertFalse((output / relative).exists(),
+                                 f'native database generated part survived staging: {relative}')
+                continue
+            self.assertEqual(file.read_bytes(), (output / relative).read_bytes(),
+                             f'generated source changed outside the excluded database part: {relative}')
+        for part in (self.source / 'lib/database').rglob('*.dart'):
+            relative = part.relative_to(self.source)
+            if relative.as_posix() == 'lib/database/database.dart':
+                continue
+            self.assertFalse((output / relative).exists(),
+                             f'native database part survived staging: {relative}')
+        exempted = {file.relative_to(self.source).as_posix()
+                    for file in database_generated.rglob('*') if file.is_file()}
+        missing_generated = {file.relative_to(self.source).as_posix()
+                             for file in (self.source / 'lib').rglob('*.dart')
+                             if stage.generated(file) and not (output / file.relative_to(self.source)).exists()}
+        self.assertEqual(exempted, missing_generated,
+                         'Only the staged native database generated part may be excluded')
+        staged_database = (output / 'lib/database/database.dart').read_text()
+        self.assertNotIn('@DriftDatabase', staged_database)
+        self.assertNotIn('package:drift/', staged_database)
+        self.assertNotIn('QueryExecutor', staged_database)
+        self.assertFalse((output / 'lib/web_shim/drift_native.dart').exists())
+        self.assertFalse((output / 'web/sqlite3.wasm').exists())
         self.assertFalse((output / 'core/cmd/flclash-web/web_dist').exists())
         self.assertFalse((output / 'tool').exists())
         self.assertFalse((self.source / 'lib/web_auth').exists())
+        self.assertNotIn('WebLogoutScope', (self.source / 'lib/application.dart').read_text())
+        self.assertIn('child: WebLogoutScope(child: child!)', (output / 'lib/application.dart').read_text())
+        self.assertNotIn('footerAction', (self.source / 'plugins/prism_ui/lib/sidebar.dart').read_text())
+        self.assertIn('footerAction: webLogoutNavigationAction(context)',
+                      (output / 'lib/manager/app_manager.dart').read_text())
+        self.assertIn('action: navigationAction', (output / 'lib/pages/home.dart').read_text())
+        self.assertIn('hasAction: navigationAction != null', (output / 'lib/pages/home.dart').read_text())
+        self.assertNotIn("ValueKey('web-log-out')", (output / 'lib/web_auth/account_view.dart').read_text())
+        for relative in ('plugins/prism_ui/lib/sidebar.dart', 'plugins/prism_ui/lib/navigation_dock.dart',
+                         'plugins/prism_ui/lib/navigation_bar.dart'):
+            self.assertIn('NavigationAction?', (output / relative).read_text())
         self.assertNotIn('WebAccountItem', (self.source / 'lib/views/tools.dart').read_text())
         self.assertIn('if (webPanelBuild) const WebAccountItem()', (output / 'lib/views/tools.dart').read_text())
         self.assertIn("kIsWeb && bool.fromEnvironment('WEB_PANEL')",
@@ -74,6 +140,43 @@ class WebStagingTests(unittest.TestCase):
             self.assertEqual(web, {key: staged[key] for key in web})
         self.assertTrue(json.loads((output / '.webpanel-stage.json').read_text())['import_rewrites'])
 
+    def test_staged_bootstrap_wires_scheduler_import_and_registers_before_initialize(self):
+        output = stage.stage(self.source, self.output())
+        bootstrap = (output / 'lib/bootstrap.dart').read_text()
+        lines = [line.strip() for line in bootstrap.splitlines()]
+        # Stage4 shipped a required overlay without its bootstrap import.
+        for line in (
+            "import 'package:fl_clash/web_workflows/index.dart';",
+            "import 'package:fl_clash/web_utilities/index.dart';",
+            "import 'package:fl_clash/web_scheduler/index.dart';",
+            "import 'package:fl_clash/web_settings/providers.dart';",
+            "import 'package:fl_clash/web_api_recovery/index.dart';",
+        ):
+            self.assertEqual(1, lines.count(line), f'missing or duplicated staged import: {line}')
+        last_import = max(index for index, line in enumerate(lines) if line.startswith('import '))
+        self.assertLessEqual(lines.index("import 'package:fl_clash/web_scheduler/index.dart';"),
+                             last_import, 'web_scheduler import must stay in the import block')
+
+        def position(token):
+            self.assertEqual(1, bootstrap.count(token), f'expected exactly one {token}')
+            return bootstrap.index(token)
+
+        settings = position('final settings = webSettings;')
+        workflow = position('registerWebWorkflowReceipts(webApiRepository);')
+        utility = position('registerWebUtilityReceipts(webApiRepository);')
+        scheduler = position('registerWebSchedulerReceipts(webApiRepository);')
+        runtime = position('WebRuntimeBinding.configure(webApiRepository);')
+        initialize = position('await webApiRepository.initialize();')
+        recovery = position('await waitForWebApiRecovery(webApiRepository);')
+        migration = position('await migration.run();')
+        profile_query = position('database.profilesDao.query()')
+        for earlier, later in ((settings, workflow), (workflow, utility),
+                               (utility, scheduler), (scheduler, runtime),
+                               (runtime, initialize), (initialize, recovery),
+                               (recovery, migration), (recovery, profile_query)):
+            self.assertLess(earlier, later)
+        self.assertNotIn('_claimDataDirectory', bootstrap)
+
     def test_missing_anchor_fails_without_partial_output_or_source_mutation(self):
         file = self.source / 'lib/plugins/app.dart'
         original = file.read_text()
@@ -86,6 +189,21 @@ class WebStagingTests(unittest.TestCase):
             self.assertEqual(before, self.digest(self.source))
             self.assertFalse(output.exists())
             self.assertEqual([], list(self.base.glob('.webpanel-stage-*')))
+        finally:
+            file.write_text(original)
+
+    def test_navigation_scope_anchor_is_strict_and_never_changes_native_checkout(self):
+        file = self.source / 'lib/application.dart'
+        original = file.read_text()
+        output = self.output()
+        try:
+            file.write_text(original.replace('              terminateSignals: _terminateSignals,',
+                                             '              terminateSignals: changedSignal,'))
+            before = self.digest(self.source)
+            with self.assertRaisesRegex(stage.StageError, 'lib/application.dart'):
+                stage.stage(self.source, output)
+            self.assertEqual(before, self.digest(self.source))
+            self.assertFalse(output.exists())
         finally:
             file.write_text(original)
 
@@ -116,6 +234,8 @@ class WebStagingTests(unittest.TestCase):
         calls = []
         def fake_run(arguments, cwd=None, capture=False, env=None):
             calls.append((arguments, cwd, env))
+            if arguments[:3] == ['flutter', 'pub', 'get']:
+                write_mock_pub_dependencies(cwd)
             if arguments[:3] == ['flutter', 'build', 'web']:
                 web = cwd / 'build/web'
                 web.mkdir(parents=True)
@@ -124,13 +244,13 @@ class WebStagingTests(unittest.TestCase):
             if arguments[:2] == ['go', 'build']:
                 self.assertEqual('authenticated shell', (cwd / 'cmd/flclash-web/web_dist/index.html').read_text())
                 Path(arguments[arguments.index('-o') + 1]).write_bytes(b'binary')
-        before = self.digest(self.source)
+        before = self.digest_sources()
         with patch.object(build, 'ROOT', self.source), patch.object(build, 'preflight', return_value=(
             '0.9.3', 'webpanel,with_gvisor', '-w -s', 'v1.19.33',
         )), patch.object(build, 'run', side_effect=fake_run):
             build.build()
             build.build(safe_mode=True)
-        native_after = self.digest(self.source)
+        native_after = self.digest_sources()
         self.assertEqual(before, {key: native_after[key] for key in before})
         self.assertEqual(b'binary', (self.source / 'dist/FlClash-web').read_bytes())
         go = [call for call in calls if call[0][:2] == ['go', 'build']]
@@ -155,6 +275,8 @@ class WebStagingTests(unittest.TestCase):
         before = self.digest(self.source / 'lib')
         pubspec = (self.source / 'pubspec.yaml').read_bytes()
         def failed_run(arguments, **kwargs):
+            if arguments[:3] == ['flutter', 'pub', 'get']:
+                write_mock_pub_dependencies(kwargs.get('cwd'))
             if arguments[:3] == ['flutter', 'build', 'web']:
                 raise subprocess.CalledProcessError(1, arguments)
         with patch.object(build, 'ROOT', self.source), patch.object(build, 'preflight', return_value=(
@@ -166,6 +288,45 @@ class WebStagingTests(unittest.TestCase):
         self.assertEqual(pubspec, (self.source / 'pubspec.yaml').read_bytes())
         self.assertEqual(b'previous-release', binary.read_bytes())
         self.assertEqual(b'', (self.source / 'core/cmd/flclash-web/web_dist/.gitkeep').read_bytes())
+
+    def test_artifact_validation_failure_preserves_previous_binary_and_native_sources(self):
+        dist = self.source / 'dist'
+        dist.mkdir(exist_ok=True)
+        binary = dist / 'FlClash-web'
+        binary.write_bytes(b'previous-release')
+        before = self.digest(self.source / 'lib')
+        gates = []
+
+        def fake_run(arguments, cwd=None, capture=False, env=None):
+            if arguments[:3] == ['flutter', 'pub', 'get']:
+                write_mock_pub_dependencies(cwd)
+            elif arguments[:3] == ['flutter', 'build', 'web']:
+                web = cwd / 'build/web'
+                web.mkdir(parents=True, exist_ok=True)
+                (web / 'index.html').write_text('authenticated shell')
+                (web / 'main.dart.js').write_text('compiled')
+            elif arguments[:2] == ['go', 'build']:
+                Path(arguments[arguments.index('-o') + 1]).write_bytes(b'rejected-build')
+
+        def fake_validation(**inputs):
+            gates.append(sorted(inputs))
+            if inputs.get('server') is not None:
+                return Report(findings=[
+                    Finding(ERROR, 'synthetic_artifact', 'server', 'gate failure'),
+                ])
+            return Report()
+
+        with patch.object(build, 'ROOT', self.source), patch.object(build, 'preflight', return_value=(
+            '0.9.3', 'webpanel,with_gvisor', '-w -s', 'v1.19.33',
+        )), patch.object(build, 'run', side_effect=fake_run), \
+                patch.object(build, 'validate_artifact', side_effect=fake_validation):
+            with self.assertRaisesRegex(stage.StageError, 'synthetic_artifact'):
+                build.build()
+
+        self.assertEqual([['deps', 'staged'], ['web'], ['server']], gates)
+        self.assertEqual(b'previous-release', binary.read_bytes())
+        self.assertEqual([], list(dist.glob('.FlClash-web-*')))
+        self.assertEqual(before, self.digest(self.source / 'lib'))
 
     def test_generated_caching_worker_is_rejected_without_modifying_generated_content(self):
         directory = self.output()

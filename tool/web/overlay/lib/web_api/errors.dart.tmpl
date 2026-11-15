@@ -1,0 +1,64 @@
+class WebApiException implements Exception {
+  const WebApiException(
+    this.code,
+    this.message, {
+    this.status,
+    this.revision,
+    this.details,
+  });
+
+  final String code;
+  final String message;
+  final int? status;
+  final String? revision;
+  final Object? details;
+
+  @override
+  String toString() => 'WebApiException($code): $message';
+}
+
+class WebApiProtocolException extends WebApiException {
+  const WebApiProtocolException(String message)
+    : super('invalid_api_response', message);
+}
+
+class WebApiSessionException extends WebApiException {
+  const WebApiSessionException()
+    : super('session_changed', 'The authenticated session has ended');
+}
+
+class WebApiUnknownCommitException extends WebApiException {
+  const WebApiUnknownCommitException(this.operationId)
+    : super(
+        'commit_unknown',
+        'The command may have committed; recover its operation receipt',
+      );
+
+  final String operationId;
+}
+
+class WebApiOperationSupersededException extends WebApiException {
+  const WebApiOperationSupersededException()
+    : super(
+        'operation_superseded',
+        'This operation was explicitly settled or acknowledged',
+      );
+}
+
+class WebApiCommittedProjectionException extends WebApiException {
+  const WebApiCommittedProjectionException(this.operationId, String revision)
+    : super(
+        'committed_refresh_failed',
+        'The command committed; reload its canonical projection',
+        revision: revision,
+      );
+
+  final String operationId;
+}
+
+class WebApiPendingOperationException extends WebApiException {
+  const WebApiPendingOperationException(this.operationId)
+    : super('operation_pending', 'Recover the pending operation first');
+
+  final String operationId;
+}

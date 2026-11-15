@@ -1,0 +1,93 @@
+import 'dart:async';
+
+import 'errors.dart';
+
+class ApiQuery<T> {
+  const ApiQuery(this._read, this._changes, {int Function()? sessionEpoch})
+    : _sessionEpoch = sessionEpoch;
+
+  final Future<List<T>> Function() _read;
+  final Stream<void> _changes;
+  final int Function()? _sessionEpoch;
+
+  Future<List<T>> get() async {
+    final epoch = _sessionEpoch?.call();
+    final rows = await _read();
+    if (epoch != _sessionEpoch?.call()) throw const WebApiSessionException();
+    return rows;
+  }
+
+  ApiQuery<R> map<R>(R Function(T value) transform) => ApiQuery(
+    () async => [for (final row in await get()) transform(row)],
+    _changes,
+    sessionEpoch: _sessionEpoch,
+  );
+
+  Future<T> getSingle() async => _single(await get());
+
+  Future<T?> getSingleOrNull() async => _singleOrNull(await get());
+
+  Stream<T> watchSingle() => watch().map(_single);
+
+  Stream<T?> watchSingleOrNull() => watch().map(_singleOrNull);
+
+  Stream<List<T>> watch() =>
+      Stream<(List<T>, int?)>.multi((controller) {
+            var cancelled = false;
+            var reading = false;
+            var requested = 0;
+            Future<void> refresh() async {
+              requested++;
+              if (reading) return;
+              reading = true;
+              try {
+                while (!cancelled) {
+                  final current = requested;
+                  final epoch = _sessionEpoch?.call();
+                  try {
+                    final rows = await get();
+                    if (!cancelled && current == requested) {
+                      controller.add((rows, epoch));
+                    }
+                  } catch (error, stack) {
+                    if (!cancelled && current == requested) {
+                      controller.addError(error, stack);
+                    }
+                  }
+                  if (current == requested) break;
+                }
+              } finally {
+                reading = false;
+              }
+            }
+
+            final subscription = _changes.listen(
+              (_) => unawaited(refresh()),
+              onError: controller.addError,
+              onDone: () {
+                cancelled = true;
+                controller.close();
+              },
+            );
+            controller.onCancel = () async {
+              cancelled = true;
+              await subscription.cancel();
+            };
+            unawaited(refresh());
+          })
+          .where(
+            (delivery) =>
+                _sessionEpoch == null || delivery.$2 == _sessionEpoch(),
+          )
+          .map((delivery) => delivery.$1);
+
+  T _single(List<T> rows) {
+    if (rows.length != 1) throw StateError('Expected exactly one API result');
+    return rows.single;
+  }
+
+  T? _singleOrNull(List<T> rows) {
+    if (rows.length > 1) throw StateError('Expected at most one API result');
+    return rows.firstOrNull;
+  }
+}

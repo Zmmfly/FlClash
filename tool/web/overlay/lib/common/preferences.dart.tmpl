@@ -1,0 +1,55 @@
+import 'package:fl_clash/common/boot_record.dart';
+import 'package:fl_clash/common/system_dns.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_settings/presentation.dart';
+import 'package:fl_clash/web_settings/providers.dart';
+import 'package:flutter/foundation.dart';
+
+class Preferences {
+  factory Preferences() => _instance;
+  Preferences._();
+  static final _instance = Preferences._();
+
+  Future<bool> get isInit async => true;
+  @visibleForTesting
+  Future<void> rebind() => webSettings.load(refresh: true);
+  Future<int> getVersion() async => 1;
+  Future<void> setVersion(int version) async {}
+  Future<int> getUpgradeVersion() async => 4;
+  Future<void> setUpgradeVersion(int version) async {}
+  Future<Map<String, Object?>?> getConfigMap() async =>
+      settingsJson(await webSettings.load());
+  Future<Config?> getConfig() => webSettings.load();
+  Future<bool> saveConfig(Config config) async {
+    await webSettings.savePresentation(config);
+    return true;
+  }
+
+  Future<Map<String, Object?>?> getClashConfigMap() async => null;
+  Future<void> clearClashConfig() async {}
+  Future<void> clearPreferences() => webSettings.clearPresentation();
+  Future<String?> getAppliedConfigMd5() async => null;
+  Future<void> saveAppliedConfigMd5(String? md5) async {
+    throw UnsupportedError('Web applied state belongs to the server runtime');
+  }
+
+  Future<void> saveShareState(SharedState shareState) async {
+    throw UnsupportedError('Web runtime shared state is server-owned');
+  }
+
+  Future<SystemDnsRecord?> getSystemDnsRecord() async => null;
+  Future<void> saveSystemDnsRecord(SystemDnsRecord record) async {
+    throw UnsupportedError('Browser settings cannot change system DNS');
+  }
+
+  Future<void> clearSystemDnsRecord() async {
+    throw UnsupportedError('Browser settings cannot change system DNS');
+  }
+
+  Future<BootRecord?> getBootRecord() async => null;
+  Future<void> saveBootRecord(BootRecord record) async {
+    throw UnsupportedError('Native boot recovery is not browser authority');
+  }
+}
+
+final preferences = Preferences();

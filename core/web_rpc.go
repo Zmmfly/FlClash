@@ -117,6 +117,9 @@ func (s *WebServer) webRPC(call *MethodCall) (response []byte) {
 	}()
 	result, err := s.runWebRPC(call)
 	if err != nil {
+		if isDependencyPolicyError(err) {
+			return encodeResponse(MethodResponse{ID: call.ID, Error: asMethodError(err)})
+		}
 		var methodErr *MethodError
 		if errors.As(err, &methodErr) {
 			return encodeResponse(MethodResponse{ID: call.ID, Error: methodErr})
@@ -171,6 +174,9 @@ func (s *WebServer) runWebRPC(call *MethodCall) (any, error) {
 			base.Path = filename
 			document, err := mergeProfileBase(&base)
 			if err != nil {
+				if isDependencyPolicyError(err) {
+					return nil, err
+				}
 				return nil, errors.New("cannot build profile")
 			}
 			data, err := yaml.Marshal(document)
@@ -221,6 +227,9 @@ func (s *WebServer) runWebRPC(call *MethodCall) (any, error) {
 		if call.decodeArguments(&params) != nil {
 			return nil, errors.New("invalid setup arguments")
 		}
+		if params.Base != nil && params.ConfigPath != "" {
+			return nil, dependencyPolicy("invalid_setup_source", "base", "config-path")
+		}
 		var data []byte
 		var err error
 		if params.Base != nil {
@@ -234,10 +243,15 @@ func (s *WebServer) runWebRPC(call *MethodCall) (any, error) {
 				data, err = yaml.Marshal(document)
 				return nil, err
 			})
+		} else if params.ConfigPath != "" {
+			data, err = s.readRPCPath(params.ConfigPath)
 		} else {
 			data, err = s.readRPCPath("/data/config.yaml")
 		}
 		if err != nil {
+			if isDependencyPolicyError(err) {
+				return nil, err
+			}
 			return nil, errors.New("setup profile unavailable or invalid")
 		}
 		data, err = s.sanitizeConfig(data)
@@ -247,17 +261,9 @@ func (s *WebServer) runWebRPC(call *MethodCall) (any, error) {
 		if _, err := s.corePath("/data/config.yaml", false); err != nil {
 			return nil, err
 		}
-		var overlay map[string]any
-		if err := yaml.Unmarshal(data, &overlay); err != nil {
-			return nil, errors.New("invalid configuration")
-		}
-		delete(overlay, "rules")
-		overlayData, err := yaml.Marshal(overlay)
-		if err != nil {
-			return nil, err
-		}
 		return webWithBuffer(data, func(filename string) (any, error) {
-			params.Base = &SetupBase{Path: filename, Overlay: string(overlayData)}
+			params.Base = nil
+			params.ConfigPath = filename
 			return nil, handleSetupConfig(&params)
 		})
 	}

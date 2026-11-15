@@ -1,0 +1,116 @@
+import 'dart:convert';
+
+import '../web_api/draft_ids.dart' show maxSafeLocalId;
+import '../web_api/errors.dart';
+import '../web_api/repository.dart' show ApiEditVersion;
+
+final webRuntimeSources = WebRuntimeSources();
+
+class WebRuntimeSources {
+  final _profiles = <String, int>{};
+  final _profileVersions = <String, ApiEditVersion>{};
+  final _bufferVersions = <String, ApiEditVersion>{};
+  final _bufferProfiles = <String, int>{};
+  final _buffers = <String, String>{};
+  int _next = 0;
+  int _bytes = 0;
+
+  String profileHandle(int localId) {
+    if (localId == 0 || localId == -1 || localId.abs() > maxSafeLocalId) {
+      throw const WebApiProtocolException('Invalid local profile handle');
+    }
+    final handle = 'flclash-profile:${_next++}';
+    _profiles[handle] = localId;
+    return handle;
+  }
+
+  String versionedProfileHandle(int localId, ApiEditVersion version) {
+    final handle = profileHandle(localId);
+    _profileVersions[handle] = version;
+    return handle;
+  }
+
+  ApiEditVersion editVersion(String handle) =>
+      _profileVersions[handle] ??
+      _bufferVersions[handle] ??
+      (throw const WebApiException(
+        'edit_baseline_required',
+        'Rebuild this candidate from an actual versioned source read',
+      ));
+
+  int candidateProfileId(String handle) =>
+      _bufferProfiles[handle] ?? profileId(handle);
+
+  int profileId(String handle) {
+    final id = _profiles[handle];
+    if (id == null) {
+      throw const WebApiException(
+        'unsupported_source',
+        'Only an internal profile resource handle can identify a profile',
+      );
+    }
+    return id;
+  }
+
+  bool isProfile(String handle) => _profiles.containsKey(handle);
+
+  String editorBuffer(
+    String text, {
+    ApiEditVersion? editVersion,
+    int? profileId,
+  }) {
+    final handle = 'flclash-editor:${_next++}';
+    writeEditorBuffer(handle, text);
+    if (editVersion != null) _bufferVersions[handle] = editVersion;
+    if (profileId != null) _bufferProfiles[handle] = profileId;
+    return handle;
+  }
+
+  void writeEditorBuffer(String handle, String text) {
+    if (!handle.startsWith('flclash-editor:')) {
+      throw const WebApiException(
+        'unsupported_source',
+        'Not a local editor buffer',
+      );
+    }
+    final bytes = utf8.encode(text).length;
+    final previous = _buffers[handle];
+    final total =
+        _bytes - (previous == null ? 0 : utf8.encode(previous).length) + bytes;
+    if (bytes > 32 << 20 || total > 64 << 20) {
+      throw const WebApiException(
+        'content_too_large',
+        'The local editor buffer exceeds its memory budget',
+      );
+    }
+    _buffers[handle] = text;
+    _bytes = total;
+  }
+
+  String readEditorBuffer(String handle) {
+    final text = _buffers[handle];
+    if (text == null) {
+      throw const WebApiException(
+        'unsupported_source',
+        'Only a local in-memory editor buffer can be used as content input',
+      );
+    }
+    return text;
+  }
+
+  void dropEditorBuffer(String handle) {
+    _bufferVersions.remove(handle);
+    _bufferProfiles.remove(handle);
+    final text = _buffers.remove(handle);
+    if (text != null) _bytes -= utf8.encode(text).length;
+  }
+
+  void clear() {
+    _profiles.clear();
+    _profileVersions.clear();
+    _bufferVersions.clear();
+    _bufferProfiles.clear();
+    _buffers.clear();
+    _bytes = 0;
+  }
+}

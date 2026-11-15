@@ -1,0 +1,351 @@
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart';
+
+export 'package:fl_clash/web_api/index.dart'
+    show ApiQuery, IconRecord, IpQualityRecord;
+
+class Database {
+  Database({WebApiRepository? repository})
+    : repository = repository ?? webApiRepository;
+
+  final WebApiRepository repository;
+
+  late final profilesDao = ProfilesDao(repository);
+  late final rulesDao = RulesDao(repository);
+  late final proxyGroupsDao = ProxyGroupsDao(repository);
+  late final customProxiesDao = CustomProxiesDao(repository);
+  late final scriptsDao = ScriptsDao(repository);
+  late final clashProvidersDao = ClashProvidersDao(repository);
+  late final iconSetsDao = IconSetsDao(repository);
+  late final mitmModulesDao = MitmModulesDao(repository);
+  late final proxyDialersDao = ProxyDialersDao(repository);
+  late final iconRecordsDao = IconRecordsDao(repository);
+  late final ipQualitiesDao = IpQualitiesDao(repository);
+
+  Future<void> deleteProfile(int id, {required ApiEditVersion editVersion}) =>
+      repository.deleteProfile(id, editVersion: editVersion);
+
+  Future<void> close() => repository.close();
+}
+
+class ProfilesDao {
+  const ProfilesDao(this.repository);
+  final WebApiRepository repository;
+
+  ApiQuery<Profile> query() => repository.profiles();
+  ApiQuery<int> ids() => query().map((profile) => profile.id);
+  ApiQuery<int> customIds() => repository.queryProjection(
+    () async => [
+      for (final profile in await query().get())
+        if (profile.type == ProfileType.custom) profile.id,
+    ],
+  );
+
+  Future<Profile?> get(int id) => repository.profiles(id: id).getSingleOrNull();
+  Future<Profile> save(Profile profile, {ApiEditVersion? editVersion}) =>
+      repository.saveProfile(profile, editVersion: editVersion);
+  Future<void> reorder(List<int> ids, {required ApiEditVersion editVersion}) =>
+      repository.reorderProfiles(ids, editVersion: editVersion);
+
+  static int compare(Profile a, Profile b) => switch ((a.order, b.order)) {
+    (final x?, final y?) when x != y => x.compareTo(y),
+    (null, _?) => 1,
+    (_?, null) => -1,
+    _ => a.id.compareTo(b.id),
+  };
+}
+
+class RulesDao {
+  const RulesDao(this.repository);
+  final WebApiRepository repository;
+
+  ApiQuery<Rule> queryGlobalRules() => repository.rules();
+  ApiQuery<Rule> queryProfileRules(int profileId) =>
+      repository.rules(profileId: profileId);
+  ApiQuery<Rule> queryAddedRules(int profileId) =>
+      repository.rules(profileId: profileId, added: true);
+  ApiQuery<int> queryDisabledRuleIds(int profileId) =>
+      repository.disabledRuleIds(profileId);
+  ApiQuery<int> profileRulesCount(int profileId) => repository.queryProjection(
+    () async => [(await queryProfileRules(profileId).get()).length],
+  );
+
+  Future<int> putRule(
+    Rule rule, {
+    int? profileId,
+    ApiEditVersion? editVersion,
+  }) async => (await repository.saveRule(
+    rule,
+    profileId: profileId,
+    editVersion: editVersion,
+  )).id;
+  Future<void> delRules(
+    Iterable<int> ids, {
+    required ApiEditVersion editVersion,
+  }) => repository.deleteRules(ids, editVersion: editVersion);
+  Future<void> reorder(
+    int? profileId,
+    List<int> ids, {
+    required ApiEditVersion editVersion,
+  }) => repository.reorderRules(
+    profileId: profileId,
+    ids: ids,
+    editVersion: editVersion,
+  );
+  Future<List<Rule>> replace(
+    int profileId,
+    List<Rule> rules, {
+    required ApiEditVersion editVersion,
+  }) => repository.replaceProfileRules(
+    profileId,
+    rules,
+    editVersion: editVersion,
+  );
+
+  Future<int> putDisabled(int profileId, int ruleId) =>
+      repository.runIntent(() async {
+        final ids = await queryDisabledRuleIds(profileId).get();
+        await repository.replaceDisabledRules(profileId, {
+          ...ids,
+          ruleId,
+        }, editVersion: repository.captureEditVersion(ApiIdentity.rule, ids));
+        return ruleId;
+      });
+
+  Future<int> delDisabled(int profileId, int ruleId) =>
+      repository.runIntent(() async {
+        final ids = await queryDisabledRuleIds(profileId).get();
+        await repository.replaceDisabledRules(
+          profileId,
+          ids.where((id) => id != ruleId),
+          editVersion: repository.captureEditVersion(ApiIdentity.rule, ids),
+        );
+        return ruleId;
+      });
+
+  Future<Map<int, Set<String>>> targetsNaming(Set<String> names) async {
+    final result = <int, Set<String>>{};
+    for (final profile in await repository.profiles().get()) {
+      for (final rule in await queryProfileRules(profile.id).get()) {
+        if (names.contains(rule.ruleTarget)) {
+          result.putIfAbsent(profile.id, () => {}).add(rule.ruleTarget!);
+        }
+      }
+    }
+    return result;
+  }
+
+  Future<Set<int>> profileIdsUsingRuleProvider(String provider) async {
+    final ids = <int>{};
+    for (final profile in await repository.profiles().get()) {
+      if (profile.type != ProfileType.custom) continue;
+      if ((await queryProfileRules(
+        profile.id,
+      ).get()).any((rule) => rule.ruleSets.contains(provider))) {
+        ids.add(profile.id);
+      }
+    }
+    return ids;
+  }
+}
+
+class CatalogDao<T> {
+  const CatalogDao(this.repository, this.spec);
+  final WebApiRepository repository;
+  final ApiCatalog<T> spec;
+
+  ApiQuery<T> query() => repository.catalog(spec);
+  Future<T> save(T value, {ApiEditVersion? editVersion}) =>
+      repository.saveCatalog(spec, value, editVersion: editVersion);
+  Future<void> delAll(
+    Iterable<int> ids, {
+    required ApiEditVersion editVersion,
+  }) => repository.deleteCatalog(spec, ids, editVersion: editVersion);
+  Future<void> reorder(List<int> ids, {required ApiEditVersion editVersion}) =>
+      repository.reorderCatalog(spec, ids, editVersion: editVersion);
+  Future<List<T>> replace(
+    List<T> values, {
+    required ApiEditVersion editVersion,
+  }) => repository.replaceCatalog(spec, values, editVersion: editVersion);
+}
+
+class ProxyGroupsDao {
+  const ProxyGroupsDao(this.repository);
+  final WebApiRepository repository;
+
+  ApiQuery<ProxyGroup> query(int profileId) =>
+      repository.catalog(repository.groups, profileId: profileId);
+  ApiQuery<int> profileGroupsCount(int profileId) => repository.queryProjection(
+    () async => [(await query(profileId).get()).length],
+  );
+
+  ApiQuery<String> names({int? except}) => repository.queryProjection(
+    () async => {
+      for (final group in await repository.catalog(repository.groups).get())
+        if (except == null || group.profileId != except) group.name,
+    }.toList(),
+  );
+
+  Future<Set<int>> profileIdsUsing(String provider) async => {
+    for (final group in await repository.catalog(repository.groups).get())
+      if (group.use?.contains(provider) ?? false) group.profileId!,
+  };
+
+  Future<ProxyGroup> save(
+    int profileId,
+    ProxyGroup group, {
+    ApiEditVersion? editVersion,
+  }) => repository.saveCatalog(
+    repository.groups,
+    group,
+    profileId: profileId,
+    editVersion: editVersion,
+  );
+  Future<void> delAll(
+    int profileId,
+    Iterable<int> ids, {
+    required ApiEditVersion editVersion,
+  }) => repository.deleteCatalog(
+    repository.groups,
+    ids,
+    profileId: profileId,
+    editVersion: editVersion,
+  );
+  Future<void> reorder(
+    int profileId,
+    List<int> ids, {
+    required ApiEditVersion editVersion,
+  }) => repository.reorderCatalog(
+    repository.groups,
+    ids,
+    profileId: profileId,
+    editVersion: editVersion,
+  );
+  Future<List<ProxyGroup>> replace(
+    int profileId,
+    List<ProxyGroup> groups, {
+    required ApiEditVersion editVersion,
+  }) => repository.replaceCatalog(
+    repository.groups,
+    groups,
+    profileId: profileId,
+    editVersion: editVersion,
+  );
+}
+
+class CustomProxiesDao extends CatalogDao<CustomProxy> {
+  CustomProxiesDao(WebApiRepository repository)
+    : super(repository, repository.proxies);
+}
+
+class ScriptsDao extends CatalogDao<Script> {
+  ScriptsDao(WebApiRepository repository)
+    : super(repository, repository.scripts);
+
+  ApiQuery<Script> get(int id) => repository.queryProjection(
+    () async => [
+      for (final script in await query().get())
+        if (script.id ==
+            repository.identities.canonical(ApiIdentity.script, id))
+          script,
+    ],
+  );
+  ApiQuery<int> ids() => query().map((script) => script.id);
+}
+
+class ClashProvidersDao extends CatalogDao<ClashProvider> {
+  ClashProvidersDao(WebApiRepository repository)
+    : super(repository, repository.providers);
+}
+
+class IconSetsDao extends CatalogDao<IconSet> {
+  IconSetsDao(WebApiRepository repository)
+    : super(repository, repository.iconSets);
+}
+
+class MitmModulesDao extends CatalogDao<MitmModule> {
+  MitmModulesDao(WebApiRepository repository)
+    : super(repository, repository.modules);
+}
+
+class ProxyDialersDao {
+  const ProxyDialersDao(this.repository);
+  final WebApiRepository repository;
+
+  ApiQuery<ProxyDialer> query(int profileId) => repository.dialers(profileId);
+  Future<void> setAll(
+    int profileId,
+    Map<int, String> dialers, {
+    required ApiEditVersion editVersion,
+  }) => repository.replaceDialers(profileId, dialers, editVersion: editVersion);
+
+  Future<void> set(int profileId, int proxyId, String? target) =>
+      repository.runIntent(() async {
+        final rows = await query(profileId).get();
+        final version = repository.captureEditVersion(
+          ApiIdentity.profile,
+          rows,
+        );
+        final current = {for (final item in rows) item.proxyId: item.target};
+        if (target == null) {
+          current.remove(proxyId);
+        } else {
+          current[proxyId] = target;
+        }
+        await setAll(profileId, current, editVersion: version);
+      });
+
+  Future<Map<int, Set<String>>> targetsNaming(Set<String> names) async {
+    final result = <int, Set<String>>{};
+    for (final profile in await repository.profiles().get()) {
+      if (profile.type != ProfileType.custom) continue;
+      for (final dialer in await query(profile.id).get()) {
+        if (names.contains(dialer.target)) {
+          result.putIfAbsent(profile.id, () => {}).add(dialer.target);
+        }
+      }
+    }
+    return result;
+  }
+}
+
+class IconRecordsDao {
+  const IconRecordsDao(this.repository);
+  final WebApiRepository repository;
+  int get maxCapacity => 1000;
+
+  Future<IconRecord?> get(String url) async {
+    final rows = await repository.iconRecords(url: url);
+    if (rows.isEmpty) return null;
+    if (rows.length != 1) throw StateError('Duplicate icon cache entry');
+    return repository.putIcon(url, touch: true);
+  }
+
+  Future<void> put(String url) async {
+    await repository.putIcon(url);
+  }
+
+  Future<void> del(String url) => repository.deleteIcons([url]);
+  Future<List<IconRecord>> query(String query) =>
+      repository.iconRecords(query: query);
+}
+
+class IpQualitiesDao {
+  const IpQualitiesDao(this.repository);
+  final WebApiRepository repository;
+
+  Future<IpQualityRecord?> fresh(String ip, Duration maxAge) =>
+      repository.freshIpQuality(ip, maxAge);
+  Future<void> put(
+    IpQuality quality,
+    DateTime checkedAt,
+    Duration maxAge,
+  ) async {
+    await repository.putIpQuality(quality);
+  }
+}
+
+Database _database = Database();
+Database get database => _database;
+set database(Database value) => _database = value;

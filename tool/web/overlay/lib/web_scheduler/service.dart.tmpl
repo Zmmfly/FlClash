@@ -1,0 +1,58 @@
+import 'package:fl_clash/web_api/index.dart';
+
+import 'types.dart';
+
+class WebSchedulerService {
+  WebSchedulerService(this.repository) {
+    repository.registerExternalReceipt(
+      '/api/v1/scheduler:trigger',
+      WebSchedulerAccepted.decode,
+    );
+  }
+
+  final WebApiRepository repository;
+  Future<WebSchedulerStatus>? _hint;
+  int _hintEpoch = -1;
+
+  Future<WebSchedulerStatus> status() async {
+    final receipt = await repository.readExternal('/api/v1/scheduler');
+    final version = repository.captureReadVersion(receipt);
+    return WebSchedulerStatus.decode(receipt.data, version);
+  }
+
+  Future<WebSchedulerAccepted> trigger(WebSchedulerStatus original) {
+    repository.requireReadVersion(original.editVersion);
+    return repository.executeExternalCommand(
+      '/api/v1/scheduler:trigger',
+      const {'intent': 'run-due-updates'},
+      WebSchedulerAccepted.decode,
+      editVersion: original.editVersion,
+    );
+  }
+
+  Future<WebSchedulerStatus> hintDue() async {
+    final epoch = repository.client.sessionEpoch;
+    final existing = _hint;
+    if (existing != null && _hintEpoch == epoch) return existing;
+    final run = _hintDue();
+    _hint = run;
+    _hintEpoch = epoch;
+    try {
+      return await run;
+    } finally {
+      if (identical(_hint, run)) _hint = null;
+    }
+  }
+
+  Future<WebSchedulerStatus> _hintDue() async {
+    final original = await status();
+    if (original.closed ||
+        original.safeMode ||
+        original.running ||
+        !original.hasDue) {
+      return original;
+    }
+    await trigger(original);
+    return status();
+  }
+}

@@ -31,15 +31,19 @@ const (
 )
 
 type WebServerOptions struct {
-	ListenAddr   string
-	DataDir      string
-	WebDir       string
-	EmbeddedFS   fs.FS
-	Username     string
-	Password     string
-	PasswordFile string
-	AuthFile     string
-	SecureCookie bool
+	ListenAddr         string
+	DataDir            string
+	WebDir             string
+	EmbeddedFS         fs.FS
+	Username           string
+	Password           string
+	PasswordFile       string
+	AuthFile           string
+	SecureCookie       bool
+	APIStoreDir        string
+	SafeMode           bool
+	RuntimeBackend     *WebAPIRuntimeBackend
+	SourceFetchOptions WebAPISourceFetchOptions
 }
 
 type webSession struct {
@@ -70,6 +74,12 @@ type WebServer struct {
 	rpcSlots                    chan struct{}
 	coreEnabled                 atomic.Bool
 	startTimeMs                 int64
+	apiMu                       sync.Mutex
+	api                         *webServerAPI
+	apiClosed                   bool
+	apiAdmissionOnce            sync.Once
+	apiHeavySlots               chan struct{}
+	apiControlSlots             chan struct{}
 }
 
 func webCanonicalDir(name string) (string, error) {
@@ -152,6 +162,7 @@ func (s *WebServer) Close() error {
 	}
 	s.mu.Unlock()
 	var errs []error
+	errs = append(errs, s.closeAPI())
 	for _, root := range []*os.Root{s.staticRoot, s.temporary, s.data, s.authRoot} {
 		if root != nil {
 			errs = append(errs, root.Close())
@@ -228,10 +239,18 @@ func (s *WebServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("X-Frame-Options", "DENY")
 	if !s.sameOrigin(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if strings.HasPrefix(r.URL.Path, "/api/v1/") || r.URL.Path == "/ws/v1/events" {
+			WebAPIWriteError(w, webAPIError(401, "unauthorized", "A same-origin session is required"))
+		} else {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, webMaxBody)
+	limit := int64(webMaxBody)
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		limit = webAPIRequestBodyLimit(r.URL.Path)
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	if r.URL.Path == "/login" {
 		if !webMethod(w, r, http.MethodGet) {
 			return
@@ -254,11 +273,19 @@ func (s *WebServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	key, session := s.session(r)
 	if session == nil {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/") || r.URL.Path == "/ws/v1/events" {
+			WebAPIWriteError(w, webAPIError(401, "unauthorized", "An authenticated session is required"))
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws/") || r.URL.Path == "/api" || r.URL.Path == "/ws" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		} else {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 		}
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") || r.URL.Path == "/ws/v1/events" {
+		s.serveAPI(w, r)
 		return
 	}
 	switch r.URL.Path {
@@ -288,19 +315,7 @@ func (s *WebServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		http.SetCookie(w, &http.Cookie{Name: webSessionCookie, Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.opts.SecureCookie, SameSite: http.SameSiteStrictMode})
 		w.WriteHeader(http.StatusNoContent)
-	case "/ws/core":
-		if webMethod(w, r, http.MethodGet) {
-			s.serveWebSocket(w, r, key)
-		}
-	case "/api/http-proxy":
-		if webMethod(w, r, http.MethodPost) {
-			s.serveProxy(w, r)
-		}
 	default:
-		if strings.HasPrefix(r.URL.Path, "/api/fs/") {
-			s.serveFS(w, r)
-			return
-		}
 		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws/") {
 			http.NotFound(w, r)
 			return
@@ -356,6 +371,9 @@ func StartWebServer(opts WebServerOptions) error {
 		return err
 	}
 	defer s.Close()
+	if _, err := s.ensureAPI(); err != nil {
+		return err
+	}
 	address := opts.ListenAddr
 	if address == "" {
 		address = "127.0.0.1:8080"
@@ -370,6 +388,9 @@ func StartWebServer(opts WebServerOptions) error {
 		return err
 	}
 	defer restore()
+	if err := s.initializeAPICore(); err != nil {
+		return err
+	}
 	server := &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, WriteTimeout: 90 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	defer server.Close()
 	return server.Serve(listener)

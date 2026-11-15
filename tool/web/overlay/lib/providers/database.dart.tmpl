@@ -1,0 +1,735 @@
+import 'dart:async';
+
+import 'package:collection/collection.dart';
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/database/database.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/web_api/index.dart' hide snowflake, uniqueId, uuidV4;
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+
+part 'generated/database.g.dart';
+
+Future<void> withRollback<T>({
+  required T snapshot,
+  required FutureOr<void> Function() action,
+  required void Function(T) rollback,
+}) async {
+  try {
+    await action();
+  } catch (error, stack) {
+    rollback(snapshot);
+    Error.throwWithStackTrace(error, stack);
+  }
+}
+
+ApiEditVersion _needVersion(ApiEditVersion? token) =>
+    token ??
+    (throw const WebApiException(
+      'edit_baseline_required',
+      'Keep the version captured before opening the editor',
+    ));
+
+Stream<T> _sessionRows<T extends Object>(
+  WebApiRepository repository,
+  Stream<T> rows,
+  T empty,
+) =>
+    Stream<(T, int, bool)>.multi((controller) {
+          var closed = false;
+          final subscription = rows.listen(
+            (value) {
+              if (!closed) {
+                controller.add((value, repository.client.sessionEpoch, false));
+              }
+            },
+            onError: (Object error, StackTrace stack) {
+              if (!closed && repository.isSessionActive) {
+                controller.addError(error, stack);
+              }
+            },
+            onDone: () {
+              closed = true;
+              controller.close();
+            },
+          );
+          final resets = repository.sessionChanges.listen((_) {
+            if (!closed) {
+              controller.add((empty, repository.client.sessionEpoch, true));
+            }
+          });
+          controller.onCancel = () async {
+            closed = true;
+            await subscription.cancel();
+            await resets.cancel();
+          };
+        })
+        .where(
+          (event) =>
+              event.$2 == repository.client.sessionEpoch &&
+              (event.$3 || repository.ownsReadProjection(event.$1)),
+        )
+        .map((event) => event.$1);
+
+mixin _Committed<T extends Object> on AsyncNotifierMixin<T> {
+  Future<T> Function()? _query;
+
+  Stream<T> committed(Stream<T> rows, Future<T> Function() query, T empty) {
+    _query = query;
+    final subscription = database.repository.sessionChanges.listen((_) {
+      if (ref.mounted) value = empty;
+    });
+    ref.onDispose(subscription.cancel);
+    return _sessionRows(database.repository, rows, empty);
+  }
+
+  Future<R> commit<R>(Future<R> Function() action) {
+    final repository = database.repository;
+    final epoch = repository.client.sessionEpoch;
+    return repository.runIntent(() async {
+      repository.client.requireSession(epoch);
+      final result = await action();
+      repository.client.requireSession(epoch);
+      final rows = await _query!();
+      repository.client.requireSession(epoch);
+      if (ref.mounted) value = rows;
+      return result;
+    });
+  }
+
+  Future<void> submit(Future<void> Function() action) => commit(action);
+}
+
+mixin _CatalogWrites<T> on AsyncNotifierMixin<List<T>>, _Committed<List<T>> {
+  ApiCatalog<T> get catalogSpec;
+
+  Future<void> put(T item, {ApiEditVersion? editVersion}) => submit(() async {
+    await database.repository.saveCatalog(
+      catalogSpec,
+      item,
+      editVersion: editVersion,
+    );
+  });
+
+  Future<void> del(int id, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(
+          catalogSpec.identity,
+          value.firstWhere((item) => catalogSpec.localId(item) == id) as Object,
+        );
+    return submit(
+      () => database.repository.deleteCatalog(catalogSpec, [
+        id,
+      ], editVersion: version),
+    );
+  }
+
+  Future<void> order(
+    int oldIndex,
+    int newIndex, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(catalogSpec.identity, value);
+    final next = value.copyAndReorder(oldIndex, newIndex);
+    return submit(
+      () => database.repository.reorderCatalog(catalogSpec, [
+        for (final item in next) catalogSpec.localId(item),
+      ], editVersion: version),
+    );
+  }
+}
+
+@riverpod
+Stream<List<Profile>> profilesStream(Ref ref) => _sessionRows(
+  database.repository,
+  database.profilesDao.query().watch(),
+  const <Profile>[],
+);
+
+@riverpod
+Stream<Set<String>> customGroupNames(Ref ref) =>
+    database.proxyGroupsDao.names().watch().map(Set.of);
+
+@Riverpod(keepAlive: true)
+class Profiles extends _$Profiles {
+  @override
+  List<Profile> build() {
+    ref.listen(profilesStreamProvider, (_, next) {
+      if (!database.repository.isSessionActive) {
+        state = [];
+      } else if (next.value case final rows?
+          when !next.isLoading && !next.hasError) {
+        if (database.repository.ownsReadProjection(rows)) state = rows;
+      }
+    });
+    final subscription = database.repository.sessionChanges.listen((_) {
+      if (ref.mounted) state = [];
+    });
+    ref.onDispose(subscription.cancel);
+    final initial = ref.read(profilesStreamProvider);
+    final rows = initial.value;
+    return !initial.isLoading &&
+            !initial.hasError &&
+            rows != null &&
+            database.repository.ownsReadProjection(rows)
+        ? rows
+        : [];
+  }
+
+  Profile labeled(Profile profile) => state.optimizeLabel(profile);
+
+  void adoptCommitted(List<Profile> profiles) {
+    database.repository.captureEditVersion(ApiIdentity.profile, profiles);
+    state = profiles;
+  }
+
+  Future<R> _write<R>(Future<R> Function() action) {
+    final repository = database.repository;
+    final epoch = repository.client.sessionEpoch;
+    return repository.runIntent(() async {
+      repository.client.requireSession(epoch);
+      final result = await action();
+      repository.client.requireSession(epoch);
+      final rows = await database.profilesDao.query().get();
+      repository.client.requireSession(epoch);
+      if (ref.mounted) state = rows;
+      return result;
+    });
+  }
+
+  Future<Profile> putCommitted(
+    Profile profile, {
+    ApiEditVersion? editVersion,
+  }) => _write(
+    () => database.repository.saveProfile(
+      labeled(profile),
+      editVersion: editVersion,
+    ),
+  );
+
+  Future<void> put(Profile profile, {ApiEditVersion? editVersion}) async {
+    await putCommitted(profile, editVersion: editVersion);
+  }
+
+  Future<void> resetDialerOverrides(int id, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(
+          ApiIdentity.profile,
+          state.getProfile(id)!,
+        );
+    return _write(() async {
+      await database.repository.resetDialerOverrides(id, editVersion: version);
+    });
+  }
+
+  Future<void> rewriteCustom(
+    Future<Map<int, Profile Function(Profile)>> Function() body,
+  ) => Future.error(
+    UnsupportedError(
+      'Web reference rewrites are server-owned typed rename commands',
+    ),
+  );
+
+  Future<void> del(int id, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(
+          ApiIdentity.profile,
+          state.getProfile(id)!,
+        );
+    return _write(
+      () => database.repository.deleteProfile(id, editVersion: version),
+    );
+  }
+
+  Future<void> updateProfile(
+    int id,
+    Profile Function(Profile) builder, {
+    ApiEditVersion? editVersion,
+  }) {
+    final previous = state.getProfile(id);
+    if (previous == null) {
+      return Future.error(
+        const WebApiException('not_found', 'Profile not found'),
+      );
+    }
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.profile, previous);
+    final next = builder(previous);
+    if (next == previous) return Future.value();
+    return _write(() async {
+      await database.repository.saveProfile(next, editVersion: version);
+    });
+  }
+
+  Future<void> reorder(List<Profile> profiles, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureCollectionVersion(
+          ApiIdentity.profile,
+          profiles,
+        );
+    return _write(
+      () => database.repository.reorderProfiles([
+        for (final item in profiles) item.id,
+      ], editVersion: version),
+    );
+  }
+
+  @override
+  bool updateShouldNotify(List<Profile> previous, List<Profile> next) =>
+      !profileListEquality.equals(previous, next);
+}
+
+@riverpod
+class Scripts extends _$Scripts
+    with
+        AsyncNotifierMixin<List<Script>>,
+        _Committed<List<Script>>,
+        _CatalogWrites<Script> {
+  @override
+  ApiCatalog<Script> get catalogSpec => database.repository.scripts;
+  @override
+  List<Script> get value => state.value ?? [];
+  @override
+  Stream<List<Script>> build() {
+    final query = database.scriptsDao.query();
+    return committed(query.watch(), query.get, const []);
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<Script>> previous,
+    AsyncValue<List<Script>> next,
+  ) => !scriptListEquality.equals(previous.value, next.value);
+}
+
+@riverpod
+class ClashProviders extends _$ClashProviders
+    with
+        AsyncNotifierMixin<List<ClashProvider>>,
+        _Committed<List<ClashProvider>>,
+        _CatalogWrites<ClashProvider> {
+  @override
+  ApiCatalog<ClashProvider> get catalogSpec => database.repository.providers;
+  @override
+  List<ClashProvider> get value => state.value ?? [];
+  @override
+  Stream<List<ClashProvider>> build() {
+    final query = database.clashProvidersDao.query();
+    return committed(query.watch(), query.get, const []);
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<ClashProvider>> previous,
+    AsyncValue<List<ClashProvider>> next,
+  ) => !clashProviderListEquality.equals(previous.value, next.value);
+}
+
+@Riverpod(keepAlive: true)
+class IconSets extends _$IconSets
+    with
+        AsyncNotifierMixin<List<IconSet>>,
+        _Committed<List<IconSet>>,
+        _CatalogWrites<IconSet> {
+  @override
+  ApiCatalog<IconSet> get catalogSpec => database.repository.iconSets;
+  @override
+  List<IconSet> get value => state.value ?? [];
+  @override
+  Stream<List<IconSet>> build() {
+    final query = database.iconSetsDao.query();
+    return committed(query.watch(), query.get, const []);
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<IconSet>> previous,
+    AsyncValue<List<IconSet>> next,
+  ) => !iconSetListEquality.equals(previous.value, next.value);
+}
+
+@riverpod
+class MitmModules extends _$MitmModules
+    with
+        AsyncNotifierMixin<List<MitmModule>>,
+        _Committed<List<MitmModule>>,
+        _CatalogWrites<MitmModule> {
+  @override
+  ApiCatalog<MitmModule> get catalogSpec => database.repository.modules;
+  @override
+  List<MitmModule> get value => state.value ?? [];
+  @override
+  Stream<List<MitmModule>> build() {
+    final query = database.mitmModulesDao.query();
+    return committed(query.watch(), query.get, const []);
+  }
+
+  @override
+  Future<void> put(
+    MitmModule item, {
+    bool first = false,
+    ApiEditVersion? editVersion,
+  }) {
+    if (first &&
+        !database.repository.identities.isBound(
+          ApiIdentity.mitmModule,
+          item.id,
+        )) {
+      final version = _needVersion(editVersion);
+      return submit(() async {
+        await database.repository.replaceCatalog(catalogSpec, [
+          item,
+          ...value,
+        ], editVersion: version);
+      });
+    }
+    return super.put(item, editVersion: editVersion);
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<MitmModule>> previous,
+    AsyncValue<List<MitmModule>> next,
+  ) => !mitmModuleListEquality.equals(previous.value, next.value);
+}
+
+mixin _RuleListMixin on _Committed<List<Rule>> {
+  int? get ownerId;
+  @override
+  List<Rule> get value => state.value ?? [];
+
+  Future<void> persistRule(Rule rule, {ApiEditVersion? editVersion}) async {
+    await database.repository.saveRule(
+      rule,
+      profileId: ownerId,
+      editVersion: editVersion,
+    );
+  }
+
+  Future<void> put(Rule rule, {ApiEditVersion? editVersion}) =>
+      submit(() => persistRule(rule, editVersion: editVersion));
+
+  Future<void> putAll(List<Rule> rules, {ApiEditVersion? editVersion}) {
+    final version = _needVersion(editVersion);
+    final next = [...rules, ...value];
+    return submit(() async {
+      await database.repository.replaceRules(
+        ownerId,
+        next,
+        editVersion: version,
+      );
+    });
+  }
+
+  Future<void> delAll(Iterable<int> ids, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.rule, value);
+    return submit(
+      () => database.repository.deleteRules(ids, editVersion: version),
+    );
+  }
+
+  Future<void> insertAfterEach(
+    Map<int, Rule> copies, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.rule, value);
+    final next = <Rule>[];
+    for (final item in value) {
+      next.add(item);
+      if (copies[item.id] case final copy?) next.add(copy);
+    }
+    return submit(() async {
+      await database.repository.replaceRules(
+        ownerId,
+        next,
+        editVersion: version,
+      );
+    });
+  }
+
+  Future<void> order(
+    int oldIndex,
+    int newIndex, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.rule, value);
+    final ids = [
+      for (final item in value.copyAndReorder(oldIndex, newIndex)) item.id,
+    ];
+    return submit(
+      () => database.repository.reorderRules(
+        profileId: ownerId,
+        ids: ids,
+        editVersion: version,
+      ),
+    );
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<Rule>> previous,
+    AsyncValue<List<Rule>> next,
+  ) => !ruleListEquality.equals(previous.value, next.value);
+}
+
+@riverpod
+class GlobalRules extends _$GlobalRules
+    with
+        AsyncNotifierMixin<List<Rule>>,
+        _Committed<List<Rule>>,
+        _RuleListMixin {
+  @override
+  int? get ownerId => null;
+  @override
+  Stream<List<Rule>> build() {
+    final query = database.rulesDao.queryGlobalRules();
+    return committed(query.watch(), query.get, const []);
+  }
+}
+
+@riverpod
+Stream<int> profileGroupsCount(Ref ref, int profileId) =>
+    database.proxyGroupsDao.profileGroupsCount(profileId).watchSingle();
+
+@riverpod
+class ProfileRules extends _$ProfileRules
+    with
+        AsyncNotifierMixin<List<Rule>>,
+        _Committed<List<Rule>>,
+        _RuleListMixin {
+  @override
+  int get ownerId => profileId;
+  @override
+  Stream<List<Rule>> build(int profileId) {
+    final query = database.rulesDao.queryProfileRules(profileId);
+    return committed(query.watch(), query.get, const []);
+  }
+
+  Future<void> setAll(List<Rule> rules, {ApiEditVersion? editVersion}) {
+    final version = _needVersion(editVersion);
+    return submit(() async {
+      await database.repository.replaceProfileRules(
+        profileId,
+        rules,
+        editVersion: version,
+      );
+    });
+  }
+}
+
+@riverpod
+class ProxyGroups extends _$ProxyGroups
+    with AsyncNotifierMixin<List<ProxyGroup>>, _Committed<List<ProxyGroup>> {
+  @override
+  List<ProxyGroup> get value => state.value ?? [];
+  @override
+  Stream<List<ProxyGroup>> build(int profileId) {
+    final query = database.proxyGroupsDao.query(profileId);
+    return committed(query.watch(), query.get, const []);
+  }
+
+  Future<void> delAll(Iterable<int> ids, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.proxyGroup, value);
+    return submit(
+      () =>
+          database.proxyGroupsDao.delAll(profileId, ids, editVersion: version),
+    );
+  }
+
+  Future<bool> put(ProxyGroup group, {ApiEditVersion? editVersion}) async {
+    if (value.any((item) => item.name == group.name && item.id != group.id)) {
+      return false;
+    }
+    await submit(() async {
+      await database.proxyGroupsDao.save(
+        profileId,
+        group,
+        editVersion: editVersion,
+      );
+    });
+    return true;
+  }
+
+  Future<void> setAll(List<ProxyGroup> groups, {ApiEditVersion? editVersion}) {
+    final version = _needVersion(editVersion);
+    return submit(() async {
+      await database.proxyGroupsDao.replace(
+        profileId,
+        groups,
+        editVersion: version,
+      );
+    });
+  }
+
+  Future<void> insertAfterEach(
+    Map<int, ProxyGroup> copies, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.proxyGroup, value);
+    final next = <ProxyGroup>[];
+    for (final item in value) {
+      next.add(item);
+      if (copies[item.id] case final copy?) next.add(copy);
+    }
+    return submit(() async {
+      await database.proxyGroupsDao.replace(
+        profileId,
+        next,
+        editVersion: version,
+      );
+    });
+  }
+
+  Future<void> order(
+    int oldIndex,
+    int newIndex, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.proxyGroup, value);
+    final ids = [
+      for (final item in value.copyAndReorder(oldIndex, newIndex)) item.id,
+    ];
+    return submit(
+      () =>
+          database.proxyGroupsDao.reorder(profileId, ids, editVersion: version),
+    );
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<ProxyGroup>> previous,
+    AsyncValue<List<ProxyGroup>> next,
+  ) => !proxyGroupsEquality.equals(previous.value, next.value);
+}
+
+@riverpod
+class CustomProxies extends _$CustomProxies
+    with
+        AsyncNotifierMixin<List<CustomProxy>>,
+        _Committed<List<CustomProxy>>,
+        _CatalogWrites<CustomProxy> {
+  @override
+  ApiCatalog<CustomProxy> get catalogSpec => database.repository.proxies;
+  @override
+  List<CustomProxy> get value => state.value ?? [];
+  @override
+  Stream<List<CustomProxy>> build() {
+    final query = database.customProxiesDao.query();
+    return committed(query.watch(), query.get, const []);
+  }
+
+  Future<void> delAll(Iterable<int> ids, {ApiEditVersion? editVersion}) {
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.customProxy, value);
+    return submit(
+      () => database.customProxiesDao.delAll(ids, editVersion: version),
+    );
+  }
+
+  Future<void> putAll(
+    List<CustomProxy> proxies, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version = _needVersion(editVersion);
+    final next = [...value, ...proxies];
+    return submit(() async {
+      await database.customProxiesDao.replace(next, editVersion: version);
+    });
+  }
+
+  Future<void> setAll(
+    List<CustomProxy> proxies, {
+    ApiEditVersion? editVersion,
+  }) {
+    final version = _needVersion(editVersion);
+    return submit(() async {
+      await database.customProxiesDao.replace(proxies, editVersion: version);
+    });
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<CustomProxy>> previous,
+    AsyncValue<List<CustomProxy>> next,
+  ) => !customProxiesEquality.equals(previous.value, next.value);
+}
+
+@riverpod
+class ProxyDialers extends _$ProxyDialers
+    with AsyncNotifierMixin<Map<int, String>>, _Committed<Map<int, String>> {
+  @override
+  Map<int, String> get value => state.value ?? const {};
+  @override
+  Stream<Map<int, String>> build(int profileId) {
+    final query = database.proxyDialersDao.query(profileId);
+    final targets = database.repository.dialerTargets;
+    return committed(
+      query.watch().map(targets),
+      () => query.get().then(targets),
+      const {},
+    );
+  }
+
+  Future<void> set(int proxyId, String? target) =>
+      submit(() => database.proxyDialersDao.set(profileId, proxyId, target));
+
+  Future<void> setAll(Map<int, String> dialers, {ApiEditVersion? editVersion}) {
+    final version = _needVersion(editVersion);
+    return submit(
+      () => database.proxyDialersDao.setAll(
+        profileId,
+        dialers,
+        editVersion: version,
+      ),
+    );
+  }
+
+  @override
+  bool updateShouldNotify(
+    AsyncValue<Map<int, String>> previous,
+    AsyncValue<Map<int, String>> next,
+  ) => !const MapEquality<int, String>().equals(previous.value, next.value);
+}
+
+@riverpod
+class ProfileDisabledRuleIds extends _$ProfileDisabledRuleIds
+    with AsyncNotifierMixin<List<int>>, _Committed<List<int>> {
+  @override
+  List<int> get value => state.value ?? const [];
+  @override
+  Stream<List<int>> build(int profileId) {
+    final query = database.rulesDao.queryDisabledRuleIds(profileId);
+    return committed(query.watch(), query.get, const []);
+  }
+
+  Future<void> del(int ruleId) => submit(() async {
+    await database.rulesDao.delDisabled(profileId, ruleId);
+  });
+  Future<void> put(int ruleId) => submit(() async {
+    await database.rulesDao.putDisabled(profileId, ruleId);
+  });
+  @override
+  bool updateShouldNotify(
+    AsyncValue<List<int>> previous,
+    AsyncValue<List<int>> next,
+  ) => !intListEquality.equals(previous.value, next.value);
+}

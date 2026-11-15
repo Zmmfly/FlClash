@@ -88,5 +88,7 @@ devtools_options.yaml
 /.env
 /data/
 /auth/
+/state/
+/*.api-store/
 /*.auth.json
 /secrets/

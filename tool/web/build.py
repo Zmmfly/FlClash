@@ -18,9 +18,7 @@ import tempfile
 from pathlib import Path
 
 from stage import ROOT, StageError, stage, validate_source
-
-SQLITE_SHA256 = 'fbcd2e8214f9231ea961e1b7706a22dd1194cfbfe6f26f13841b5aa7a0be1a1f'
-
+from validate_artifact import validate_artifact
 
 def run(arguments, cwd=ROOT, capture=False, env=None):
     return subprocess.run(arguments, cwd=cwd, check=True, text=True,
@@ -62,9 +60,6 @@ def preflight():
     go_version = run(['go', 'version'], cwd=ROOT / 'core', capture=True)
     if version_tuple(go_version) < version_tuple(required[1]):
         raise StageError(f'Go {required[1]} or newer is required; found {go_version.strip()}')
-    wasm = ROOT / 'web/sqlite3.wasm'
-    if not wasm.is_file() or hashlib.sha256(wasm.read_bytes()).hexdigest() != SQLITE_SHA256:
-        raise StageError('Vendored sqlite3.wasm v3.7.0 is absent or its SHA-256 does not match')
     config = (ROOT / 'build_config.yaml').read_text()
     tags = scalar(config, 'tags')
     if not re.fullmatch(r'[\w, ]+', tags):
@@ -82,6 +77,13 @@ def validate_service_worker(web_output):
             raise StageError('Refusing an authentication-bypassing caching service worker')
 
 
+def require_api_artifact(**inputs):
+    report = validate_artifact(**inputs)
+    if not report.ok:
+        findings = '; '.join(f'{item.code}: {item.path}' for item in report.errors)
+        raise StageError(f'Typed Web artifact validation failed: {findings}')
+
+
 def build(safe_mode=False):
     version, tags, flags, core_version = preflight()
     build_dir = ROOT / 'build'
@@ -94,6 +96,7 @@ def build(safe_mode=False):
     print(f'Isolated Web sources: {work}', flush=True)
     run(['flutter', 'pub', 'get'], cwd=work)
     run(['dart', 'run', 'intl_utils:generate'], cwd=work)
+    require_api_artifact(staged=work, deps=work / '.dart_tool/package_config.json')
     flutter_arguments = ['flutter', 'build', 'web', '--release', '--no-tree-shake-icons',
                          '--dart-define=APP_ENV=stable', '--dart-define=WEB_PANEL=true',
                          f'--build-name={version}']
@@ -104,6 +107,7 @@ def build(safe_mode=False):
     if not (web_output / 'index.html').is_file() or not (web_output / 'main.dart.js').is_file():
         raise StageError('Flutter build did not produce the expected Web entrypoints')
     validate_service_worker(web_output)
+    require_api_artifact(web=web_output)
     embed = work / 'core/cmd/flclash-web/web_dist'
     shutil.copytree(web_output, embed)
     env = dict(os.environ, CGO_ENABLED='0')
@@ -111,6 +115,7 @@ def build(safe_mode=False):
     binary = work / 'FlClash-web'
     run(['go', 'build', '-trimpath', '-tags', tags, '-ldflags', flags,
          '-o', str(binary), './cmd/flclash-web'], cwd=work / 'core', env=env)
+    require_api_artifact(server=binary)
     dist = ROOT / 'dist'
     if dist.is_symlink():
         raise StageError('dist/ must not be a symlink')

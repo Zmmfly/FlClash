@@ -1,0 +1,893 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+
+import 'attachment.dart';
+
+import 'json.dart' show apiObject;
+import 'draft_ids.dart' show uuidV4;
+import 'errors.dart';
+import 'journal.dart';
+import 'operation.dart';
+import 'transport.dart';
+
+final _revisionPattern = RegExp(r'^(0|[1-9][0-9]*)$');
+
+String requireApiRevision(Object? value) {
+  if (value is! String ||
+      value.length > 20 ||
+      !_revisionPattern.hasMatch(value)) {
+    throw const WebApiProtocolException('Expected a decimal string revision');
+  }
+  if (BigInt.parse(value) > BigInt.parse('9223372036854775807')) {
+    throw const WebApiProtocolException(
+      'Revision outside nonnegative int64 range',
+    );
+  }
+  return value;
+}
+
+int compareApiRevisions(String left, String right) =>
+    BigInt.parse(left).compareTo(BigInt.parse(right));
+
+class ApiReceipt {
+  const ApiReceipt({
+    required this.revision,
+    required this.data,
+    this.operationId,
+  });
+
+  final String revision;
+  final Object? data;
+  final String? operationId;
+}
+
+class ApiRequestProof {
+  const ApiRequestProof._(
+    this.method,
+    this.path,
+    this.expectedRevision,
+    this.fieldDigests,
+  );
+  final String method;
+  final String path;
+  final String? expectedRevision;
+  final Map<String, String> fieldDigests;
+}
+
+class _ReadWork {
+  _ReadWork({
+    required this.epoch,
+    required this.store,
+    required this.control,
+    required this.checkStore,
+    required this.send,
+    required this.isBusy,
+    this.guard,
+  });
+
+  final int epoch;
+  final String? store;
+  final bool control;
+  final bool checkStore;
+  final Future<Object?> Function(ApiRequestCancellation) send;
+  final bool Function(Object?) isBusy;
+  final void Function()? guard;
+  final cancellation = ApiRequestCancellation();
+  final result = Completer<Object?>();
+  int attempts = 0;
+}
+
+class WebApiClient {
+  WebApiClient({
+    ApiTransport? transport,
+    ApiOperationJournal? journal,
+    String? origin,
+    void Function()? onUnauthorized,
+    this.timeout = const Duration(seconds: 30),
+  }) : _transport = transport ?? createApiTransport(),
+       _journal = journal ?? createApiOperationJournal(),
+       origin = origin ?? currentApiOrigin(),
+       _onUnauthorized = onUnauthorized ?? notifyApiUnauthorized {
+    _pending = _journal.read();
+  }
+
+  final ApiTransport _transport;
+  final ApiOperationJournal _journal;
+  final String origin;
+  final void Function() _onUnauthorized;
+  String? _storeId;
+  final Duration timeout;
+  final _sessions = StreamController<void>.broadcast(sync: true);
+  var _receiptEpochs = Expando<int>();
+  var _receiptScopes = Expando<ApiRevisionScope>();
+  var _receiptStores = Expando<String>();
+  var _receiptOperations = Expando<ApiPendingOperation>();
+  var _receiptRequests = Expando<ApiRequestProof>();
+  final _readQueue = Queue<_ReadWork>();
+  final _runningReads = <_ReadWork>{};
+  int _activeReads = 0;
+
+  bool ownsReceipt(ApiReceipt receipt) =>
+      _receiptEpochs[receipt] == _epoch &&
+      isActive &&
+      _storeId != null &&
+      _receiptStores[receipt] == _storeId;
+
+  ApiRevisionScope? receiptScope(ApiReceipt receipt) =>
+      ownsReceipt(receipt) ? _receiptScopes[receipt] : null;
+  ApiRequestProof? requestProof(ApiReceipt receipt) =>
+      ownsReceipt(receipt) ? _receiptRequests[receipt] : null;
+  ApiPendingOperation? _pending;
+  final _revisions = <ApiRevisionScope, String>{};
+  int _epoch = 0;
+  bool _active = true;
+  bool _closed = false;
+
+  String? get revision => revisionFor(ApiRevisionScope.configuration);
+  String? get boundStoreId => _storeId;
+  String? revisionFor(ApiRevisionScope scope) => _revisions[scope];
+  int get sessionEpoch => _epoch;
+  bool get isActive => _active && !_closed;
+  ApiPendingOperation? get pendingOperation => _pending;
+  Stream<void> get sessionChanges => _sessions.stream;
+
+  void requireSession(int epoch) {
+    if (!isActive || epoch != _epoch) throw const WebApiSessionException();
+  }
+
+  void endSession() {
+    if (_closed) return;
+    _active = false;
+    _epoch++;
+    for (final work in [..._readQueue, ..._runningReads]) {
+      _cancelRead(work, const WebApiSessionException());
+    }
+    _revisions.clear();
+    _storeId = null;
+    _receiptEpochs = Expando<int>();
+    _receiptScopes = Expando<ApiRevisionScope>();
+    _receiptStores = Expando<String>();
+    _receiptOperations = Expando<ApiPendingOperation>();
+    _receiptRequests = Expando<ApiRequestProof>();
+    final pending = _pending;
+    if (pending != null) {
+      _pending = ApiPendingOperation.fromJournal(pending.toJournal());
+    }
+    _sessions.add(null);
+  }
+
+  void bindStore(String storeId) {
+    if (storeId.isEmpty ||
+        storeId.length > 128 ||
+        storeId.contains(RegExp(r'[\x00-\x20]'))) {
+      throw const WebApiProtocolException(
+        'Invalid authoritative store identity',
+      );
+    }
+    if (_storeId != storeId) {
+      _revisions.clear();
+      if (_pending case final pending? when pending.storeId != storeId) {
+        _pending = ApiPendingOperation.fromJournal(pending.toJournal());
+      }
+    }
+    _storeId = storeId;
+  }
+
+  void ackPendingUnrecoverable(String operationId, {required String intent}) {
+    if (intent != 'acknowledge-unrecoverable-operation' ||
+        _pending?.operationId != operationId) {
+      throw const WebApiProtocolException(
+        'Explicit acknowledgement of this pending operation is required',
+      );
+    }
+    _journal.clear();
+    _pending = null;
+  }
+
+  void _handleUnauthorized() {
+    if (!isActive) return;
+    endSession();
+    try {
+      _onUnauthorized();
+    } catch (_) {}
+  }
+
+  void _requireStoreAtStart(String? store) {
+    if (store != _storeId) {
+      throw const WebApiException(
+        'store_changed',
+        'The authoritative store changed while this request was in flight',
+      );
+    }
+  }
+
+  void beginSession() {
+    if (_closed) throw const WebApiSessionException();
+    endSession();
+    _active = true;
+    _sessions.add(null);
+  }
+
+  Future<ApiReceipt> read(
+    String path, {
+    ApiRevisionScope scope = ApiRevisionScope.configuration,
+  }) async {
+    final epoch = _epoch;
+    final store = _storeId;
+    requireSession(epoch);
+    final response = await _sendRead<ApiResponse>(
+      epoch: epoch,
+      store: store,
+      control: path == '/api/v1/meta',
+      checkStore: path != '/api/v1/meta',
+      send: (cancellation) => _transport.send(
+        ApiRequest(method: 'GET', path: path, cancellation: cancellation),
+      ),
+      isBusy: _isUnacceptedBusy,
+    );
+    requireSession(epoch);
+    if (path != '/api/v1/meta') _requireStoreAtStart(store);
+    final receipt = _decode(response, scope: scope);
+    if (path == '/api/v1/meta' &&
+        receipt.data is Map &&
+        (receipt.data as Map)['storeId'] is String) {
+      _receiptStores[receipt] = (receipt.data as Map)['storeId'] as String;
+    }
+    _receiptRequests[receipt] = ApiRequestProof._('GET', path, null, const {});
+    if (path != '/api/v1/meta') observeRevision(receipt.revision, scope: scope);
+    return receipt;
+  }
+
+  Future<ApiAttachment> readAttachment(String path) async {
+    final epoch = _epoch;
+    final store = _storeId;
+    requireSession(epoch);
+    final transport = _transport;
+    if (transport is! ApiAttachmentTransport) {
+      throw UnsupportedError(
+        'The configured transport cannot read API attachments',
+      );
+    }
+    const limit = 32 * 1024 * 1024;
+    final response = await _sendRead<ApiBinaryResponse>(
+      epoch: epoch,
+      store: store,
+      send: (cancellation) =>
+          (transport as ApiAttachmentTransport).readAttachment(
+            ApiRequest(method: 'GET', path: path, cancellation: cancellation),
+            maxBytes: limit,
+          ),
+      isBusy: (response) {
+        if (!response.complete || response.bytes.length > limit) return false;
+        try {
+          return _isUnacceptedBusy(
+            ApiResponse(response.status, utf8.decode(response.bytes)),
+          );
+        } catch (_) {
+          return false;
+        }
+      },
+    );
+    requireSession(epoch);
+    _requireStoreAtStart(store);
+    if (!response.complete || response.bytes.length > limit) {
+      if (response.status == 401) _handleUnauthorized();
+      throw const WebApiProtocolException(
+        'Incomplete or oversized API attachment',
+      );
+    }
+    if (response.status < 200 || response.status >= 300) {
+      final String body;
+      try {
+        body = utf8.decode(response.bytes);
+      } catch (_) {
+        if (response.status == 401) _handleUnauthorized();
+        throw const WebApiProtocolException(
+          'The attachment error is not UTF-8 JSON',
+        );
+      }
+      _decode(ApiResponse(response.status, body));
+      throw const WebApiProtocolException('Unexpected attachment response');
+    }
+    final headers = {
+      for (final entry in response.headers.entries)
+        entry.key.toLowerCase(): entry.value,
+    };
+    final length = headers['content-length'];
+    if (length != null &&
+        (!RegExp(r'^[0-9]{1,10}$').hasMatch(length) ||
+            int.parse(length) != response.bytes.length)) {
+      throw const WebApiProtocolException(
+        'Attachment length does not match the complete response',
+      );
+    }
+    final revision = requireApiRevision(headers['x-flclash-revision']);
+    final mediaType = headers['content-type']
+        ?.split(';')
+        .first
+        .trim()
+        .toLowerCase();
+    if (mediaType != null &&
+        (mediaType.length > 256 ||
+            !RegExp(
+              r'^[a-z0-9!#&^_.+-]+/[a-z0-9!#&^_.+-]+$',
+            ).hasMatch(mediaType))) {
+      throw const WebApiProtocolException('Invalid attachment media type');
+    }
+    final disposition = headers['content-disposition'];
+    String? filename;
+    if (disposition != null && disposition.length <= 2048) {
+      filename = RegExp(
+        r'(?:^|;)\s*filename="([^"]+)"',
+        caseSensitive: false,
+      ).firstMatch(disposition)?.group(1);
+      if (filename != null &&
+          (filename.isEmpty ||
+              filename == '.' ||
+              filename == '..' ||
+              filename.contains('/') ||
+              filename.contains(r'\') ||
+              RegExp(r'[\x00-\x1f\x7f]').hasMatch(filename))) {
+        filename = null;
+      }
+    }
+    final hash = _AttachmentDigest();
+    final sink = sha256.startChunkedConversion(hash);
+    for (var start = 0; start < response.bytes.length; start += 65536) {
+      final end = start + 65536 < response.bytes.length
+          ? start + 65536
+          : response.bytes.length;
+      sink.add(Uint8List.sublistView(response.bytes, start, end));
+      await Future<void>.delayed(Duration.zero);
+      requireSession(epoch);
+      _requireStoreAtStart(store);
+    }
+    sink.close();
+    final receipt = ApiReceipt(
+      revision: revision,
+      data: {
+        'path': path,
+        'sha256': hash.value!.toString(),
+        'byteLength': response.bytes.length,
+        'mediaType': mediaType,
+        'filename': filename,
+      },
+    );
+    _receiptEpochs[receipt] = epoch;
+    _receiptScopes[receipt] = ApiRevisionScope.configuration;
+    if (_storeId != null) _receiptStores[receipt] = _storeId!;
+    observeRevision(revision);
+    return ApiAttachment(
+      bytes: response.bytes.asUnmodifiableView(),
+      revision: revision,
+      mediaType: mediaType,
+      filename: filename,
+      readReceipt: receipt,
+    );
+  }
+
+  Future<ApiReceipt> query(String path, Map<String, Object?> payload) async {
+    final epoch = _epoch;
+    final store = _storeId;
+    requireSession(epoch);
+    final body = _canonicalJson(payload);
+    final response = await _sendRead<ApiResponse>(
+      epoch: epoch,
+      store: store,
+      send: (cancellation) => _transport.send(
+        ApiRequest(
+          method: 'POST',
+          path: path,
+          body: body,
+          cancellation: cancellation,
+        ),
+      ),
+      isBusy: _isUnacceptedBusy,
+    );
+    requireSession(epoch);
+    _requireStoreAtStart(store);
+    final receipt = _decode(response);
+    final actual = Map<String, Object?>.from(jsonDecode(body) as Map);
+    final digests = {
+      for (final entry in actual.entries)
+        entry.key: apiPayloadDigest(entry.value),
+    };
+    if (actual['key'] case final Map key) {
+      for (final entry in key.entries) {
+        digests['key.${entry.key}'] = apiPayloadDigest(entry.value);
+      }
+    }
+    _receiptRequests[receipt] = ApiRequestProof._(
+      'POST',
+      path,
+      actual['expectedRevision'] is String
+          ? actual['expectedRevision'] as String
+          : null,
+      Map.unmodifiable(digests),
+    );
+    observeRevision(receipt.revision);
+    return receipt;
+  }
+
+  Future<ApiReceipt> command(
+    String path,
+    Map<String, Object?> payload, {
+    List<ApiDraftBinding> drafts = const [],
+    ApiRevisionScope scope = ApiRevisionScope.configuration,
+    String? expectedRevision,
+    String? operationId,
+  }) async {
+    requireSession(_epoch);
+    if (_pending case final pending?) {
+      throw WebApiPendingOperationException(pending.operationId);
+    }
+    if (_storeId == null) {
+      throw const WebApiProtocolException(
+        'Bind the authoritative store before writing',
+      );
+    }
+    final revision = expectedRevision == null
+        ? revisionFor(scope)
+        : requireApiRevision(expectedRevision);
+    if (revision == null) {
+      throw const WebApiProtocolException(
+        'Read a server revision before writing',
+      );
+    }
+    operationId = requireApiOperationId(operationId ?? uuidV4);
+    final operation = ApiPendingOperation(
+      operationId: operationId,
+      path: path,
+      expectedRevision: revision,
+      scope: scope,
+      origin: origin,
+      storeId: _storeId,
+      body: _canonicalJson({
+        ...payload,
+        'operationId': operationId,
+        'expectedRevision': revision,
+      }),
+      drafts: List.unmodifiable(drafts),
+    );
+    _journal.write(operation);
+    _pending = operation;
+    return _sendOperation(operation);
+  }
+
+  Future<ApiReceipt> retryOperation(String operationId) async {
+    final pending = _requirePending(operationId);
+    if (pending.body == null) {
+      throw const WebApiProtocolException(
+        'Reloaded operations must recover their receipt',
+      );
+    }
+    return _sendOperation(pending);
+  }
+
+  void _requireOperation(ApiPendingOperation operation, int epoch) {
+    requireSession(epoch);
+    _requireStoreAtStart(operation.storeId);
+    if (!identical(_pending, operation)) {
+      throw const WebApiOperationSupersededException();
+    }
+    if (operation.origin != origin) {
+      throw const WebApiException(
+        'operation_origin_changed',
+        'The operation belongs to another origin',
+      );
+    }
+  }
+
+  ApiReceipt _operationReceipt(
+    ApiReceipt receipt,
+    ApiPendingOperation operation,
+    int epoch,
+  ) {
+    _requireOperation(operation, epoch);
+    _receiptOperations[receipt] = operation;
+    return receipt;
+  }
+
+  Future<ApiReceipt> recoverOperation(String operationId) async {
+    final pending = _requirePending(operationId);
+    final epoch = _epoch;
+    final response = await _sendRead<ApiResponse>(
+      epoch: epoch,
+      store: pending.storeId,
+      control: true,
+      guard: () => _requireOperation(pending, epoch),
+      send: (cancellation) => _transport.send(
+        ApiRequest(
+          method: 'GET',
+          path:
+              '/api/v1/${_receiptCollection(pending)}/${Uri.encodeComponent(operationId)}',
+          cancellation: cancellation,
+        ),
+      ),
+      isBusy: _isUnacceptedBusy,
+    );
+    _requireOperation(pending, epoch);
+    final receipt = _operationReceipt(
+      _decode(response, expectedOperationId: operationId, scope: pending.scope),
+      pending,
+      epoch,
+    );
+    observeRevision(receipt.revision, scope: pending.scope);
+    return receipt;
+  }
+
+  Future<ApiReceipt> resolveOperation(String operationId) async {
+    final pending = _requirePending(operationId);
+    final epoch = _epoch;
+    try {
+      final response = await _transport
+          .send(
+            ApiRequest(
+              method: 'POST',
+              path:
+                  '/api/v1/${_receiptCollection(pending)}/${Uri.encodeComponent(operationId)}:resolve',
+              body: _canonicalJson({'intent': 'resolve-unknown-result'}),
+            ),
+          )
+          .timeout(timeout);
+      _requireOperation(pending, epoch);
+      final receipt = _operationReceipt(
+        _decode(
+          response,
+          expectedOperationId: operationId,
+          scope: pending.scope,
+        ),
+        pending,
+        epoch,
+      );
+      observeRevision(receipt.revision, scope: pending.scope);
+      return receipt;
+    } on WebApiSessionException {
+      rethrow;
+    } on WebApiOperationSupersededException {
+      rethrow;
+    } on WebApiException catch (error) {
+      _requireOperation(pending, epoch);
+      if (error.code == 'operation_not_committed' &&
+          error.details is Map &&
+          (error.details as Map)['state'] == 'not_committed') {
+        _journal.clear();
+        _pending = null;
+        rethrow;
+      }
+      if (error.status != null) rethrow;
+      throw WebApiUnknownCommitException(operationId);
+    } catch (_) {
+      _requireOperation(pending, epoch);
+      throw WebApiUnknownCommitException(operationId);
+    }
+  }
+
+  ApiPendingOperation requirePendingReceipt(ApiReceipt receipt) {
+    final pending = _requirePending(receipt.operationId ?? '');
+    if (!ownsReceipt(receipt) ||
+        receiptScope(receipt) != pending.scope ||
+        !identical(_receiptOperations[receipt], pending)) {
+      throw const WebApiProtocolException(
+        'The receipt does not belong to this client, store and operation epoch',
+      );
+    }
+    _requireOperation(pending, _epoch);
+    return pending;
+  }
+
+  void completeOperation(ApiReceipt receipt) {
+    requirePendingReceipt(receipt);
+    _journal.clear();
+    _pending = null;
+  }
+
+  Future<ApiReceipt> _sendOperation(ApiPendingOperation operation) async {
+    final epoch = _epoch;
+    try {
+      final response = await _transport
+          .send(
+            ApiRequest(
+              method: 'POST',
+              path: operation.path,
+              body: operation.body,
+            ),
+          )
+          .timeout(timeout);
+      _requireOperation(operation, epoch);
+      if (response.status >= 500 || response.status == 408) {
+        throw WebApiUnknownCommitException(operation.operationId);
+      }
+      final receipt = _operationReceipt(
+        _decode(
+          response,
+          expectedOperationId: operation.operationId,
+          scope: operation.scope,
+        ),
+        operation,
+        epoch,
+      );
+      observeRevision(receipt.revision, scope: operation.scope);
+      return receipt;
+    } on WebApiSessionException {
+      rethrow;
+    } on WebApiOperationSupersededException {
+      rethrow;
+    } on WebApiException catch (error) {
+      _requireOperation(operation, epoch);
+      if (error is! WebApiProtocolException &&
+          error is! WebApiUnknownCommitException &&
+          error.status != null &&
+          error.status! >= 400 &&
+          error.status! < 500) {
+        _journal.clear();
+        _pending = null;
+        rethrow;
+      }
+      throw WebApiUnknownCommitException(operation.operationId);
+    } catch (_) {
+      _requireOperation(operation, epoch);
+      throw WebApiUnknownCommitException(operation.operationId);
+    }
+  }
+
+  ApiPendingOperation _requirePending(String operationId) {
+    requireSession(_epoch);
+    final pending = _pending;
+    if (pending == null || pending.operationId != operationId) {
+      throw const WebApiProtocolException('Unknown local operation identity');
+    }
+    if (pending.origin == null || pending.storeId == null) {
+      throw const WebApiException(
+        'operation_scope_unknown',
+        'The pending operation has no recoverable origin/store scope',
+      );
+    }
+    if (pending.origin != origin) {
+      throw const WebApiException(
+        'operation_origin_changed',
+        'Recover this operation at its original origin or explicitly acknowledge it as unrecoverable',
+      );
+    }
+    if (_storeId == null || pending.storeId != _storeId) {
+      throw const WebApiException(
+        'operation_store_changed',
+        'The pending operation belongs to another authoritative store',
+      );
+    }
+    return pending;
+  }
+
+  Future<T> _sendRead<T>({
+    required int epoch,
+    required String? store,
+    required Future<T> Function(ApiRequestCancellation) send,
+    required bool Function(T) isBusy,
+    bool control = false,
+    bool checkStore = true,
+    void Function()? guard,
+  }) async {
+    requireSession(epoch);
+    final work = _ReadWork(
+      epoch: epoch,
+      store: store,
+      control: control,
+      checkStore: checkStore,
+      send: (cancellation) async => send(cancellation),
+      isBusy: (response) => isBusy(response as T),
+      guard: guard,
+    );
+    if (control) {
+      _startRead(work);
+    } else {
+      if (_readQueue.length >= 64) throw _readQueueFull();
+      _readQueue.add(work);
+      _drainReads();
+    }
+    return (await work.result.future.timeout(
+          timeout,
+          onTimeout: () {
+            final error = TimeoutException(
+              'API read exceeded its total budget',
+              timeout,
+            );
+            _cancelRead(work, error);
+            throw error;
+          },
+        ))
+        as T;
+  }
+
+  WebApiException _readQueueFull() => const WebApiException(
+    'client_read_queue_full',
+    'Too many queued API reads',
+  );
+
+  void _cancelRead(_ReadWork work, Object error) {
+    _readQueue.remove(work);
+    work.cancellation.cancel();
+    if (!work.result.isCompleted) work.result.completeError(error);
+  }
+
+  void _drainReads() {
+    while (_activeReads < 3 && _readQueue.isNotEmpty) {
+      final work = _readQueue.removeFirst();
+      if (!work.result.isCompleted) _startRead(work);
+    }
+  }
+
+  void _startRead(_ReadWork work) {
+    _runningReads.add(work);
+    if (!work.control) _activeReads++;
+    unawaited(_runRead(work));
+  }
+
+  Future<void> _runRead(_ReadWork work) async {
+    var retry = false;
+    try {
+      requireSession(work.epoch);
+      if (work.checkStore) _requireStoreAtStart(work.store);
+      work.guard?.call();
+      work.attempts++;
+      final response = await work.send(work.cancellation);
+      if (work.result.isCompleted) return;
+      requireSession(work.epoch);
+      if (work.checkStore) _requireStoreAtStart(work.store);
+      work.guard?.call();
+      if (work.isBusy(response) && work.attempts < 3) {
+        retry = true;
+      } else {
+        work.result.complete(response);
+      }
+    } catch (error, stack) {
+      if (!work.result.isCompleted) work.result.completeError(error, stack);
+    } finally {
+      _runningReads.remove(work);
+      if (!work.control) _activeReads--;
+      if (retry && !work.result.isCompleted) {
+        if (work.control) {
+          _startRead(work);
+        } else if (_readQueue.length >= 64) {
+          work.result.completeError(_readQueueFull());
+        } else {
+          _readQueue.add(work);
+        }
+      }
+      _drainReads();
+    }
+  }
+
+  bool _isUnacceptedBusy(ApiResponse response) {
+    if (response.status != 429) return false;
+    try {
+      final envelope = jsonDecode(response.body);
+      return envelope is Map &&
+          envelope['error'] is Map &&
+          (envelope['error'] as Map)['code'] == 'api_busy' &&
+          (envelope['error'] as Map)['details'] is Map &&
+          ((envelope['error'] as Map)['details'] as Map)['state'] ==
+              'not_accepted';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void observeRevision(
+    String revision, {
+    ApiRevisionScope scope = ApiRevisionScope.configuration,
+  }) {
+    if (!isActive) return;
+    requireApiRevision(revision);
+    final previous = revisionFor(scope);
+    if (previous == null || compareApiRevisions(revision, previous) > 0) {
+      _revisions[scope] = revision;
+    }
+  }
+
+  ApiReceipt _decode(
+    ApiResponse response, {
+    String? expectedOperationId,
+    ApiRevisionScope scope = ApiRevisionScope.configuration,
+  }) {
+    if (response.status == 401) _handleUnauthorized();
+    Map<String, Object?> object;
+    try {
+      object = apiObject(jsonDecode(response.body));
+    } catch (_) {
+      if (response.status == 401) _handleUnauthorized();
+      throw const WebApiProtocolException(
+        'The API response is not a JSON envelope',
+      );
+    }
+    if (response.status < 200 || response.status >= 300) {
+      final error = apiObject(object['error'], 'error');
+      if (response.status == 401) endSession();
+      throw WebApiException(
+        error['code'] as String,
+        error['message'] as String,
+        status: response.status,
+        revision: _isUnacceptedBusy(response) || object['revision'] == null
+            ? null
+            : requireApiRevision(object['revision']),
+        details: error['details'],
+      );
+    }
+    final operationId = object['operationId'];
+    if (expectedOperationId != null && operationId != expectedOperationId) {
+      throw const WebApiProtocolException(
+        'Missing or mismatched operation identity',
+      );
+    }
+    if (!object.containsKey('data')) {
+      throw const WebApiProtocolException('Missing API receipt data');
+    }
+    final receipt = ApiReceipt(
+      revision: requireApiRevision(object['revision']),
+      data: _freezeApiJson(object['data']),
+      operationId: operationId as String?,
+    );
+    _receiptEpochs[receipt] = _epoch;
+    _receiptScopes[receipt] = scope;
+    if (_storeId != null) _receiptStores[receipt] = _storeId!;
+    return receipt;
+  }
+
+  Future<void> close() async {
+    if (_closed) return;
+    endSession();
+    _closed = true;
+    _transport.close();
+    await _sessions.close();
+  }
+}
+
+Object? _freezeApiJson(Object? value) => switch (value) {
+  Map<String, Object?>() => Map<String, Object?>.unmodifiable({
+    for (final entry in value.entries) entry.key: _freezeApiJson(entry.value),
+  }),
+  List() => List<Object?>.unmodifiable([
+    for (final item in value) _freezeApiJson(item),
+  ]),
+  _ => value,
+};
+
+String apiPayloadDigest(Object? value) => sha256
+    .convert(utf8.encode(_canonicalJson(jsonDecode(jsonEncode(value)))))
+    .toString();
+
+String requireApiOperationId(String value) {
+  if (!RegExp(r'^[A-Za-z0-9_.:-]{1,128}$').hasMatch(value)) {
+    throw const WebApiProtocolException('Invalid operation identifier');
+  }
+  return value;
+}
+
+String _receiptCollection(ApiPendingOperation operation) =>
+    operation.path == '/api/v1/sources:authorize'
+    ? 'source-operations'
+    : operation.scope == ApiRevisionScope.cache
+    ? 'cache-operations'
+    : 'operations';
+
+class _AttachmentDigest implements Sink<Digest> {
+  Digest? value;
+  @override
+  void add(Digest data) => value = data;
+  @override
+  void close() {}
+}
+
+String _canonicalJson(Object? value) {
+  Object? order(Object? item) => switch (item) {
+    Map<String, Object?>() => {
+      for (final key in item.keys.toList()..sort()) key: order(item[key]),
+    },
+    List() => [for (final child in item) order(child)],
+    _ => item,
+  };
+  return jsonEncode(order(value));
+}

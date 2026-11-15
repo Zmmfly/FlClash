@@ -1,0 +1,300 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:fl_clash/common/javascript.dart';
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_evaluate/index.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _profile = '9007199254740993';
+const _script = '9223372036854775807';
+
+class _EvaluateHTTP implements ApiTransport {
+  @override
+  void close() {}
+
+  final requests = <ApiRequest>[];
+  String revision = '17';
+  String? replyRevision;
+  String? replyProfile;
+  bool draftGetsAuthority = false;
+  Completer<void>? commandStarted;
+  Completer<void>? commandGate;
+  Completer<void>? queryStarted;
+  Completer<void>? queryGate;
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    if (request.path == '/api/v1/meta') {
+      return _ok({
+        'storeId': 'evaluation-test-store',
+        'schemaVersion': 1,
+        'revision': revision,
+      });
+    }
+    if (request.method == 'GET') {
+      return _ok({'profileId': _profile, 'scriptId': _script});
+    }
+    final body = Map<String, Object?>.from(jsonDecode(request.body!) as Map);
+    if (request.path == '/api/v1/runtime:hold') {
+      commandStarted?.complete();
+      await commandGate?.future;
+      revision = '18';
+      return _ok({
+        'accepted': true,
+      }, operationId: body['operationId'] as String);
+    }
+    if (body['expectedRevision'] != revision) {
+      return ApiResponse(
+        409,
+        jsonEncode({
+          'revision': revision,
+          'error': {'code': 'revision_conflict', 'message': 'source changed'},
+        }),
+      );
+    }
+    queryStarted?.complete();
+    await queryGate?.future;
+    final preview = request.path == '/api/v1/scripts:preview';
+    return _ok({
+      'profileId': replyProfile ?? _profile,
+      'scriptId': _script,
+      'readRevision': replyRevision ?? revision,
+      'config': {
+        'mode': 'global',
+        'rules': ['MATCH,DIRECT'],
+      },
+      'sha256': 'a' * 64,
+      'sourceDigest': 'b' * 64,
+      'scriptDigest': 'c' * 64,
+      'counts': {'proxies': 0, 'groups': 0, 'rules': 1},
+      'console': 'synthetic\n',
+      'preview': preview,
+      if (!preview || draftGetsAuthority) 'evaluationId': 'e' * 43,
+    }, responseRevision: replyRevision);
+  }
+
+  ApiResponse _ok(
+    Object? data, {
+    String? operationId,
+    String? responseRevision,
+  }) => ApiResponse(
+    200,
+    jsonEncode({
+      'revision': responseRevision ?? revision,
+      'data': data,
+      'operationId': ?operationId,
+    }),
+  );
+}
+
+void main() {
+  late _EvaluateHTTP http;
+  late WebApiRepository repository;
+  late WebEvaluateService service;
+  late ApiEditVersion version;
+  late int profileId;
+  late int scriptId;
+
+  setUp(() async {
+    http = _EvaluateHTTP();
+    repository = WebApiRepository(
+      transport: http,
+      journal: MemoryApiOperationJournal(),
+    );
+    await repository.initialize();
+    profileId = repository.identities.decode(ApiIdentity.profile, _profile);
+    scriptId = repository.identities.decode(ApiIdentity.script, _script);
+    final receipt = await repository.readExternal(
+      '/api/v1/profiles/$_profile/setup-state',
+    );
+    version = repository.captureReadVersion(receipt, kind: ApiIdentity.profile);
+    service = WebEvaluateService(repository);
+  });
+  tearDown(() async {
+    await repository.close();
+  });
+
+  test(
+    'api-evaluate-contract: committed script sends exact IDs and original read token only',
+    () async {
+      final result = await service.evaluateCommitted(
+        profileId: profileId,
+        scriptId: scriptId,
+        editVersion: version,
+      );
+      final request = http.requests.last;
+      expect(request.path, '/api/v1/profiles:evaluate');
+      expect(jsonDecode(request.body!), {
+        'expectedRevision': '17',
+        'profileId': _profile,
+        'scriptId': _script,
+      });
+      expect(result.editVersion, same(version));
+      expect(result.profileId, profileId);
+      expect(result.scriptId, scriptId);
+      expect(result.config['mode'], 'global');
+      expect(result.counts.rules, 1);
+      expect(result.evaluationId, 'e' * 43);
+      expect(repository.pendingOperation, isNull);
+      expect(
+        http.requests.any(
+          (r) => r.path.contains('/api/fs/') || r.path.contains('http-proxy'),
+        ),
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'api-evaluate-contract: draft preview is a bounded pure query, never runtime authority',
+    () async {
+      final result = await service.preview(
+        profileId: profileId,
+        scriptId: scriptId,
+        editVersion: version,
+        scriptText: 'function main(c){return c}',
+        config: {'mode': 'rule'},
+      );
+      expect(result.preview, isTrue);
+      expect(result.evaluationId, isNull);
+      final body = jsonDecode(http.requests.last.body!) as Map;
+      expect(body['expectedRevision'], '17');
+      expect(body['scriptText'], contains('function main'));
+      expect(body.containsKey('operationId'), isFalse);
+      expect(repository.pendingOperation, isNull);
+      http.draftGetsAuthority = true;
+      await expectLater(
+        service.preview(
+          profileId: profileId,
+          scriptId: scriptId,
+          editVersion: version,
+          scriptText: 'function main(c){return c}',
+          config: {},
+        ),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'api-evaluate-contract: rejects mismatched result revision and identity',
+    () async {
+      http.replyRevision = '18';
+      await expectLater(
+        service.evaluateCommitted(
+          profileId: profileId,
+          scriptId: scriptId,
+          editVersion: version,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      http.replyRevision = null;
+      http.replyProfile = '9007199254740994';
+      await expectLater(
+        service.evaluateCommitted(
+          profileId: profileId,
+          scriptId: scriptId,
+          editVersion: version,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-evaluate-contract: create stamps and old sessions cannot stand in for a read token',
+    () async {
+      final create = repository.captureCreateVersion(ApiIdentity.profile);
+      await expectLater(
+        service.evaluateCommitted(
+          profileId: profileId,
+          scriptId: scriptId,
+          editVersion: create,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      repository.endSession();
+      repository.beginSession();
+      await repository.initialize();
+      await expectLater(
+        service.evaluateCommitted(
+          profileId: profileId,
+          scriptId: scriptId,
+          editVersion: version,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        http.requests.where((r) => r.path == '/api/v1/profiles:evaluate'),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'api-evaluate-contract: pending write barrier never fresh-stamps an old candidate',
+    () async {
+      http.commandStarted = Completer<void>();
+      http.commandGate = Completer<void>();
+      final command = repository.executeExternalCommand(
+        '/api/v1/runtime:hold',
+        {},
+        apiObject,
+        editVersion: version,
+      );
+      await http.commandStarted!.future;
+      final result = service.evaluateCommitted(
+        profileId: profileId,
+        scriptId: scriptId,
+        editVersion: version,
+      );
+      final assertion = expectLater(result, throwsA(isA<WebApiException>()));
+      await Future<void>.delayed(Duration.zero);
+      expect(
+        http.requests.where((r) => r.path == '/api/v1/profiles:evaluate'),
+        isEmpty,
+      );
+      http.commandGate!.complete();
+      await command;
+      await assertion;
+      final request = http.requests
+          .where((r) => r.path == '/api/v1/profiles:evaluate')
+          .single;
+      expect(jsonDecode(request.body!)['expectedRevision'], '17');
+    },
+  );
+
+  test('api-evaluate-contract: logout drops an in-flight result', () async {
+    http.queryStarted = Completer<void>();
+    http.queryGate = Completer<void>();
+    final result = service.evaluateCommitted(
+      profileId: profileId,
+      scriptId: scriptId,
+      editVersion: version,
+    );
+    final assertion = expectLater(result, throwsA(isA<WebApiException>()));
+    await http.queryStarted!.future;
+    repository.endSession();
+    http.queryGate!.complete();
+    await assertion;
+  });
+
+  test(
+    'api-evaluate-contract: raw JavaScript shim calls fail closed without executing code',
+    () async {
+      await expectLater(
+        handleEvaluate('globalThis.syntheticViolation = true', {}),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'evaluation_source_required',
+          ),
+        ),
+      );
+      expect(http.requests.where((r) => r.method == 'POST'), isEmpty);
+    },
+  );
+}

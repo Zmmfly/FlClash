@@ -85,7 +85,9 @@ class HotKeySpec {
 
 Stream<int> hotKeyEvents() => const Stream<int>.empty();
 
-Future<List<HotKeyFailure>> setHotKeys({required List<HotKeySpec> specs}) async {
+Future<List<HotKeyFailure>> setHotKeys({
+  required List<HotKeySpec> specs,
+}) async {
   return const [];
 }
 
@@ -130,11 +132,21 @@ class IpcServer {
   final String address;
   final StreamController<IpcEvent> _controller =
       StreamController<IpcEvent>.broadcast();
-  final List<String> _pendingMessages = [];
   _JSWebSocket? _ws;
   bool _closed = false;
+  int _generation = 0;
+  int _inFlight = 0;
+  Future<void> _eventQueue = Future<void>.value();
+  late final void Function() _subscriptionListener;
 
   IpcServer._(this.address) {
+    _subscriptionListener = () {
+      final ws = _ws;
+      if (!_closed && ws != null && ws.readyState == 1) _subscribe(ws);
+    };
+    WebCoreBridge.instance.addRuntimeSubscriptionListener(
+      _subscriptionListener,
+    );
     WebCoreBridge.instance.registerServer(
       address,
       onConnect: _connectWebSocket,
@@ -142,61 +154,79 @@ class IpcServer {
     );
   }
 
-  static Future<IpcServer> bind({required String address}) async {
-    return IpcServer._(address);
+  static Future<IpcServer> bind({required String address}) async =>
+      IpcServer._(address);
+
+  void _subscribe(_JSWebSocket ws) {
+    ws.send(jsonEncode(WebCoreBridge.instance.typedSubscriptionFrame()).toJS);
+  }
+
+  void _emit(Map<String, Object?> frame) {
+    if (_closed) return;
+    _controller.add(
+      IpcEvent(
+        kind: IpcEventKind.message,
+        payload: Uint8List.fromList(utf8.encode(jsonEncode(frame))),
+      ),
+    );
   }
 
   void _connectWebSocket(int pid) {
     if (_closed) return;
+    _generation++;
     _ws?.close();
-    final url = JsBridge.wsUrl('/ws/core');
-    final ws = _JSWebSocket(url.toJS);
+    final ws = _JSWebSocket(JsBridge.wsUrl('/ws/v1/events').toJS);
     _ws = ws;
-
+    final generation = _generation;
     ws.onopen = ((JSAny? _) {
       if (_closed || _ws != ws) return;
+      _subscribe(ws);
       _controller.add(
-        IpcEvent(
-          kind: IpcEventKind.connected,
-          pid: pid,
-          payload: Uint8List(0),
-        ),
+        IpcEvent(kind: IpcEventKind.connected, pid: pid, payload: Uint8List(0)),
       );
-      for (final msg in _pendingMessages) {
-        ws.send(msg.toJS);
-      }
-      _pendingMessages.clear();
     }).toJS;
-
-    ws.onmessage = ((_JSMessageEvent evt) {
+    ws.onmessage = ((_JSMessageEvent event) {
       if (_closed || _ws != ws) return;
-      final data = evt.data;
-      if (data != null && data.isA<JSString>()) {
-        final str = (data as JSString).toDart;
-        final bytes = Uint8List.fromList(utf8.encode(str));
-        _controller.add(
-          IpcEvent(kind: IpcEventKind.message, payload: bytes),
-        );
-      }
+      final data = event.data;
+      if (data == null || !data.isA<JSString>()) return;
+      final text = (data as JSString).toDart;
+      _eventQueue = _eventQueue
+          .then((_) async {
+            if (_closed || generation != _generation) return;
+            final raw = jsonDecode(text);
+            if (raw is! Map<String, Object?>)
+              throw const FormatException('Invalid typed event');
+            final frame = await WebCoreBridge.instance.receiveTypedEvent(raw);
+            if (!_closed && generation == _generation && frame != null)
+              _emit(frame);
+          })
+          .catchError((Object error, StackTrace stack) {
+            if (!_closed && generation == _generation) {
+              _controller.add(
+                IpcEvent(
+                  kind: IpcEventKind.failed,
+                  payload: Uint8List(0),
+                  error: 'Typed event synchronization failed',
+                ),
+              );
+            }
+          });
     }).toJS;
-
     ws.onclose = ((JSAny? _) {
       if (_closed || _ws != ws) return;
+      _generation++;
+      _ws = null;
       _controller.add(
-        IpcEvent(
-          kind: IpcEventKind.disconnected,
-          payload: Uint8List(0),
-        ),
+        IpcEvent(kind: IpcEventKind.disconnected, payload: Uint8List(0)),
       );
     }).toJS;
-
-    ws.onerror = ((JSAny? err) {
+    ws.onerror = ((JSAny? _) {
       if (_closed || _ws != ws) return;
       _controller.add(
         IpcEvent(
           kind: IpcEventKind.failed,
           payload: Uint8List(0),
-          error: 'WebSocket connection error',
+          error: 'Authenticated event connection failed',
         ),
       );
     }).toJS;
@@ -204,43 +234,65 @@ class IpcServer {
 
   void _disconnectWebSocket() {
     if (_closed) return;
+    _generation++;
     _ws?.close();
     _ws = null;
-    if (!_controller.isClosed) {
-      _controller.add(
-        IpcEvent(
-          kind: IpcEventKind.disconnected,
-          payload: Uint8List(0),
-        ),
-      );
-    }
+    _controller.add(
+      IpcEvent(kind: IpcEventKind.disconnected, payload: Uint8List(0)),
+    );
   }
 
   Stream<IpcEvent> events() => _controller.stream;
 
   void send({required List<int> message}) {
-    if (_closed) throw StateError('WebSocket transport is closed');
-    final text = utf8.decode(message);
-    final ws = _ws;
-    if (ws != null && ws.readyState == 1) {
-      ws.send(text.toJS);
-    } else {
-      _pendingMessages.add(text);
-    }
-    final method = (jsonDecode(text) as Map<String, dynamic>)['method'];
-    if (const {'config.setup', 'config.update', 'listener.start', 'listener.stop'}.contains(method)) {
-      Future.delayed(const Duration(milliseconds: 500), () {
-        WebCoreBridge.instance.notifyNetworkChanged();
+    if (_closed) throw StateError('The browser Core facade is closed');
+    final raw = jsonDecode(utf8.decode(message));
+    if (raw is! Map<String, Object?>)
+      throw const FormatException('Invalid browser IPC call');
+    final id = raw['id'];
+    if (_inFlight >= 64) {
+      _emit({
+        if (id is String) 'id': id,
+        'result': null,
+        'error': {
+          'code': 'busy',
+          'message': 'Too many pending typed HTTP calls',
+          'details': null,
+        },
       });
-      Future.delayed(const Duration(milliseconds: 1500), () {
-        WebCoreBridge.instance.notifyNetworkChanged();
-      });
+      return;
     }
+    final generation = _generation;
+    _inFlight++;
+    unawaited(
+      WebCoreBridge.instance
+          .dispatchTypedCall(raw)
+          .then((response) {
+            if (_closed || generation != _generation) return;
+            _emit(response);
+            if (response['error'] == null &&
+                const {
+                  'config.setup',
+                  'config.update',
+                  'listener.start',
+                  'listener.stop',
+                }.contains(raw['method'])) {
+              WebCoreBridge.instance.notifyNetworkChanged();
+            }
+          })
+          .whenComplete(() {
+            _inFlight--;
+          }),
+    );
   }
 
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    _generation++;
+    WebCoreBridge.instance.removeRuntimeSubscriptionListener(
+      _subscriptionListener,
+    );
     WebCoreBridge.instance.unregisterServer(address);
     _ws?.close();
     _ws = null;

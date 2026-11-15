@@ -103,24 +103,12 @@ LIB_IMPORT_REWRITES = [
         r"\1 'package:fl_clash/web_shim/dart_ffi.dart'\2",
     ),
     (
-        re.compile(r"""^(import|export)\s+['"]package:archive/archive_io\.dart['"](.*)$""", re.MULTILINE),
-        r"\1 'package:fl_clash/web_shim/archive_io.dart'\2",
-    ),
-    (
         re.compile(r"""^(import|export)\s+['"]package:dio/dio\.dart['"](.*)$""", re.MULTILINE),
         r"\1 'package:fl_clash/web_shim/dio.dart'\2",
     ),
     (
         re.compile(r"""^(import|export)\s+['"]package:dio/io\.dart['"](.*)$""", re.MULTILINE),
         r"\1 'package:fl_clash/web_shim/dio_io.dart'\2",
-    ),
-    (
-        re.compile(r"""^(import|export)\s+['"]package:drift/native\.dart['"](.*)$""", re.MULTILINE),
-        r"\1 'package:fl_clash/web_shim/drift_native.dart'\2",
-    ),
-    (
-        re.compile(r"""^(import|export)\s+['"]package:drift_flutter/drift_flutter\.dart['"](.*)$""", re.MULTILINE),
-        r"\1 'package:fl_clash/web_shim/drift_native.dart'\2",
     ),
     (
         re.compile(r"""^(import|export)\s+['"]package:path_provider/path_provider\.dart['"](.*)$""", re.MULTILINE),

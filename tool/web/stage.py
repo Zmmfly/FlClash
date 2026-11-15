@@ -14,6 +14,13 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from navigation_adapt import adapt_navigation
+from api_adapt import adapt_api, check_api_overlay, validate_api_sources
+from workflow_adapt import adapt_workflows
+from scheduler_adapt import adapt_scheduler
+from utility_adapt import adapt_utilities
+from evaluate_adapt import adapt_evaluate
+
 from adaptations import (
     CODE_FORGE_IMPORT_REWRITES,
     LIB_IMPORT_REWRITES,
@@ -69,7 +76,8 @@ def adapt(root, overlay=OVERLAY):
         destination = root / relative
         if generated(destination):
             raise StageError(f'Generated overlay forbidden: {relative}')
-        if destination.exists() and relative != Path('lib/common/mitm_trust.dart'):
+        if (destination.exists() and relative != Path('lib/common/mitm_trust.dart')
+                and not check_api_overlay(root, relative, StageError)):
             raise StageError(f'Unexpected overlay collision: {relative}')
         if relative == Path('lib/common/mitm_trust.dart'):
             if 'MitmTrustStore? mitmTrustStoreForPlatform()' not in destination.read_text():
@@ -77,6 +85,15 @@ def adapt(root, overlay=OVERLAY):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(template, destination)
 
+    adapt_api(root, replace_exact, StageError)
+    adapt_workflows(root, replace_exact)
+    adapt_scheduler(root, replace_exact)
+    adapt_utilities(root, replace_exact)
+    obsolete_cache = root / 'lib/common/cache.dart'
+    if 'extension CacheManagerExt on CacheManager' not in obsolete_cache.read_text():
+        raise StageError('Missing native image cache helper anchor')
+    obsolete_cache.unlink()
+    adapt_evaluate(root, replace_exact)
     shim = root / 'lib/web_shim'
     rust = root / 'plugins/rust_api/lib'
     if not (rust / 'rust_api.dart').is_file():
@@ -94,10 +111,9 @@ def adapt(root, overlay=OVERLAY):
     replace_exact(root, 'lib/providers/actions/setup.dart',
                   'Future<DateTime?> serviceStartTime() async => service?.getRunTime();',
                   '''Future<DateTime?> serviceStartTime() async {
-    if (WebFileSystem.instance.isCoreListening && WebFileSystem.instance.coreStartTimeMs > 0) {
-      return DateTime.fromMillisecondsSinceEpoch(WebFileSystem.instance.coreStartTimeMs);
-    }
-    return service?.getRunTime();
+    final started = await WebRuntimeBinding.instance.startTime();
+    return started == null || started == 0
+        ? null : DateTime.fromMillisecondsSinceEpoch(started);
   }''')
     replace_exact(root, 'lib/plugins/app.dart', 'return FileImage(File(path));',
                   'return MemoryImage(File(path).readAsBytesSync());')
@@ -122,6 +138,7 @@ def adapt(root, overlay=OVERLAY):
                   '        const _GeneralItem(),',
                   '        const _GeneralItem(),\n        if (webPanelBuild) const WebAccountItem(),')
     merge_web_localizations(root)
+    adapt_navigation(root, replace_exact)
 
     counts = {}
     for directory, rewrites in ((root / 'lib', LIB_IMPORT_REWRITES),
@@ -141,6 +158,7 @@ def adapt(root, overlay=OVERLAY):
     for pattern, _ in LIB_IMPORT_REWRITES + CODE_FORGE_IMPORT_REWRITES:
         if counts.get(pattern.pattern, 0) == 0:
             raise StageError(f'Import rewrite has no matching anchor: {pattern.pattern}')
+    validate_api_sources(root, StageError)
     return counts
 
 

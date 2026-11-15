@@ -1,0 +1,4468 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
+import 'dart:typed_data';
+
+import 'package:fl_clash/common/common.dart' hide snowflake, uniqueId, uuidV4;
+import 'package:fl_clash/features/form/form.dart' show RuleForm;
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/manager/theme_manager.dart';
+import 'package:fl_clash/state.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/widgets/widgets.dart';
+import 'package:fl_clash/database/database.dart' as db;
+import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/providers/database.dart' as providers;
+import 'package:fl_clash/web_api/index.dart';
+import 'package:fl_clash/web_api/transport_browser.dart'
+    show BrowserApiTransport;
+import 'package:flutter/widgets.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _largeProfile = '9007199254740993';
+const _largeScript = '9223372036854775807';
+
+Map<String, Object?> _profile(String id, {String label = 'Profile'}) => {
+  'id': id,
+  'type': 'custom',
+  'label': label,
+  'url': '',
+  'ageSecretKey': '',
+  'autoUpdateDurationMillis': 3600000,
+  'autoUpdate': false,
+  'selectedMap': <String, String>{},
+  'unfoldSet': <String>[],
+  'extendType': 'standard',
+  'overrides': <String, Object?>{},
+  'order': 0,
+};
+
+Map<String, Object?> _rule(
+  String id, {
+  String? profileId,
+  String content = 'example.test',
+}) => {
+  'id': id,
+  'profileId': profileId,
+  'ruleAction': 'DOMAIN_SUFFIX',
+  'content': content,
+  'ruleTarget': 'DIRECT',
+  'noResolve': false,
+  'src': false,
+  'order': 'a0',
+};
+
+Map<String, Object?> _wrappedMutationData() => {
+  'profile': {
+    ..._profile(_largeProfile, label: 'Imported canonical profile'),
+    'scriptId': _largeScript,
+    'lastUpdateDate': '2026-01-02T03:04:05Z',
+  },
+  'script': {
+    'id': _largeScript,
+    'label': 'Canonical script',
+    'url': 'https://example.test/script.js',
+    'lastUpdateTime': '2026-01-02T03:04:05Z',
+    'order': 1,
+  },
+  'ruleProvider': {
+    'id': '-9223372036854775808',
+    'label': 'Canonical rules',
+    'url': 'https://example.test/rules.yaml',
+    'behavior': 'classical',
+    'format': 'yaml',
+    'order': 2,
+  },
+  'mitmModule': {
+    'id': '9007199254741100',
+    'name': 'Canonical module',
+    'description': 'Receipt projection',
+    'enabled': true,
+    'arguments': {'x': 'a'},
+    'resources': {'body': 'fixture'},
+    'scripts': 3,
+    'lastUpdateTime': '2026-01-02T03:04:05Z',
+    'order': 3,
+  },
+};
+
+class _WrappedContentMutation implements ApiCanonicalProjectionCarrier {
+  const _WrappedContentMutation({
+    required this.profile,
+    required this.script,
+    required this.ruleProvider,
+    required this.mitmModule,
+  });
+
+  final Profile profile;
+  final Script script;
+  final ClashProvider ruleProvider;
+  final MitmModule mitmModule;
+
+  @override
+  Iterable<ApiCanonicalProjection> get canonicalProjections => [
+    ApiCanonicalProjection(
+      ApiIdentity.profile,
+      profile,
+      path: const ['profile'],
+    ),
+    ApiCanonicalProjection(ApiIdentity.script, script, path: const ['script']),
+    ApiCanonicalProjection(
+      ApiIdentity.clashProvider,
+      ruleProvider,
+      path: const ['ruleProvider'],
+    ),
+    ApiCanonicalProjection(
+      ApiIdentity.mitmModule,
+      mitmModule,
+      path: const ['mitmModule'],
+    ),
+  ];
+}
+
+class _ProjectionCarrier implements ApiCanonicalProjectionCarrier {
+  const _ProjectionCarrier(this.canonicalProjections);
+
+  @override
+  final List<ApiCanonicalProjection> canonicalProjections;
+}
+
+_WrappedContentMutation _decodeWrappedMutation(
+  WebApiRepository repository,
+  Object? value,
+) {
+  final data = apiObject(value);
+  return _WrappedContentMutation(
+    profile: repository.codec.profile(data['profile']),
+    script: repository.codec.script(data['script']),
+    ruleProvider: repository.codec.clashProvider(data['ruleProvider']),
+    mitmModule: repository.codec.mitmModule(data['mitmModule']),
+  );
+}
+
+List<ApiDraftBinding> _wrappedMutationDrafts() => [
+  ApiDraftBinding(
+    ApiIdentity.profile,
+    allocateWebDraftId(),
+    path: const ['profile'],
+  ),
+  ApiDraftBinding(
+    ApiIdentity.script,
+    allocateWebDraftId(),
+    path: const ['script'],
+  ),
+  ApiDraftBinding(
+    ApiIdentity.clashProvider,
+    allocateWebDraftId(),
+    path: const ['ruleProvider'],
+  ),
+  ApiDraftBinding(
+    ApiIdentity.mitmModule,
+    allocateWebDraftId(),
+    path: const ['mitmModule'],
+  ),
+];
+
+class _HttpFixture implements ApiTransport, ApiAttachmentTransport {
+  final requests = <ApiRequest>[];
+  final receipts = <String, ApiResponse>{};
+  final requestBodies = <String, String>{};
+  final tombstones = <String>{};
+  final profiles = <Map<String, Object?>>[_profile(_largeProfile)];
+  final rules = <Map<String, Object?>>[_rule(_largeProfile)];
+  final disabled = <String, List<String>>{};
+  final catalogs = <String, List<Map<String, Object?>>>{};
+  final dialers = <String, List<Map<String, Object?>>>{};
+  final icons = <Map<String, Object?>>[];
+  final qualities = <Map<String, Object?>>[];
+  BigInt nextId = BigInt.parse('9007199254741000');
+  String revision = '17';
+  String cacheRevision = '2';
+  String storeId = 'isolated-test-store';
+  Completer<void>? postStarted;
+  Completer<void>? replyGate;
+  Completer<void>? getStarted;
+  Completer<void>? getGate;
+  bool dropAfterCommit = false;
+  bool dropBeforeCommit = false;
+  ApiResponse? nextGet;
+  ApiResponse? nextQuery;
+  String? preparationExpiry;
+  Object? wrappedMutation;
+  Map<String, Object?>? sourceGrant;
+  ApiBinaryResponse? nextAttachment;
+  Completer<void>? attachmentStarted;
+  Completer<void>? attachmentGate;
+  int? requestedAttachmentLimit;
+
+  ApiResponse _ok(Object? data, {String? operationId, bool cache = false}) =>
+      ApiResponse(
+        200,
+        jsonEncode({
+          'revision': cache ? cacheRevision : revision,
+          'data': data,
+          'operationId': ?operationId,
+        }),
+      );
+
+  ApiResponse _error(int status, String code, {Object? details}) => ApiResponse(
+    status,
+    jsonEncode({
+      'revision': revision,
+      'error': {'code': code, 'message': code, 'details': ?details},
+    }),
+  );
+
+  String allocateId() {
+    final value = nextId;
+    nextId += BigInt.one;
+    return value.toString();
+  }
+
+  void advance() => revision = (BigInt.parse(revision) + BigInt.one).toString();
+
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    final uri = Uri.parse(request.path);
+    final resource = uri.path.substring('/api/v1/'.length);
+    if (request.method == 'GET') {
+      final override = nextGet;
+      nextGet = null;
+      final response = override ?? _get(resource, uri.queryParameters);
+      getStarted?.complete();
+      getStarted = null;
+      final gate = getGate;
+      getGate = null;
+      if (gate != null) await gate.future;
+      return response;
+    }
+    final body = Map<String, Object?>.from(jsonDecode(request.body!) as Map);
+    if (nextQuery case final response?) {
+      nextQuery = null;
+      return response;
+    }
+    if ((resource.startsWith('operations/') ||
+            resource.startsWith('cache-operations/')) &&
+        resource.endsWith(':resolve')) {
+      expect(body, {'intent': 'resolve-unknown-result'});
+      final id = resource.substring(
+        resource.indexOf('/') + 1,
+        resource.length - ':resolve'.length,
+      );
+      if (receipts[id] case final receipt?) return receipt;
+      tombstones.add(id);
+      return _error(
+        409,
+        'operation_not_committed',
+        details: {'state': 'not_committed'},
+      );
+    }
+    if (resource == 'runtime:query-test') return _ok({'answer': 42});
+    if (resource == 'sources:prepare') {
+      return _ok({
+        'preparationId': 'public-source-preparation',
+        'purpose': 'profile-import',
+      });
+    }
+    if (resource == 'content:prepare-write' ||
+        resource == 'mitm-modules:prepare-arguments' ||
+        resource == 'profiles:prepare-custom-import' ||
+        resource == 'mitm-modules:prepare-import') {
+      expect(body['expectedRevision'], revision);
+      final operationId = resource == 'profiles:prepare-custom-import'
+          ? 'prepared-custom-import-fixture'
+          : resource == 'mitm-modules:prepare-import'
+          ? 'prepared-module-import-fixture'
+          : 'prepared-fixture-operation';
+      return _ok({
+        'preparedJobId': operationId,
+        'operationId': operationId,
+        if (resource == 'profiles:prepare-custom-import') ...{
+          'profileId': body['profileId'],
+          'summary': {'name': 'isolated custom import'},
+        },
+        'requestDigest': 'a' * 64,
+        'contentSha256': 'b' * 64,
+        'expiresAt':
+            preparationExpiry ??
+            DateTime.now()
+                .toUtc()
+                .add(const Duration(minutes: 4))
+                .toIso8601String(),
+        'dependencies': <Object?>[],
+      });
+    }
+    final operationId = body['operationId'] as String;
+    if (receipts[operationId] case final receipt?) {
+      return requestBodies[operationId] == request.body
+          ? receipt
+          : _error(409, 'operation_reused');
+    }
+    if (tombstones.contains(operationId)) {
+      return _error(
+        409,
+        'operation_not_committed',
+        details: {'state': 'not_committed'},
+      );
+    }
+    final cache =
+        resource.startsWith('icon-cache:') ||
+        resource.startsWith('ip-quality-cache:') ||
+        resource == 'previews:register';
+    if (body['expectedRevision'] != (cache ? cacheRevision : revision)) {
+      return _error(409, 'revision_conflict');
+    }
+    if (dropBeforeCommit) {
+      dropBeforeCommit = false;
+      postStarted?.complete();
+      postStarted = null;
+      throw StateError('isolated mock transport disconnected before dispatch');
+    }
+    final data = _command(resource, body);
+    if (data is ApiResponse) return data;
+    if (cache) {
+      cacheRevision = (BigInt.parse(cacheRevision) + BigInt.one).toString();
+    } else if (resource != 'sources:authorize') {
+      advance();
+    }
+    final response = _ok(data, operationId: operationId, cache: cache);
+    receipts[operationId] = response;
+    requestBodies[operationId] = request.body!;
+    postStarted?.complete();
+    postStarted = null;
+    final gate = replyGate;
+    replyGate = null;
+    if (gate != null) await gate.future;
+    if (dropAfterCommit) {
+      dropAfterCommit = false;
+      throw StateError(
+        'isolated mock transport dropped the committed HTTP response',
+      );
+    }
+    return response;
+  }
+
+  ApiResponse _get(String resource, Map<String, String> query) {
+    if (resource == 'meta') {
+      return _ok({
+        'storeId': storeId,
+        'schemaVersion': 1,
+        'revision': revision,
+      });
+    }
+    if ((resource.startsWith('operations/') ||
+        resource.startsWith('cache-operations/'))) {
+      return receipts[resource.substring(resource.indexOf('/') + 1)] ??
+          _error(404, 'operation_not_found');
+    }
+    if (resource == 'profiles') {
+      return _ok([
+        for (final item in profiles)
+          if (query['id'] == null || item['id'] == query['id']) item,
+      ]);
+    }
+    if (resource == 'rules') {
+      final owner = query['profileId'];
+      return _ok([
+        for (final item in rules)
+          if (query['scope'] == 'global'
+              ? item['profileId'] == null
+              : query['scope'] == 'profile'
+              ? item['profileId'] == owner
+              : (item['profileId'] == owner || item['profileId'] == null) &&
+                    !(disabled[owner] ?? []).contains(item['id']))
+            item,
+      ]);
+    }
+    if (resource == 'disabled-rules') {
+      return _ok({
+        'profileId': query['profileId'],
+        'ruleIds': disabled[query['profileId']] ?? [],
+      });
+    }
+    if (resource == 'proxy-dialers') {
+      return _ok({
+        'profileId': query['profileId'],
+        'dialers': dialers[query['profileId']] ?? [],
+      });
+    }
+    if (resource == 'icon-cache') {
+      return _ok([
+        for (final item in icons)
+          if (query['url'] != null
+              ? item['url'] == query['url']
+              : (item['url'] as String).contains(query['query'] ?? ''))
+            item,
+      ], cache: true);
+    }
+    if (resource == 'ip-quality-cache') {
+      return _ok([
+        for (final item in qualities)
+          if (item['ip'] == query['ip']) item,
+      ], cache: true);
+    }
+    return _ok([
+      for (final item in catalogs[resource] ?? <Map<String, Object?>>[])
+        if (query['profileId'] == null ||
+            item['profileId'] == query['profileId'])
+          item,
+    ]);
+  }
+
+  ApiResponse? _validateInput(String resource, Map<String, Object?> input) {
+    final allowed = switch (resource) {
+      'profiles' => {
+        'type',
+        'label',
+        'currentGroupName',
+        'url',
+        'ageSecretKey',
+        'extendType',
+        'scriptId',
+        'matchTarget',
+        'autoUpdateDurationMillis',
+        'autoUpdate',
+        'selectedMap',
+        'unfoldSet',
+        'overrides',
+        'overridesRawDocument',
+      },
+      'rules' => {
+        'profileId',
+        'ruleAction',
+        'content',
+        'ruleTarget',
+        'ruleProvider',
+        'subRule',
+        'noResolve',
+        'src',
+      },
+      'proxy-groups' => {'definition', 'memberLayout'},
+      'custom-proxies' => {'definition', 'emptyOptions'},
+      'scripts' => {'label', 'url'},
+      'clash-providers' => {'label', 'url'},
+      'mitm-modules' => {
+        'name',
+        'description',
+        'url',
+        'enabled',
+        'arguments',
+        'system',
+      },
+      'icon-sets' => {'name', 'url', 'icons'},
+      _ => throw StateError('Unexpected input resource'),
+    };
+    return input.keys.any((key) => !allowed.contains(key))
+        ? _error(400, 'unknown_field')
+        : null;
+  }
+
+  Object? _command(String path, Map<String, Object?> body) {
+    final parts = path.split(':');
+    final resource = parts.first;
+    final command = parts.last;
+    if (path == 'sources:authorize') {
+      return sourceGrant ??
+          {
+            'authorizationId': 'public-source-authorization',
+            'importOperationId': 'server-profile-import-operation',
+          };
+    }
+    if (path == 'previews:register') {
+      return wrappedMutation ?? {'previewId': 'opaque-preview'};
+    }
+    if (path == 'profiles:import' || path == 'scripts:import') {
+      return wrappedMutation;
+    }
+    if (path == 'content:write' ||
+        path == 'mitm-modules:arguments' ||
+        path == 'profiles:import-custom' ||
+        path == 'mitm-modules:import') {
+      return {'committed': true};
+    }
+    if (resource == 'disabled-rules') {
+      final owner = body['profileId'] as String;
+      disabled[owner] = List<String>.from(body['ruleIds'] as List);
+      return {'profileId': owner, 'ruleIds': disabled[owner]};
+    }
+    if (resource == 'proxy-dialers') {
+      final owner = body['profileId'] as String;
+      dialers[owner] = [
+        for (final row in body['dialers'] as List)
+          Map<String, Object?>.from(row as Map),
+      ];
+      return {'profileId': owner, 'dialers': dialers[owner]};
+    }
+    if (resource == 'icon-cache') {
+      if (command == 'delete') {
+        final urls = body['urls'] as List;
+        icons.removeWhere((item) => urls.contains(item['url']));
+        return {'deletedUrls': urls};
+      }
+      final row = {'url': body['url'], 'lastAccessed': '1700000000000'};
+      icons.removeWhere((item) => item['url'] == body['url']);
+      icons.add(row);
+      return row;
+    }
+    if (resource == 'ip-quality-cache') {
+      final quality = Map<String, Object?>.from(body['quality'] as Map);
+      final row = {
+        'ip': quality['ip'],
+        'quality': quality,
+        'checkedAt': '2026-01-02T03:04:05.000Z',
+      };
+      qualities.removeWhere((item) => item['ip'] == row['ip']);
+      qualities.add(row);
+      return row;
+    }
+    final rows = resource == 'profiles'
+        ? profiles
+        : resource == 'rules'
+        ? rules
+        : catalogs.putIfAbsent(resource, () => []);
+    final singular = switch (resource) {
+      'profiles' => 'profile',
+      'rules' => 'rule',
+      'proxy-groups' => 'group',
+      'custom-proxies' => 'proxy',
+      'scripts' => 'script',
+      'clash-providers' => 'provider',
+      'mitm-modules' => 'module',
+      'icon-sets' => 'iconSet',
+      _ => throw StateError('Unexpected route $path'),
+    };
+    final plural = switch (resource) {
+      'custom-proxies' => 'proxies',
+      'proxy-groups' => 'groups',
+      'clash-providers' => 'providers',
+      'mitm-modules' => 'modules',
+      'icon-sets' => 'iconSets',
+      _ => resource,
+    };
+    Map<String, Object?> make(Map<String, Object?> input, [String? id]) => {
+      ...switch (resource) {
+        'profiles' => _profile(id ?? allocateId()),
+        'rules' => _rule(id ?? allocateId()),
+        'scripts' => {'lastUpdateTime': '2026-01-02T03:04:05.000Z', 'order': 0},
+        'icon-sets' => {'lastUpdateTime': null, 'order': 0},
+        'clash-providers' => {
+          'behavior': 'classical',
+          'format': 'yaml',
+          'order': 0,
+        },
+        'mitm-modules' => {
+          'resources': <String, String>{},
+          'scripts': 0,
+          'lastUpdateTime': '2026-01-02T03:04:05.000Z',
+          'order': 0,
+        },
+        _ => <String, Object?>{'order': 'a0'},
+      },
+      ...input,
+      'id':
+          id ??
+          (resource == 'profiles' || resource == 'rules' ? null : allocateId()),
+      if (resource == 'proxy-groups') 'profileId': body['profileId'],
+    };
+    if (command == 'delete') {
+      final ids = resource == 'profiles' ? [body['id']] : body['ids'] as List;
+      if (ids.any((id) => !rows.any((row) => row['id'] == id))) {
+        return _error(404, 'not_found');
+      }
+      rows.removeWhere((row) => ids.contains(row['id']));
+      if (resource == 'rules') {
+        for (final idsForProfile in disabled.values) {
+          idsForProfile.removeWhere(ids.contains);
+        }
+      }
+      return {'deletedIds': ids};
+    }
+    if (command == 'reorder') {
+      final ids = body['ids'] as List;
+      final owned = resource == 'rules' || resource == 'proxy-groups';
+      final current = [
+        for (final row in rows)
+          if (!owned || row['profileId'] == body['profileId']) row,
+      ];
+      if (ids.length != current.length ||
+          ids.toSet().length != ids.length ||
+          ids.any((id) => !current.any((row) => row['id'] == id))) {
+        return _error(409, 'invalid_order');
+      }
+      final ordered = [
+        for (final id in ids) current.singleWhere((row) => row['id'] == id),
+      ];
+      rows.removeWhere(current.contains);
+      rows.addAll(ordered);
+      return ordered;
+    }
+    if (command == 'replace') {
+      final inputs = body[plural] as List;
+      final owner = body['profileId'];
+      final result = <Map<String, Object?>>[];
+      for (final value in inputs) {
+        final input = Map<String, Object?>.from(value as Map);
+        final id = input.remove('id') as String?;
+        final rejected = _validateInput(resource, input);
+        if (rejected != null) return rejected;
+        if (id != null &&
+            !rows.any(
+              (row) =>
+                  row['id'] == id &&
+                  (resource != 'rules' && resource != 'proxy-groups' ||
+                      row['profileId'] == owner),
+            )) {
+          return _error(409, 'wrong_owner');
+        }
+        final row = make(input, id ?? allocateId());
+        if (resource == 'rules') row['profileId'] = owner;
+        result.add(row);
+      }
+      rows.removeWhere(
+        (row) =>
+            resource != 'rules' && resource != 'proxy-groups' ||
+            row['profileId'] == owner,
+      );
+      rows.addAll(result);
+      return result;
+    }
+    if (command == 'reset-dialers') {
+      final row = rows.singleWhere((row) => row['id'] == body['id']);
+      row.remove('overridesRawDocument');
+      row['overrides'] = <String, Object?>{};
+      return row;
+    }
+    if (command == 'rename') {
+      final row = rows.singleWhere((row) => row['id'] == body['id']);
+      row['label'] = body['label'];
+      return row;
+    }
+    final input = Map<String, Object?>.from(body[singular] as Map);
+    final rejected = _validateInput(resource, input);
+    if (rejected != null) return rejected;
+    expect(input.containsKey('id'), isFalse);
+    final id = command == 'create' ? allocateId() : body['id'] as String;
+    if (command == 'update' && !rows.any((row) => row['id'] == id)) {
+      return _error(404, 'not_found');
+    }
+    final row = command == 'update'
+        ? {...rows.singleWhere((item) => item['id'] == id), ...input, 'id': id}
+        : make(input, id);
+    rows.removeWhere((item) => item['id'] == id);
+    rows.add(row);
+    return row;
+  }
+
+  @override
+  Future<ApiBinaryResponse> readAttachment(
+    ApiRequest request, {
+    required int maxBytes,
+  }) async {
+    requests.add(request);
+    requestedAttachmentLimit = maxBytes;
+    final response =
+        nextAttachment ??
+        ApiBinaryResponse(
+          200,
+          Uint8List.fromList([0, 255, 128, 1, 10]),
+          headers: {
+            'X-FlClash-Revision': revision,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '5',
+            'Content-Disposition': 'attachment; filename="profile.bin"',
+          },
+        );
+    nextAttachment = null;
+    attachmentStarted?.complete();
+    attachmentStarted = null;
+    final gate = attachmentGate;
+    attachmentGate = null;
+    if (gate != null) await gate.future;
+    return response;
+  }
+
+  @override
+  void close() {}
+}
+
+Widget _formHost(Widget child) => ProviderScope(
+  child: PrismApp(
+    localizationsDelegates: const [
+      AppLocalizations.delegate,
+      AppUiLocalizations.delegate,
+      GlobalWidgetsLocalizations.delegate,
+    ],
+    supportedLocales: AppLocalizations.delegate.supportedLocales,
+    builder: (context, child) {
+      globalState.measure = MeasureScope.of(context);
+      return AppViewScope(child: child!);
+    },
+    home: child,
+  ),
+);
+
+@JS('globalThis')
+external JSObject get _global;
+
+class _HttpMock implements ApiTransport, ApiAttachmentTransport {
+  final requests = <ApiRequest>[];
+  Future<ApiResponse> Function(ApiRequest)? handler;
+  Future<ApiBinaryResponse> Function(ApiRequest)? attachmentHandler;
+  ApiBinaryResponse? attachment;
+  ApiResponse ok(Object? data, {String revision = '17', String? id}) =>
+      ApiResponse(
+        200,
+        jsonEncode({'revision': revision, 'data': data, 'operationId': ?id}),
+      );
+  @override
+  Future<ApiResponse> send(ApiRequest request) async {
+    requests.add(request);
+    return handler == null ? ok({'id': '9007199254740993'}) : handler!(request);
+  }
+
+  @override
+  Future<ApiBinaryResponse> readAttachment(
+    ApiRequest request, {
+    required int maxBytes,
+  }) async {
+    expect(maxBytes, 32 * 1024 * 1024);
+    requests.add(request);
+    return attachmentHandler == null
+        ? attachment!
+        : attachmentHandler!(request);
+  }
+
+  @override
+  void close() {}
+}
+
+ApiResponse _busyResponse({
+  int status = 429,
+  String code = 'api_busy',
+  Object? state = 'not_accepted',
+}) => ApiResponse(
+  status,
+  jsonEncode({
+    'revision': '999',
+    'error': {
+      'code': code,
+      'message': code,
+      'details': {'state': state},
+    },
+  }),
+);
+
+WebApiClient _mockClient(_HttpMock transport, {ApiOperationJournal? journal}) {
+  final client = WebApiClient(
+    transport: transport,
+    journal: journal ?? MemoryApiOperationJournal(),
+  );
+  client.bindStore('component-store');
+  return client;
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  late _HttpFixture server;
+  late WebApiRepository repository;
+
+  setUp(() {
+    server = _HttpFixture();
+    repository = WebApiRepository(
+      transport: server,
+      journal: MemoryApiOperationJournal(),
+    );
+  });
+  tearDown(() async {
+    await repository.close();
+  });
+
+  test(
+    'api-client-contract identities retain full int64, namespaces and reload references',
+    () async {
+      server.profiles.first['scriptId'] = _largeScript;
+      server.catalogs['scripts'] = [
+        {
+          'id': _largeScript,
+          'label': 'script',
+          'lastUpdateTime': '2026-01-02T03:04:05Z',
+        },
+      ];
+      final profile = (await repository.profiles().get()).single;
+      final script =
+          (await repository.catalog(repository.scripts).get()).single;
+      final rule = (await repository.rules().get()).single;
+      expect(profile.scriptId, script.id);
+      expect(profile.id, isNot(rule.id));
+      expect(
+        repository.codec.wireId(ApiIdentity.profile, profile.id),
+        _largeProfile,
+      );
+      expect(repository.codec.wireId(ApiIdentity.rule, rule.id), _largeProfile);
+      expect(
+        repository.codec.wireId(ApiIdentity.script, script.id),
+        _largeScript,
+      );
+      final reload = WebApiRepository(
+        transport: server,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(reload.close);
+      final loadedScript = (await reload.catalog(reload.scripts).get()).single;
+      expect((await reload.profiles().get()).single.scriptId, loadedScript.id);
+      expect(
+        () =>
+            repository.identities.decode(ApiIdentity.profile, 9007199254740992),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(
+        () => repository.identities.decode(
+          ApiIdentity.profile,
+          '9223372036854775808',
+        ),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract DTO codec preserves corrupt dialer field and raw document',
+    () {
+      final invalid = {
+        ..._profile(_largeProfile),
+        'overrides': {
+          'dialer-proxies': {'good': 'node', 'bad': 42},
+        },
+      };
+      final profile = repository.codec.profile(invalid);
+      expect(profile.autoUpdateDuration, const Duration(hours: 1));
+      expect(profile.overrides.dialerProxies.isValid, isFalse);
+      expect(
+        repository.codec.profileInput(profile)['overrides'],
+        containsPair('dialer-proxies', {'good': 'node', 'bad': 42}),
+      );
+      const raw = '{broken raw document';
+      final unreadable = repository.codec.profile({
+        ..._profile(_largeProfile),
+        'overrides': null,
+        'overridesRawDocument': raw,
+      });
+      expect(unreadable.overrides.dialerProxies.rawDocument, raw);
+      expect(
+        repository.codec.profileInput(unreadable)['overridesRawDocument'],
+        raw,
+      );
+      expect(
+        () =>
+            repository.codec.profile({...invalid, 'overridesRawDocument': raw}),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract readonly int64 quantities are approximate display only, identities and mutation bytes remain exact',
+    () async {
+      const counts = {
+        'upload': '9007199254740993',
+        'download': '0',
+        'total': '9223372036854775807',
+        'expire': '1700000000',
+      };
+      server.profiles.single['subscriptionInfo'] = counts;
+      final profile = (await repository.profiles().get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      expect(profile.subscriptionInfo!.total, greaterThan(maxSafeLocalId));
+      expect(
+        profile.subscriptionInfo!.usage,
+        closeTo(9007199254740993.0 / 9223372036854775807.0, 1e-12),
+      );
+      expect(
+        repository.codec.wireId(ApiIdentity.profile, profile.id),
+        _largeProfile,
+      );
+      await repository.saveProfile(
+        profile.copyWith(label: 'metadata only'),
+        editVersion: version,
+      );
+      expect(server.profiles.single['subscriptionInfo'], counts);
+      final request = server.requests.lastWhere(
+        (request) => request.path == '/api/v1/profiles:update',
+      );
+      final input = (jsonDecode(request.body!) as Map)['profile'] as Map;
+      for (final key in [
+        'lastUpdateDate',
+        'subscriptionInfo',
+        'order',
+        'unfoldSet',
+      ]) {
+        expect(input.containsKey(key), isFalse);
+      }
+      expect(
+        () => repository.codec.profile({
+          ..._profile(_largeProfile),
+          'subscriptionInfo': {...counts, 'expire': '9223372036854775807'},
+        }),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'quantity_unrepresentable',
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract create requires an explicit original form token and fresh draft IDs cannot escape stale CAS',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.rule);
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      final freshDraft = Rule(
+        id: allocateWebDraftId(),
+        content: 'draft remains after conflict',
+      );
+      await expectLater(
+        repository.saveRule(freshDraft),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'edit_baseline_required',
+          ),
+        ),
+      );
+      expect(
+        server.requests.where((request) => request.method == 'POST'),
+        isEmpty,
+      );
+      await expectLater(
+        repository.saveRule(
+          freshDraft.copyWith(ruleTarget: 'DIRECT'),
+          editVersion: version,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(freshDraft.content, 'draft remains after conflict');
+      expect(
+        repository.identities.isBound(ApiIdentity.rule, freshDraft.id),
+        isFalse,
+      );
+      expect(
+        server.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract synchronously registered write intent fences an immediate auto-apply read before HTTP starts',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.rule);
+      final draft = Rule(id: allocateWebDraftId(), content: 'queued intent');
+      final preflight = Completer<void>();
+      final started = server.postStarted = Completer<void>();
+      final receiptGate = server.replyGate = Completer<void>();
+      final write = repository.runIntent(() async {
+        await preflight.future;
+        return repository.saveRule(draft, editVersion: version);
+      });
+      var appliedSnapshot = false;
+      final readForApply = repository
+          .readExternal('/api/v1/rules?scope=global')
+          .then((receipt) {
+            appliedSnapshot = true;
+            return receipt;
+          });
+      expect(appliedSnapshot, isFalse);
+      preflight.complete();
+      await started.future;
+      await repository.handleCommitEvent({
+        'revision': server.revision,
+        'operationId': repository.pendingOperation!.operationId,
+      });
+      expect(appliedSnapshot, isFalse);
+      receiptGate.complete();
+      await write;
+      final snapshot = await readForApply;
+      expect(appliedSnapshot, isTrue);
+      expect(
+        (snapshot.data as List).any(
+          (value) => (value as Map)['content'] == 'queued intent',
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract queued unknown command blocks auto-apply snapshots until operation receipt recovery',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.rule);
+      final draft = Rule(
+        id: allocateWebDraftId(),
+        content: 'unknown auto apply',
+      );
+      final preflight = Completer<void>();
+      server.dropAfterCommit = true;
+      final write = repository.runIntent(() async {
+        await preflight.future;
+        return repository.saveRule(draft, editVersion: version);
+      });
+      final rejectedWrite = expectLater(
+        write,
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final readForApply = repository.readExternal(
+        '/api/v1/rules?scope=global',
+      );
+      final rejectedRead = expectLater(
+        readForApply,
+        throwsA(isA<WebApiPendingOperationException>()),
+      );
+      preflight.complete();
+      await rejectedWrite;
+      await rejectedRead;
+      await repository.recoverOperation(
+        repository.pendingOperation!.operationId,
+      );
+      final snapshot = await repository.readExternal(
+        '/api/v1/rules?scope=global',
+      );
+      expect(
+        (snapshot.data as List).any(
+          (value) => (value as Map)['content'] == 'unknown auto apply',
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract query/get/watch/map/single helpers use typed HTTP resources',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      final global = (await repository.rules().get()).single;
+      server.rules.add(_rule(_largeScript, profileId: _largeProfile));
+      server.disabled[_largeProfile] = [_largeProfile];
+      final facade = db.Database(repository: repository);
+      expect(await facade.profilesDao.ids().getSingle(), profile.id);
+      expect(
+        await facade.rulesDao.profileRulesCount(profile.id).watchSingle().first,
+        1,
+      );
+      expect(
+        (await facade.rulesDao.queryAddedRules(profile.id).get())
+            .single
+            .profileId,
+        profile.id,
+      );
+      expect(await facade.rulesDao.queryDisabledRuleIds(profile.id).get(), [
+        global.id,
+      ]);
+      expect(
+        server.requests.every((r) => r.path.startsWith('/api/v1/')),
+        isTrue,
+      );
+      expect(
+        server.requests.map((r) => r.path).join(' '),
+        isNot(contains('/api/fs')),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract provider projection waits for canonical HTTP receipt',
+    () async {
+      final previous = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() {
+        db.database = previous;
+      });
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      container.listen(providers.profilesProvider, (_, _) {});
+      await container.read(providers.profilesStreamProvider.future);
+      final before = container.read(providers.profilesProvider);
+      final draft = Profile.custom(label: 'new profile');
+      final started = server.postStarted = Completer<void>();
+      final gate = server.replyGate = Completer<void>();
+      final pending = container
+          .read(providers.profilesProvider.notifier)
+          .putCommitted(
+            draft,
+            editVersion: repository.captureCreateVersion(ApiIdentity.profile),
+          );
+      await started.future;
+      expect(container.read(providers.profilesProvider), before);
+      gate.complete();
+      final saved = await pending;
+      expect(saved.id, draft.id);
+      expect(
+        container
+            .read(providers.profilesProvider)
+            .any((item) => item.id == draft.id),
+        isTrue,
+      );
+      final request = server.requests.firstWhere(
+        (request) => request.path == '/api/v1/profiles:create',
+      );
+      expect(jsonDecode(request.body!)['profile'].containsKey('id'), isFalse);
+      expect(draft.id.abs(), lessThanOrEqualTo(maxSafeLocalId));
+    },
+  );
+
+  test(
+    'api-client-contract WS-before-HTTP-loss binds original draft before any publication',
+    () async {
+      await repository.initialize();
+      final emissions = <List<Rule>>[];
+      final initial = Completer<void>();
+      final subscription = repository.rules().watch().listen((rows) {
+        emissions.add(rows);
+        if (!initial.isCompleted) initial.complete();
+      });
+      addTearDown(subscription.cancel);
+      await initial.future;
+      final rule = Rule(
+        id: allocateWebDraftId(),
+        content: 'new.test',
+        ruleTarget: 'DIRECT',
+      );
+      final started = server.postStarted = Completer<void>();
+      final gate = server.replyGate = Completer<void>();
+      server.dropAfterCommit = true;
+      final pending = repository.saveRule(
+        rule,
+        editVersion: repository.captureCreateVersion(ApiIdentity.rule),
+      );
+      await started.future;
+      final operationId = repository.pendingOperation!.operationId;
+      await repository.handleCommitEvent({
+        'revision': server.revision,
+        'operationId': operationId,
+      });
+      expect(
+        emissions.every((rows) => rows.every((item) => item.id != rule.id)),
+        isTrue,
+      );
+      gate.complete();
+      final saved = await pending;
+      expect(saved.id, rule.id);
+      expect(
+        (await repository.rules().get()).any((item) => item.id == rule.id),
+        isTrue,
+      );
+      expect(
+        server.requests.any((r) => r.path == '/api/v1/operations/$operationId'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract unknown commit retains operation and blocks subsequent writes until recovery',
+    () async {
+      await repository.initialize();
+      final rule = Rule(
+        id: allocateWebDraftId(),
+        content: 'unknown.test',
+        ruleTarget: 'DIRECT',
+      );
+      server.dropAfterCommit = true;
+      await expectLater(
+        repository.saveRule(
+          rule,
+          editVersion: repository.captureCreateVersion(ApiIdentity.rule),
+        ),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final pending = repository.pendingOperation!;
+      await expectLater(
+        repository.rules().get(),
+        throwsA(isA<WebApiPendingOperationException>()),
+      );
+      await expectLater(
+        repository.saveRule(
+          Rule(id: allocateWebDraftId()),
+          editVersion: repository.captureCreateVersion(ApiIdentity.rule),
+        ),
+        throwsA(isA<WebApiPendingOperationException>()),
+      );
+      await repository.recoverOperation(pending.operationId);
+      expect(repository.pendingOperation, isNull);
+      expect(
+        (await repository.rules().get()).any((item) => item.id == rule.id),
+        isTrue,
+      );
+      expect(
+        server.rules.where((r) => r['content'] == 'unknown.test'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract journal reload recovers without persisting payload or credentials',
+    () async {
+      final journal = MemoryApiOperationJournal();
+      final first = WebApiRepository(transport: server, journal: journal);
+      addTearDown(first.close);
+      await first.initialize();
+      server.dropAfterCommit = true;
+      final profile = Profile.custom(
+        label: 'secret label',
+      ).copyWith(ageSecretKey: 'synthetic-test-secret');
+      await expectLater(
+        first.saveProfile(
+          profile,
+          editVersion: first.captureCreateVersion(ApiIdentity.profile),
+        ),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final persisted = jsonEncode(journal.read()!.toJournal());
+      expect(persisted, isNot(contains('synthetic-test-secret')));
+      expect(persisted, isNot(contains('secret label')));
+      expect(journal.read()!.body, isNull);
+      final reloaded = WebApiRepository(transport: server, journal: journal);
+      addTearDown(reloaded.close);
+      await reloaded.initialize();
+      expect(reloaded.pendingOperation, isNull);
+      expect(
+        (await reloaded.profiles().get())
+            .singleWhere((p) => p.label == 'secret label')
+            .id,
+        profile.id,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract ordinary operation 404 is pending; atomic resolve tombstone releases it',
+    () async {
+      await repository.initialize();
+      server.dropBeforeCommit = true;
+      await expectLater(
+        repository.saveRule(
+          Rule(id: allocateWebDraftId()),
+          editVersion: repository.captureCreateVersion(ApiIdentity.rule),
+        ),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final operationId = repository.pendingOperation!.operationId;
+      final original = server.requests.last;
+      await expectLater(
+        repository.recoverOperation(operationId),
+        throwsA(isA<WebApiException>().having((e) => e.status, 'status', 404)),
+      );
+      expect(repository.pendingOperation, isNotNull);
+      await expectLater(
+        repository.recoverOperation(operationId, resolve: true),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'operation_not_committed',
+          ),
+        ),
+      );
+      expect(repository.pendingOperation, isNull);
+      final delayed = await server.send(original);
+      expect(delayed.status, 409);
+      await repository.saveRule(
+        Rule(id: allocateWebDraftId(), content: 'retry-new-operation.test'),
+        editVersion: repository.captureCreateVersion(ApiIdentity.rule),
+      );
+      expect(
+        server.rules.where((r) => r['content'] == 'retry-new-operation.test'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract logout clears caches and rejects inflight old-session HTTP results',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      repository.onRevisionEvent(server.revision);
+      final started = server.getStarted = Completer<void>();
+      final gate = server.getGate = Completer<void>();
+      final inflight = repository.profiles().get();
+      await started.future;
+      repository.endSession();
+      gate.complete();
+      await expectLater(inflight, throwsA(isA<WebApiSessionException>()));
+      expect(
+        () => repository.codec.wireId(ApiIdentity.profile, profile.id),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      repository.beginSession();
+      final next = (await repository.profiles().get()).single;
+      expect(next.id, isNot(profile.id));
+    },
+  );
+
+  test(
+    'api-client-contract logout resets provider source data, not just its transient notifier value',
+    () async {
+      final previous = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() {
+        db.database = previous;
+      });
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      container.listen(providers.profilesProvider, (_, _) {});
+      await container.read(providers.profilesStreamProvider.future);
+      final old = container.read(providers.profilesProvider).single.id;
+      repository.endSession();
+      expect(container.read(providers.profilesProvider), isEmpty);
+      await Future<void>.delayed(Duration.zero);
+      expect(container.read(providers.profilesProvider), isEmpty);
+      repository.beginSession();
+      final changed = Completer<void>();
+      final listener = container.listen(providers.profilesProvider, (_, rows) {
+        if (rows.isNotEmpty && rows.single.id != old && !changed.isCompleted) {
+          changed.complete();
+        }
+      });
+      addTearDown(listener.close);
+      await changed.future;
+      expect(container.read(providers.profilesProvider).single.id, isNot(old));
+    },
+  );
+
+  test(
+    'api-client-contract paused watch cannot deliver queued DTOs from an old session',
+    () async {
+      final values = <List<Profile>>[];
+      final first = Completer<void>();
+      final fresh = Completer<void>();
+      final subscription = repository.profiles().watch().listen((rows) {
+        values.add(rows);
+        if (!first.isCompleted) first.complete();
+        if (rows.single.label == 'new-session' && !fresh.isCompleted) {
+          fresh.complete();
+        }
+      }, onError: (Object _) {});
+      addTearDown(subscription.cancel);
+      await first.future;
+      subscription.pause();
+      server.profiles.single['label'] = 'queued-old-session';
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      await repository.profiles().get();
+      await Future<void>.delayed(Duration.zero);
+      repository.endSession();
+      server.profiles.single['label'] = 'new-session';
+      repository.beginSession();
+      subscription.resume();
+      await fresh.future;
+      expect(
+        values.skip(1).every((rows) => rows.single.label == 'new-session'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract out-of-order events and reconnect invalidate/refetch instead of reverting',
+    () async {
+      final first = (await repository.profiles().get()).single;
+      server.profiles.first['label'] = 'other tab';
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      expect((await repository.profiles().get()).single.label, 'other tab');
+      server.profiles.first['label'] = 'newer tab';
+      server.advance();
+      await repository.handleCommitEvent({'revision': '1'});
+      expect((await repository.profiles().get()).single.label, 'newer tab');
+      expect(repository.revision, server.revision);
+      server.profiles.first['label'] = 'after reconnect';
+      await repository.onReconnect();
+      expect(
+        (await repository.profiles().get()).single.label,
+        'after reconnect',
+      );
+      expect((await repository.profiles().get()).single.id, first.id);
+    },
+  );
+
+  test(
+    'api-client-contract CAS conflict is explicit and never retried as an upsert',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      server.advance();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      await expectLater(
+        repository.saveProfile(
+          profile.copyWith(label: 'stale'),
+          editVersion: version,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(server.profiles.single['label'], 'Profile');
+      expect(repository.pendingOperation, isNull);
+      expect(server.requests.where((r) => r.method == 'POST'), hasLength(1));
+    },
+  );
+
+  test(
+    'api-client-contract atomic global replace preserves namespace references and disables by wire ID',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      final originals = await repository.rules().get();
+      final global = originals.single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.rule,
+        originals,
+      );
+      final draft = Rule(
+        id: allocateWebDraftId(),
+        ruleAction: RuleAction.DOMAIN_SUFFIX,
+        content: 'first.test',
+      );
+      final next = await repository.replaceRules(null, [
+        draft,
+        global,
+      ], editVersion: version);
+      expect(next.map((r) => r.id), [draft.id, global.id]);
+      final disabledBefore = await repository.disabledRuleIds(profile.id).get();
+      await repository.replaceDisabledRules(
+        profile.id,
+        [global.id],
+        editVersion: repository.captureEditVersion(
+          ApiIdentity.rule,
+          disabledBefore,
+        ),
+      );
+      expect(await repository.disabledRuleIds(profile.id).get(), [global.id]);
+      final replace = server.requests.singleWhere(
+        (r) => r.path == '/api/v1/rules:replace',
+      );
+      expect(jsonDecode(replace.body!)['profileId'], isNull);
+      expect(jsonDecode(replace.body!)['rules'][1]['id'], _largeProfile);
+      final disabled = server.requests.singleWhere(
+        (r) => r.path == '/api/v1/disabled-rules:replace',
+      );
+      expect(jsonDecode(disabled.body!)['ruleIds'], [_largeProfile]);
+    },
+  );
+
+  test(
+    'api-client-contract every catalog uses typed input and server-generated identity/clock',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      final group = ProxyGroup(
+        id: allocateWebDraftId(),
+        name: 'group',
+        type: GroupType.Selector,
+        proxies: ['DIRECT'],
+        usePosition: {'provider': 1},
+      );
+      final savedGroup = await repository.saveCatalog(
+        repository.groups,
+        group,
+        profileId: profile.id,
+        editVersion: repository.captureCreateVersion(
+          repository.groups.identity,
+        ),
+      );
+      expect(savedGroup.profileId, profile.id);
+      expect(savedGroup.usePosition, {'provider': 1});
+      final proxy = CustomProxy(
+        id: allocateWebDraftId(),
+        definition: {'name': 'node', 'type': 'ss', 'id': 'vendor-owned-id'},
+      );
+      final savedProxy = await repository.saveCatalog(
+        repository.proxies,
+        proxy,
+        editVersion: repository.captureCreateVersion(
+          repository.proxies.identity,
+        ),
+      );
+      expect(savedProxy.definition['id'], 'vendor-owned-id');
+      final dialersBefore = await repository.dialers(profile.id).get();
+      await repository.replaceDialers(
+        profile.id,
+        {savedProxy.id: 'group'},
+        editVersion: repository.captureEditVersion(
+          ApiIdentity.profile,
+          dialersBefore,
+        ),
+      );
+      expect(
+        (await repository.dialers(profile.id).get()).single.proxyId,
+        savedProxy.id,
+      );
+      final script = await repository.saveCatalog(
+        repository.scripts,
+        Script(
+          id: allocateWebDraftId(),
+          label: 'script',
+          lastUpdateTime: DateTime(2000),
+        ),
+        editVersion: repository.captureCreateVersion(
+          repository.scripts.identity,
+        ),
+      );
+      expect(script.lastUpdateTime.year, 2026);
+      await repository.saveCatalog(
+        repository.providers,
+        ClashProvider(id: allocateWebDraftId(), label: 'provider'),
+        editVersion: repository.captureCreateVersion(
+          repository.providers.identity,
+        ),
+      );
+      await repository.saveCatalog(
+        repository.iconSets,
+        IconSet(id: allocateWebDraftId(), name: 'icons'),
+        editVersion: repository.captureCreateVersion(
+          repository.iconSets.identity,
+        ),
+      );
+      await repository.saveCatalog(
+        repository.modules,
+        MitmModule(
+          id: allocateWebDraftId(),
+          name: 'module',
+          lastUpdateTime: DateTime(2000),
+        ),
+        editVersion: repository.captureCreateVersion(
+          repository.modules.identity,
+        ),
+      );
+      for (final request in server.requests.where((r) => r.method == 'POST')) {
+        final body = jsonDecode(request.body!) as Map;
+        expect(body['expectedRevision'], isA<String>());
+        expect(body['operationId'], isA<String>());
+        expect(request.body, isNot(contains('toCompanion')));
+      }
+      final scriptBody = jsonDecode(
+        server.requests
+            .singleWhere((r) => r.path == '/api/v1/scripts:create')
+            .body!,
+      );
+      expect(scriptBody['script'].keys, unorderedEquals(['label', 'url']));
+    },
+  );
+
+  testWidgets(
+    'api-client-contract actual RuleForm keeps V1 token across copyWith and WS V2',
+    (tester) async {
+      final previousDatabase = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() {
+        db.database = previousDatabase;
+      });
+      final original = (await tester.runAsync(
+        () => repository.rules().get(),
+      ))!.single;
+      final originalVersion = repository.captureEditVersion(
+        ApiIdentity.rule,
+        original,
+      );
+      Rule? draft;
+      Object? saveError;
+      await tester.pumpWidget(
+        _formHost(
+          Builder(
+            builder: (context) => FilledButton(
+              onPressed: () async {
+                final result = await showFormSheet<Rule>(
+                  context: context,
+                  builder: (_) => RuleForm(rule: original),
+                );
+                if (result == null) return;
+                draft = result;
+              },
+              child: const Text('open actual rule form'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('open actual rule form'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextFormField), 'edited-by-A.test');
+      server.rules.single['content'] = 'edited-by-B.test';
+      server.advance();
+      await tester.runAsync(
+        () => repository.handleCommitEvent({'revision': server.revision}),
+      );
+      await tester.tap(find.byTooltip(AppLocalizations.current.save));
+      await tester.pumpAndSettle();
+      expect(draft, isNotNull);
+      await tester.runAsync(() async {
+        try {
+          await repository.saveRule(draft!, editVersion: originalVersion);
+        } catch (error) {
+          saveError = error;
+        }
+      });
+      expect(identical(draft, original), isFalse);
+      expect(draft!.content, 'edited-by-A.test');
+      expect(
+        saveError,
+        isA<WebApiException>().having(
+          (e) => e.code,
+          'code',
+          'revision_conflict',
+        ),
+      );
+      expect(server.rules.single['content'], 'edited-by-B.test');
+      expect(
+        server.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+      final staleBody = jsonDecode(
+        server.requests.lastWhere((request) => request.method == 'POST').body!,
+      );
+      expect(staleBody['expectedRevision'], originalVersion.revision);
+      expect(
+        () => repository.captureEditVersion(ApiIdentity.rule, draft!),
+        throwsA(isA<WebApiException>()),
+      );
+      final reloaded = (await tester.runAsync(
+        () => repository.rules().get(),
+      ))!.single;
+      final refreshedVersion = repository.captureEditVersion(
+        ApiIdentity.rule,
+        reloaded,
+      );
+      await tester.runAsync(
+        () => repository.saveRule(
+          reloaded.copyWith(content: draft!.content),
+          editVersion: refreshedVersion,
+        ),
+      );
+      expect(server.rules.single['content'], 'edited-by-A.test');
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  test(
+    'api-client-contract raw attachment bytes carry owned read version without filesystem mirroring',
+    () async {
+      await repository.initialize();
+      final file = await repository.readAttachmentExternal(
+        '/api/v1/content/profile/$_largeProfile/download',
+      );
+      expect(file.bytes, [0, 255, 128, 1, 10]);
+      expect(file.mediaType, 'application/octet-stream');
+      expect(file.filename, 'profile.bin');
+      expect(file.readReceipt.data, containsPair('byteLength', 5));
+      expect(
+        repository.captureReadVersion(file.readReceipt).revision,
+        file.revision,
+      );
+      expect(server.requestedAttachmentLimit, 32 * 1024 * 1024);
+      expect(() => file.bytes[0] = 5, throwsUnsupportedError);
+      expect(
+        () => repository.captureReadVersion(
+          ApiReceipt(revision: file.revision, data: {}),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract attachment bound, completeness, revision and untrusted filename fail closed',
+    () async {
+      await repository.initialize();
+      const path = '/api/v1/content/profile/$_largeProfile/download';
+      server.nextAttachment = ApiBinaryResponse(
+        200,
+        Uint8List(0),
+        headers: {
+          'x-flclash-revision': server.revision,
+          'content-length': '33554433',
+        },
+      );
+      await expectLater(
+        repository.readAttachmentExternal(path),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      server.nextAttachment = ApiBinaryResponse(
+        200,
+        Uint8List.fromList([1, 2]),
+        complete: false,
+        headers: {'x-flclash-revision': server.revision},
+      );
+      await expectLater(
+        repository.readAttachmentExternal(path),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      server.nextAttachment = ApiBinaryResponse(
+        200,
+        Uint8List.fromList([1, 2]),
+        headers: {'x-flclash-revision': server.revision, 'content-length': '3'},
+      );
+      await expectLater(
+        repository.readAttachmentExternal(path),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      server.nextAttachment = ApiBinaryResponse(200, Uint8List(0));
+      await expectLater(
+        repository.readAttachmentExternal(path),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      server.nextAttachment = ApiBinaryResponse(
+        200,
+        Uint8List(0),
+        headers: {
+          'x-flclash-revision': server.revision,
+          'content-disposition': 'attachment; filename="../../outside"',
+        },
+      );
+      expect((await repository.readAttachmentExternal(path)).filename, isNull);
+      await expectLater(
+        repository.readAttachmentExternal('/api/fs/read'),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      expect(repository.pendingOperation, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract attachment 401 expires session and stale inflight binary cannot repopulate it',
+    () async {
+      await repository.initialize();
+      const path = '/api/v1/content/profile/$_largeProfile/download';
+      server.nextAttachment = ApiBinaryResponse(
+        401,
+        Uint8List.fromList(
+          utf8.encode(
+            jsonEncode({
+              'error': {'code': 'unauthenticated', 'message': 'login required'},
+            }),
+          ),
+        ),
+      );
+      await expectLater(
+        repository.readAttachmentExternal(path),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'unauthenticated',
+          ),
+        ),
+      );
+      expect(repository.isSessionActive, isFalse);
+      repository.beginSession();
+      await repository.initialize();
+      final started = server.attachmentStarted = Completer<void>();
+      final gate = server.attachmentGate = Completer<void>();
+      final inflight = repository.readAttachmentExternal(path);
+      await started.future;
+      repository.endSession();
+      gate.complete();
+      await expectLater(inflight, throwsA(isA<WebApiSessionException>()));
+    },
+  );
+
+  test(
+    'api-client-contract unknown cache command recovers only through cache receipt scope',
+    () async {
+      await repository.initialize();
+      server.dropAfterCommit = true;
+      await expectLater(
+        repository.putIcon('https://example.test/cache.svg'),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final pending = repository.pendingOperation!;
+      expect(pending.scope, ApiRevisionScope.cache);
+      await repository.recoverOperation(pending.operationId);
+      expect(
+        server.requests.any(
+          (request) =>
+              request.path == '/api/v1/cache-operations/${pending.operationId}',
+        ),
+        isTrue,
+      );
+      expect(repository.pendingOperation, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract accepted receipt with failed refresh remains known committed, never a new create',
+    () async {
+      await repository.initialize();
+      server.nextGet = ApiResponse(
+        503,
+        jsonEncode({
+          'error': {'code': 'temporary_unavailable', 'message': 'retry read'},
+        }),
+      );
+      final draft = Rule(
+        id: allocateWebDraftId(),
+        content: 'committed-refresh.test',
+      );
+      WebApiCommittedProjectionException? failure;
+      try {
+        await repository.saveRule(
+          draft,
+          editVersion: repository.captureCreateVersion(ApiIdentity.rule),
+        );
+      } on WebApiCommittedProjectionException catch (error) {
+        failure = error;
+      }
+      expect(failure, isNotNull);
+      expect(repository.pendingOperation, isNull);
+      expect(repository.identities.isBound(ApiIdentity.rule, draft.id), isTrue);
+      await repository.recoverOperation(failure!.operationId);
+      expect(
+        (await repository.rules().get()).where((rule) => rule.id == draft.id),
+        hasLength(1),
+      );
+      expect(
+        server.requests.where(
+          (request) => request.path == '/api/v1/rules:create',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract prepared operation registration requires exact authenticated query and original read context',
+    () async {
+      server.catalogs['mitm-modules'] = [
+        {
+          'id': _largeScript,
+          'name': 'module',
+          'description': '',
+          'enabled': false,
+          'arguments': <String, String>{},
+          'resources': <String, String>{},
+          'scripts': 0,
+          'lastUpdateTime': '2026-01-02T03:04:05Z',
+        },
+      ];
+      final module =
+          (await repository.catalog(repository.modules).get()).single;
+      final original = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        module,
+      );
+      final key = {'kind': 'mitm-module', 'id': _largeScript};
+      final receipt = await repository
+          .queryExternal('/api/v1/content:prepare-write', {
+            'expectedRevision': original.revision,
+            'key': key,
+            'bytes': base64Encode(utf8.encode('name: fixture')),
+          });
+      final id = repository.registerPreparedOperation(receipt, original);
+      final prepared = receipt.data as Map;
+      expect(id, prepared['operationId']);
+      expect(() => prepared['operationId'] = 'forged', throwsUnsupportedError);
+      expect(
+        () => repository.registerPreparedOperation(
+          ApiReceipt(revision: receipt.revision, data: prepared),
+          original,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => repository.registerPreparedOperation(
+          receipt,
+          repository.captureCreateVersion(ApiIdentity.mitmModule),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      final payload = {
+        'key': key,
+        'preparedJobId': id,
+        'requestDigest': prepared['requestDigest'],
+      };
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/content:write',
+          {...payload, 'requestDigest': 'c' * 64},
+          apiObject,
+          editVersion: original,
+          operationId: id,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'operation_context_mismatch',
+          ),
+        ),
+      );
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/content:write',
+          {
+            ...payload,
+            'key': {'kind': 'mitm-module', 'id': _largeProfile},
+          },
+          apiObject,
+          editVersion: original,
+          operationId: id,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/content:write',
+          {
+            ...payload,
+            'bytes': base64Encode(utf8.encode('changed after prepare')),
+          },
+          apiObject,
+          editVersion: original,
+          operationId: id,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/mitm-modules:arguments',
+          payload,
+          apiObject,
+          editVersion: original,
+          operationId: id,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        server.requests.where(
+          (request) => request.path == '/api/v1/content:write',
+        ),
+        isEmpty,
+      );
+      final result = await repository.executeExternalCommand(
+        '/api/v1/content:write',
+        payload,
+        apiObject,
+        editVersion: original,
+        operationId: id,
+      );
+      expect(result, {'committed': true});
+      expect(
+        jsonDecode(
+          server.requests
+              .lastWhere((request) => request.path == '/api/v1/content:write')
+              .body!,
+        )['operationId'],
+        id,
+      );
+      final newModule =
+          (await repository.catalog(repository.modules).get()).single;
+      expect(
+        () => repository.registerPreparedOperation(
+          receipt,
+          repository.captureEditVersion(ApiIdentity.mitmModule, newModule),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract prepared argument job rejects changed arguments, expired TTL and prior-session proof',
+    () async {
+      server.catalogs['mitm-modules'] = [
+        {
+          'id': _largeScript,
+          'name': 'module',
+          'description': '',
+          'enabled': false,
+          'arguments': <String, String>{},
+          'resources': <String, String>{},
+          'scripts': 0,
+          'lastUpdateTime': '2026-01-02T03:04:05Z',
+        },
+      ];
+      final module =
+          (await repository.catalog(repository.modules).get()).single;
+      final token = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        module,
+      );
+      final receipt = await repository.queryExternal(
+        '/api/v1/mitm-modules:prepare-arguments',
+        {
+          'expectedRevision': token.revision,
+          'id': _largeScript,
+          'arguments': {'x': 'a'},
+        },
+      );
+      final operationId = repository.registerPreparedOperation(receipt, token);
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/mitm-modules:arguments',
+          {
+            'id': _largeScript,
+            'arguments': {'x': 'b'},
+            'preparedJobId': operationId,
+            'requestDigest': (receipt.data as Map)['requestDigest'],
+          },
+          apiObject,
+          editVersion: token,
+          operationId: operationId,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      server.preparationExpiry = DateTime.now()
+          .toUtc()
+          .subtract(const Duration(seconds: 1))
+          .toIso8601String();
+      final expired = await repository.queryExternal(
+        '/api/v1/mitm-modules:prepare-arguments',
+        {
+          'expectedRevision': token.revision,
+          'id': _largeScript,
+          'arguments': {'x': 'a'},
+        },
+      );
+      expect(
+        () => repository.registerPreparedOperation(expired, token),
+        throwsA(isA<WebApiException>()),
+      );
+      repository.endSession();
+      repository.beginSession();
+      await repository.initialize();
+      expect(
+        () => repository.registerPreparedOperation(receipt, token),
+        throwsA(isA<WebApiSessionException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract custom import prepared proof binds the actual profile read, URL hash and immutable job',
+    () async {
+      final profile = await repository.profiles().getSingle();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      const url = 'https://example.test/custom-entry.json';
+      final receipt = await repository
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': version.revision,
+            'profileId': _largeProfile,
+            'url': url,
+            'authorizationId': 'main-source-ticket',
+          });
+      final proof = repository.client.requestProof(receipt)!;
+      expect(proof.fieldDigests['url'], apiPayloadDigest(url));
+      expect(jsonEncode(proof.fieldDigests), isNot(contains(url)));
+      final operationId = repository.registerPreparedOperation(
+        receipt,
+        version,
+      );
+      final prepared = apiObject(receipt.data);
+      final payload = {
+        'id': _largeProfile,
+        'preparedJobId': operationId,
+        'requestDigest': prepared['requestDigest'],
+      };
+      final result = await repository.executeExternalCommand(
+        '/api/v1/profiles:import-custom',
+        payload,
+        apiObject,
+        editVersion: version,
+        operationId: operationId,
+      );
+      expect(result, {'committed': true});
+      final finalRequest = server.requests.singleWhere(
+        (request) => request.path == '/api/v1/profiles:import-custom',
+      );
+      expect(jsonDecode(finalRequest.body!), {
+        ...payload,
+        'expectedRevision': version.revision,
+        'operationId': operationId,
+      });
+      expect(finalRequest.body, isNot(contains(url)));
+      expect(repository.pendingOperation, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract custom import refuses non-row, wrong-profile, foreign and unowned prepared proof',
+    () async {
+      server.profiles.add(_profile('9007199254741300', label: 'Other profile'));
+      final profiles = await repository.profiles().get();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profiles.first,
+      );
+      final other = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profiles.last,
+      );
+      final receipt = await repository
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': version.revision,
+            'profileId': _largeProfile,
+            'url': 'https://example.test/custom.json',
+          });
+      for (final invalid in [
+        repository.captureCreateVersion(ApiIdentity.profile),
+        repository.captureReadVersion(receipt, kind: ApiIdentity.profile),
+        other,
+      ]) {
+        expect(
+          () => repository.registerPreparedOperation(receipt, invalid),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      expect(
+        () => repository.registerPreparedOperation(
+          ApiReceipt(revision: receipt.revision, data: receipt.data),
+          version,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      final foreign = WebApiRepository(
+        transport: server,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(foreign.close);
+      final foreignProfile = (await foreign.profiles().get()).first;
+      final foreignVersion = foreign.captureEditVersion(
+        ApiIdentity.profile,
+        foreignProfile,
+      );
+      final foreignReceipt = await foreign
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': foreignVersion.revision,
+            'profileId': _largeProfile,
+            'url': 'https://example.test/custom.json',
+          });
+      expect(
+        () => repository.registerPreparedOperation(foreignReceipt, version),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => repository.registerPreparedOperation(receipt, foreignVersion),
+        throwsA(isA<WebApiException>()),
+      );
+      repository.endSession();
+      repository.beginSession();
+      await repository.initialize();
+      expect(
+        () => repository.registerPreparedOperation(receipt, version),
+        throwsA(isA<WebApiSessionException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract custom import preparation whitelist, URL proof, digest and UTC five-minute expiry fail closed',
+    () async {
+      final profile = await repository.profiles().getSingle();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      final payload = <String, Object?>{
+        'expectedRevision': version.revision,
+        'profileId': _largeProfile,
+        'url': 'https://example.test/custom.json',
+      };
+      final valid = await repository.queryExternal(
+        '/api/v1/profiles:prepare-custom-import',
+        payload,
+      );
+      final data = apiObject(valid.data);
+      for (final invalid in <Map<String, Object?>>[
+        {'preparedJobId': 'different-job'},
+        {'requestDigest': 'not-a-sha256'},
+        {'contentSha256': 'c' * 63},
+        {'profileId': '9007199254741300'},
+        {
+          'expiresAt': DateTime.now()
+              .toUtc()
+              .add(const Duration(minutes: 6))
+              .toIso8601String(),
+        },
+        {
+          'expiresAt': DateTime.now()
+              .toUtc()
+              .subtract(const Duration(seconds: 1))
+              .toIso8601String(),
+        },
+        {'expiresAt': '2026-02-31T03:04:05Z'},
+        {'expiresAt': '2026-01-02T03:04:05+00:00'},
+      ]) {
+        server.nextQuery = server._ok({...data, ...invalid});
+        final receipt = await repository.queryExternal(
+          '/api/v1/profiles:prepare-custom-import',
+          payload,
+        );
+        expect(
+          () => repository.registerPreparedOperation(receipt, version),
+          throwsA(isA<WebApiException>()),
+          reason: invalid.keys.single,
+        );
+      }
+      for (final invalid in <Map<String, Object?>>[
+        {...payload}..remove('url'),
+        {...payload, 'profileId': '9007199254741300'},
+        {...payload, 'expectedRevision': '16'},
+        {...payload, 'custom': <String, Object?>{}},
+        {
+          ...payload,
+          'headers': {'X-Private': 'synthetic'},
+        },
+      ]) {
+        server.nextQuery = server._ok(data);
+        final receipt = await repository.queryExternal(
+          '/api/v1/profiles:prepare-custom-import',
+          invalid,
+        );
+        expect(
+          () => repository.registerPreparedOperation(receipt, version),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      server.nextQuery = server._ok(data);
+      final unlisted = await repository.queryExternal(
+        '/api/v1/profiles:prepare-unlisted-import',
+        payload,
+      );
+      expect(
+        () => repository.registerPreparedOperation(unlisted, version),
+        throwsA(isA<WebApiException>()),
+      );
+      server.nextGet = server._ok(data);
+      final read = await repository.readExternal(
+        '/api/v1/profiles:prepare-custom-import',
+      );
+      expect(
+        () => repository.registerPreparedOperation(read, version),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract custom import final command rejects profile, job, URL, DTO, body and header replacement before dispatch',
+    () async {
+      final profile = await repository.profiles().getSingle();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      final receipt = await repository
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': version.revision,
+            'profileId': _largeProfile,
+            'url': 'https://example.test/custom.json',
+          });
+      final operationId = repository.registerPreparedOperation(
+        receipt,
+        version,
+      );
+      final payload = <String, Object?>{
+        'id': _largeProfile,
+        'preparedJobId': operationId,
+        'requestDigest': apiObject(receipt.data)['requestDigest'],
+      };
+      for (final invalid in <Map<String, Object?>>[
+        {...payload, 'id': '9007199254741300'},
+        {...payload, 'preparedJobId': 'different-job'},
+        {...payload, 'requestDigest': 'f' * 64},
+        {...payload, 'expectedRevision': '16'},
+        {...payload, 'operationId': 'different-operation'},
+        {...payload, 'profileId': _largeProfile},
+        {...payload, 'custom': <String, Object?>{}},
+        {...payload, 'url': 'https://example.test/replaced.json'},
+        {...payload, 'body': 'replacement'},
+        {...payload, 'bytes': ''},
+        {...payload, 'header': <String, Object?>{}},
+        {
+          ...payload,
+          'headers': {'X-Private': 'synthetic'},
+        },
+        {...payload, 'authorizationId': 'generic-ticket'},
+      ]) {
+        await expectLater(
+          repository.executeExternalCommand(
+            '/api/v1/profiles:import-custom',
+            invalid,
+            apiObject,
+            editVersion: version,
+            operationId: operationId,
+          ),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/profiles:import-custom',
+          payload,
+          apiObject,
+          editVersion: version,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/profiles:import-custom',
+          payload,
+          apiObject,
+          editVersion: version,
+          operationId: 'unregistered-job',
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/content:write',
+          payload,
+          apiObject,
+          editVersion: version,
+          operationId: operationId,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        server.requests.where(
+          (request) => request.path == '/api/v1/profiles:import-custom',
+        ),
+        isEmpty,
+      );
+      expect(repository.pendingOperation, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract edit version allows original create source intent but rejects foreign issuer and cache scope',
+    () async {
+      await repository.initialize();
+      final create = repository.captureCreateVersion(ApiIdentity.profile);
+      expect(() => repository.requireEditVersion(create), returnsNormally);
+      expect(
+        () => repository.requireReadVersion(create),
+        throwsA(isA<WebApiException>()),
+      );
+      await repository.queryExternal('/api/v1/sources:prepare', {
+        'expectedRevision': create.revision,
+        'purpose': 'profile-import',
+      });
+      final authorization = await repository.executeExternalCommand(
+        '/api/v1/sources:authorize',
+        {
+          'preparationId': 'public-source-preparation',
+          'intent': 'authorize-server-private-source',
+          'urlDigest': 'synthetic',
+        },
+        apiObject,
+        editVersion: create,
+      );
+      expect(
+        authorization['importOperationId'],
+        'server-profile-import-operation',
+      );
+      final foreign = WebApiRepository(
+        transport: server,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(foreign.close);
+      await foreign.initialize();
+      expect(
+        () => foreign.requireEditVersion(create),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'edit_issuer_mismatch',
+          ),
+        ),
+      );
+      final cached = repository.captureReadVersion(
+        await repository.readExternalCache('/api/v1/icon-cache?query='),
+      );
+      expect(
+        () => repository.requireEditVersion(cached),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => repository.requireReadVersion(cached),
+        throwsA(isA<WebApiException>()),
+      );
+      final read = repository.captureReadVersion(
+        await repository.readExternal('/api/v1/profiles'),
+      );
+      expect(() => repository.requireReadVersion(read), returnsNormally);
+      final configRevision = repository.revision;
+      expect(
+        await repository.executeExternalCacheCommand(
+          '/api/v1/previews:register',
+          {'content': 'cache only'},
+          apiObject,
+        ),
+        {'previewId': 'opaque-preview'},
+      );
+      expect(repository.revision, configRevision);
+      repository.endSession();
+      repository.beginSession();
+      await repository.initialize();
+      expect(
+        () => repository.requireEditVersion(create),
+        throwsA(isA<WebApiSessionException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract same-session store replacement invalidates original edit provenance',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.profile);
+      server.storeId = 'different-authoritative-store';
+      await expectLater(
+        repository.onReconnect(),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'store_changed',
+          ),
+        ),
+      );
+      expect(
+        () => repository.requireEditVersion(version),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract canonical mutation carrier tags the final import DTOs after draft binding at the receipt revision',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      final drafts = _wrappedMutationDrafts();
+      final decoded = <_WrappedContentMutation>[];
+      final result = await repository.executeExternalCommand(
+        '/api/v1/profiles:import',
+        {'content': 'isolated canonical fixture'},
+        (value) {
+          for (final draft in drafts) {
+            expect(
+              repository.identities.isBound(draft.kind, draft.handle),
+              isTrue,
+            );
+          }
+          final model = _decodeWrappedMutation(repository, value);
+          decoded.add(model);
+          return model;
+        },
+        editVersion: repository.captureCreateVersion(ApiIdentity.profile),
+        drafts: drafts,
+      );
+      expect(decoded, hasLength(2));
+      expect(identical(decoded.first, result), isFalse);
+      expect(identical(decoded.last, result), isTrue);
+      expect(result.profile.id, drafts[0].handle);
+      expect(result.script.id, drafts[1].handle);
+      expect(result.ruleProvider.id, drafts[2].handle);
+      expect(result.mitmModule.id, drafts[3].handle);
+      expect(result.profile.scriptId, result.script.id);
+      final postRevision = server.revision;
+      for (final model in decoded) {
+        for (final projection in model.canonicalProjections) {
+          final version = repository.captureEditVersion(
+            projection.kind,
+            projection.model,
+          );
+          expect(version.revision, postRevision);
+          expect(version.storeId, server.storeId);
+        }
+      }
+      expect(
+        () => repository.captureEditVersion(
+          ApiIdentity.profile,
+          result.profile.copyWith(label: 'changed outside the receipt'),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => repository.captureEditVersion(
+          ApiIdentity.script,
+          result.script.copyWith(),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      final profileVersion = repository.captureEditVersion(
+        ApiIdentity.profile,
+        result.profile,
+      );
+      final scriptVersion = repository.captureEditVersion(
+        ApiIdentity.script,
+        result.script,
+      );
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      expect(profileVersion.revision, postRevision);
+      expect(scriptVersion.revision, postRevision);
+      expect(
+        repository
+            .captureEditVersion(ApiIdentity.profile, result.profile)
+            .revision,
+        postRevision,
+      );
+      await expectLater(
+        repository.saveProfile(
+          result.profile.copyWith(label: 'stale profile edit'),
+          editVersion: profileVersion,
+        ),
+        throwsA(
+          isA<WebApiException>().having((error) => error.status, 'status', 409),
+        ),
+      );
+      await expectLater(
+        repository.saveCatalog(
+          repository.scripts,
+          result.script.copyWith(label: 'stale script edit'),
+          editVersion: scriptVersion,
+        ),
+        throwsA(
+          isA<WebApiException>().having((error) => error.status, 'status', 409),
+        ),
+      );
+      for (final path in [
+        '/api/v1/profiles:update',
+        '/api/v1/scripts:update',
+      ]) {
+        final request = server.requests.singleWhere(
+          (request) => request.path == path,
+        );
+        expect(jsonDecode(request.body!)['expectedRevision'], postRevision);
+      }
+      expect(
+        server.requests
+            .where((request) => request.method == 'GET')
+            .map((request) => request.path),
+        ['/api/v1/meta'],
+      );
+    },
+  );
+
+  test(
+    'api-client-contract canonical carrier supports immutable explicit root and indexed receipt paths',
+    () async {
+      await repository.initialize();
+      final script = _wrappedMutationData()['script'];
+      server.wrappedMutation = script;
+      final root = await repository.executeExternalCommand(
+        '/api/v1/scripts:import',
+        {},
+        (value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.script,
+            repository.codec.script(value),
+          ),
+        ]),
+        editVersion: repository.captureCreateVersion(ApiIdentity.script),
+      );
+      expect(
+        repository
+            .captureEditVersion(
+              ApiIdentity.script,
+              root.canonicalProjections.single.model,
+            )
+            .revision,
+        server.revision,
+      );
+      server.wrappedMutation = {
+        'items': [script],
+      };
+      final indexed = await repository.executeExternalCommand(
+        '/api/v1/profiles:import',
+        {},
+        (value) {
+          final path = <Object>['items', 0];
+          final model = repository.codec.script(
+            apiList(apiObject(value)['items']).single,
+          );
+          final projection = ApiCanonicalProjection(
+            ApiIdentity.script,
+            model,
+            path: path,
+          );
+          path[0] = 'mutated after construction';
+          return _ProjectionCarrier([projection]);
+        },
+        editVersion: repository.captureCreateVersion(ApiIdentity.script),
+      );
+      final projection = indexed.canonicalProjections.single;
+      expect(projection.path, ['items', 0]);
+      expect(() => projection.path.clear(), throwsUnsupportedError);
+      expect(
+        repository
+            .captureEditVersion(ApiIdentity.script, projection.model)
+            .revision,
+        server.revision,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract canonical recovery tags its own decoded nested instance only after the owned receipt binds drafts',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      server.dropAfterCommit = true;
+      final drafts = _wrappedMutationDrafts();
+      _WrappedContentMutation? recovered;
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/profiles:import',
+          {},
+          (value) {
+            for (final draft in drafts) {
+              expect(
+                repository.identities.isBound(draft.kind, draft.handle),
+                isTrue,
+              );
+            }
+            return recovered = _decodeWrappedMutation(repository, value);
+          },
+          editVersion: repository.captureCreateVersion(ApiIdentity.profile),
+          drafts: drafts,
+        ),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      expect(recovered, isNull);
+      final operationId = repository.pendingOperation!.operationId;
+      final receipt = await repository.recoverOperation(operationId);
+      expect(repository.pendingOperation, isNull);
+      expect(recovered!.profile.id, drafts.first.handle);
+      for (final projection in recovered!.canonicalProjections) {
+        expect(
+          repository
+              .captureEditVersion(projection.kind, projection.model)
+              .revision,
+          receipt.revision,
+        );
+      }
+      expect(
+        server.requests.where(
+          (request) =>
+              request.method == 'POST' &&
+              request.path == '/api/v1/profiles:import',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  for (final specimen
+      in <String, _ProjectionCarrier Function(WebApiRepository, Object?)>{
+        'wrong kind': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.script,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const ['profile'],
+          ),
+        ]),
+        'unsupported kind': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.configuration,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const ['profile'],
+          ),
+        ]),
+        'unbound local identity': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(
+              repository,
+              value,
+            ).profile.copyWith(id: allocateWebDraftId()),
+            path: const ['profile'],
+          ),
+        ]),
+        'changed copy': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(
+              repository,
+              value,
+            ).profile.copyWith(label: 'not canonical'),
+            path: const ['profile'],
+          ),
+        ]),
+        'changed read-only metadata': (repository, value) =>
+            _ProjectionCarrier([
+              ApiCanonicalProjection(
+                ApiIdentity.mitmModule,
+                _decodeWrappedMutation(
+                  repository,
+                  value,
+                ).mitmModule.copyWith(scripts: 99),
+                path: const ['mitmModule'],
+              ),
+            ]),
+        'absent wire path': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const ['absent'],
+          ),
+        ]),
+        'wrong wire node': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const ['script'],
+          ),
+        ]),
+        'invalid path segment': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const [true],
+          ),
+        ]),
+        'out-of-range index': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const ['items', 1],
+          ),
+        ]),
+        'negative index': (repository, value) => _ProjectionCarrier([
+          ApiCanonicalProjection(
+            ApiIdentity.profile,
+            _decodeWrappedMutation(repository, value).profile,
+            path: const ['items', -1],
+          ),
+        ]),
+      }.entries) {
+    test(
+      'api-client-contract canonical carrier rejects ${specimen.key} without minting provenance',
+      () async {
+        await repository.initialize();
+        server.wrappedMutation = {
+          ..._wrappedMutationData(),
+          'items': [_profile(_largeProfile)],
+        };
+        _ProjectionCarrier? rejected;
+        await expectLater(
+          repository.executeExternalCommand(
+            '/api/v1/profiles:import',
+            {},
+            (value) => rejected = specimen.value(repository, value),
+            editVersion: repository.captureCreateVersion(ApiIdentity.profile),
+          ),
+          throwsA(isA<WebApiUnknownCommitException>()),
+        );
+        expect(repository.pendingOperation, isNotNull);
+        for (final projection in rejected!.canonicalProjections) {
+          expect(
+            () => repository.captureEditVersion(
+              projection.kind,
+              projection.model,
+            ),
+            throwsA(isA<WebApiException>()),
+          );
+        }
+      },
+    );
+  }
+
+  test(
+    'api-client-contract canonical carrier validates every projection before tagging any model',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      _WrappedContentMutation? first;
+      await expectLater(
+        repository.executeExternalCommand('/api/v1/profiles:import', {}, (
+          value,
+        ) {
+          final original = first = _decodeWrappedMutation(repository, value);
+          return _ProjectionCarrier([
+            ApiCanonicalProjection(
+              ApiIdentity.profile,
+              original.profile,
+              path: const ['profile'],
+            ),
+            ApiCanonicalProjection(
+              ApiIdentity.script,
+              original.script.copyWith(label: 'changed'),
+              path: const ['script'],
+            ),
+          ]);
+        }, editVersion: repository.captureCreateVersion(ApiIdentity.profile)),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      expect(
+        () =>
+            repository.captureEditVersion(ApiIdentity.profile, first!.profile),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract failed final canonical decode remains known committed and does not tag changed DTOs',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      var decodes = 0;
+      _WrappedContentMutation? finalModel;
+      await expectLater(
+        repository.executeExternalCommand('/api/v1/profiles:import', {}, (
+          value,
+        ) {
+          final original = _decodeWrappedMutation(repository, value);
+          if (++decodes == 1) return original;
+          return finalModel = _WrappedContentMutation(
+            profile: original.profile,
+            script: original.script.copyWith(label: 'changed in final decode'),
+            ruleProvider: original.ruleProvider,
+            mitmModule: original.mitmModule,
+          );
+        }, editVersion: repository.captureCreateVersion(ApiIdentity.profile)),
+        throwsA(isA<WebApiCommittedProjectionException>()),
+      );
+      expect(decodes, 2);
+      expect(repository.pendingOperation, isNull);
+      for (final projection in finalModel!.canonicalProjections) {
+        expect(
+          () =>
+              repository.captureEditVersion(projection.kind, projection.model),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      expect(
+        server.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract canonical carrier cannot transfer provenance or receipt authority to a foreign issuer',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      final result = await repository.executeExternalCommand(
+        '/api/v1/profiles:import',
+        {},
+        (value) => _decodeWrappedMutation(repository, value),
+        editVersion: repository.captureCreateVersion(ApiIdentity.profile),
+      );
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        result.profile,
+      );
+      final foreign = WebApiRepository(
+        transport: server,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(foreign.close);
+      await foreign.initialize();
+      expect(
+        () => foreign.captureEditVersion(ApiIdentity.profile, result.profile),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => foreign.requireEditVersion(version),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'edit_issuer_mismatch',
+          ),
+        ),
+      );
+      await expectLater(
+        foreign.executeExternalCommand(
+          '/api/v1/profiles:import',
+          {},
+          (value) => _decodeWrappedMutation(foreign, value),
+          editVersion: version,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'edit_issuer_mismatch',
+          ),
+        ),
+      );
+      final receipt = await foreign.client.command(
+        '/api/v1/profiles:import',
+        {},
+        expectedRevision: server.revision,
+      );
+      expect(
+        () => repository.captureReadVersion(receipt),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => repository.captureReadVersion(
+          ApiReceipt(
+            revision: receipt.revision,
+            data: receipt.data,
+            operationId: receipt.operationId,
+          ),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract canonical carrier rejects old epoch authority during the final decoder',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      final decoded = <_WrappedContentMutation>[];
+      await expectLater(
+        repository.executeExternalCommand('/api/v1/profiles:import', {}, (
+          value,
+        ) {
+          final model = _decodeWrappedMutation(repository, value);
+          decoded.add(model);
+          if (decoded.length == 2) {
+            repository.endSession();
+            repository.beginSession();
+          }
+          return model;
+        }, editVersion: repository.captureCreateVersion(ApiIdentity.profile)),
+        throwsA(isA<WebApiCommittedProjectionException>()),
+      );
+      expect(decoded, hasLength(2));
+      expect(repository.pendingOperation, isNull);
+      await repository.initialize();
+      expect(
+        () => repository.captureEditVersion(
+          ApiIdentity.profile,
+          decoded.first.profile,
+        ),
+        throwsA(isA<WebApiSessionException>()),
+      );
+      expect(
+        () => repository.captureEditVersion(
+          ApiIdentity.profile,
+          decoded.last.profile,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract cache mutation carrier cannot mint business DTO read tokens',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      _WrappedContentMutation? rejected;
+      await expectLater(
+        repository.executeExternalCacheCommand(
+          '/api/v1/previews:register',
+          {},
+          (value) => rejected = _decodeWrappedMutation(repository, value),
+        ),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      expect(repository.pendingOperation!.scope, ApiRevisionScope.cache);
+      for (final projection in rejected!.canonicalProjections) {
+        expect(
+          () =>
+              repository.captureEditVersion(projection.kind, projection.model),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+    },
+  );
+
+  test(
+    'api-client-contract final cache decoder cannot upgrade its receipt to business provenance',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      var decodes = 0;
+      _WrappedContentMutation? rejected;
+      await expectLater(
+        repository.executeExternalCacheCommand<Object>(
+          '/api/v1/previews:register',
+          {},
+          (value) {
+            if (++decodes == 1) return apiObject(value);
+            return rejected = _decodeWrappedMutation(repository, value);
+          },
+        ),
+        throwsA(isA<WebApiCommittedProjectionException>()),
+      );
+      expect(decodes, 2);
+      expect(repository.pendingOperation, isNull);
+      for (final projection in rejected!.canonicalProjections) {
+        expect(
+          () =>
+              repository.captureEditVersion(projection.kind, projection.model),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+    },
+  );
+
+  test(
+    'api-client-contract final canonical decoder rejects authority from a replaced client store',
+    () async {
+      await repository.initialize();
+      server.wrappedMutation = _wrappedMutationData();
+      var decodes = 0;
+      _WrappedContentMutation? rejected;
+      await expectLater(
+        repository.executeExternalCommand('/api/v1/profiles:import', {}, (
+          value,
+        ) {
+          final model = _decodeWrappedMutation(repository, value);
+          if (++decodes == 2) {
+            rejected = model;
+            repository.client.bindStore('different-client-store');
+          }
+          return model;
+        }, editVersion: repository.captureCreateVersion(ApiIdentity.profile)),
+        throwsA(isA<WebApiCommittedProjectionException>()),
+      );
+      expect(repository.pendingOperation, isNull);
+      for (final projection in rejected!.canonicalProjections) {
+        expect(
+          () =>
+              repository.captureEditVersion(projection.kind, projection.model),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+    },
+  );
+
+  test(
+    'api-client-contract cache receipts do not advance config revision or use client clock',
+    () async {
+      await repository.initialize();
+      final configRevision = repository.revision;
+      final record = await repository.putIcon('https://example.test/icon.svg');
+      expect(record.lastAccessed, 1700000000000);
+      final quality = IpQuality(
+        ip: '192.0.2.1',
+        source: IpQualitySource.values.first,
+        type: IpType.values.first,
+      );
+      final saved = await repository.putIpQuality(quality);
+      expect(saved.checkedAt.year, 2026);
+      expect(repository.revision, configRevision);
+      final body = jsonDecode(
+        server.requests
+            .singleWhere((r) => r.path == '/api/v1/ip-quality-cache:put')
+            .body!,
+      );
+      expect(
+        body.keys,
+        unorderedEquals(['expectedRevision', 'operationId', 'quality']),
+      );
+      expect(
+        (await repository.freshIpQuality(
+          '192.0.2.1',
+          const Duration(days: 1),
+        ))!.quality,
+        quality,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract unfoldSet is browser projection and pure queries never journal',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      final before = server.requests.length;
+      await repository.setProfileUnfoldSet(profile.id, {'group'});
+      expect(
+        server.requests.skip(before).where((r) => r.method == 'POST'),
+        isEmpty,
+      );
+      expect((await repository.profiles().get()).single.unfoldSet, {'group'});
+      final query = await repository.client.query(
+        '/api/v1/runtime:query-test',
+        {'typed': true},
+      );
+      expect(query.data, {'answer': 42});
+      expect(repository.pendingOperation, isNull);
+    },
+  );
+  test(
+    'api-client-contract client preserves wire int64 and actual read receipt provenance',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http, journal: MemoryApiOperationJournal());
+      addTearDown(client.close);
+      final receipt = await client.read('/api/v1/profiles');
+      expect(receipt.data, {'id': '9007199254740993'});
+      expect(client.ownsReceipt(receipt), isTrue);
+      expect(
+        client.ownsReceipt(const ApiReceipt(revision: '17', data: {})),
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract client never upgrades an explicit stale edit revision',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http, journal: MemoryApiOperationJournal());
+      addTearDown(client.close);
+      await client.read('/api/v1/profiles');
+      client.observeRevision('18');
+      http.handler = (request) async {
+        expect(jsonDecode(request.body!)['expectedRevision'], '17');
+        return ApiResponse(
+          409,
+          jsonEncode({
+            'revision': '18',
+            'error': {'code': 'revision_conflict', 'message': 'conflict'},
+          }),
+        );
+      };
+      await expectLater(
+        client.command('/api/v1/profiles:update', {
+          'id': '9007199254740993',
+          'profile': {'label': 'draft'},
+        }, expectedRevision: '17'),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(client.pendingOperation, isNull);
+      expect(http.requests.where((r) => r.method == 'POST'), hasLength(1));
+    },
+  );
+
+  test(
+    'api-client-contract unknown command keeps secret-free journal and exact operation until receipt recovery',
+    () async {
+      final http = _HttpMock();
+      final journal = MemoryApiOperationJournal();
+      final client = _mockClient(http, journal: journal);
+      addTearDown(client.close);
+      await client.read('/api/v1/profiles');
+      http.handler = (_) async => throw StateError('mock response lost');
+      await expectLater(
+        client.command('/api/v1/profiles:create', {
+          'profile': {'ageSecretKey': 'synthetic-secret'},
+        }),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final operation = client.pendingOperation!;
+      expect(journal.read()!.body, isNull);
+      expect(
+        jsonEncode(journal.read()!.toJournal()),
+        isNot(contains('synthetic-secret')),
+      );
+      http.handler = (request) async {
+        expect(request.path, '/api/v1/operations/${operation.operationId}');
+        return http.ok(
+          {'id': '9223372036854775807'},
+          revision: '18',
+          id: operation.operationId,
+        );
+      };
+      final receipt = await client.recoverOperation(operation.operationId);
+      client.completeOperation(receipt);
+      expect(client.pendingOperation, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract raw attachment owns provenance and validates truncation and auth expiry',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http, journal: MemoryApiOperationJournal());
+      addTearDown(client.close);
+      http.attachment = ApiBinaryResponse(
+        200,
+        Uint8List.fromList([0, 255, 128]),
+        headers: {
+          'x-flclash-revision': '17',
+          'content-length': '3',
+          'content-type': 'application/octet-stream',
+        },
+      );
+      final file = await client.readAttachment(
+        '/api/v1/content/profile/9007199254740993/download',
+      );
+      expect(file.bytes, [0, 255, 128]);
+      expect(client.ownsReceipt(file.readReceipt), isTrue);
+      http.attachment = ApiBinaryResponse(
+        200,
+        Uint8List(2),
+        headers: {'x-flclash-revision': '17', 'content-length': '3'},
+      );
+      await expectLater(
+        client.readAttachment(
+          '/api/v1/content/profile/9007199254740993/download',
+        ),
+        throwsA(isA<WebApiProtocolException>()),
+      );
+      http.attachment = ApiBinaryResponse(
+        401,
+        Uint8List.fromList(
+          utf8.encode(
+            jsonEncode({
+              'error': {'code': 'unauthenticated', 'message': 'login'},
+            }),
+          ),
+        ),
+      );
+      await expectLater(
+        client.readAttachment(
+          '/api/v1/content/profile/9007199254740993/download',
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'unauthenticated',
+          ),
+        ),
+      );
+      expect(client.isActive, isFalse);
+    },
+  );
+
+  test(
+    'api-client-contract browser fetch uses same-origin options and bounded raw byte stream',
+    () async {
+      final original = _global.getProperty<JSAny?>('fetch'.toJS);
+      addTearDown(() => _global.setProperty('fetch'.toJS, original));
+      var reads = 0;
+      final reader =
+          <String, Object?>{
+                'read': (() {
+                  reads++;
+                  return Future<JSObject>.value(
+                    (reads == 1
+                                ? <String, Object?>{
+                                    'done': false,
+                                    'value': Uint8List.fromList([
+                                      0,
+                                      255,
+                                      128,
+                                    ]).toJS,
+                                  }
+                                : <String, Object?>{'done': true})
+                            .jsify()
+                        as JSObject,
+                  ).toJS;
+                }).toJS,
+                'cancel': (() => Future<JSAny?>.value(null).toJS).toJS,
+                'releaseLock': (() {}).toJS,
+              }.jsify()
+              as JSObject;
+      final response =
+          <String, Object?>{
+                'status': 200,
+                'headers': <String, Object?>{
+                  'get': ((JSString key) => switch (key.toDart) {
+                    'x-flclash-revision' => '17'.toJS,
+                    'content-length' => '3'.toJS,
+                    'content-type' => 'application/octet-stream'.toJS,
+                    _ => null,
+                  }).toJS,
+                }.jsify(),
+                'body': <String, Object?>{
+                  'getReader': (() => reader).toJS,
+                }.jsify(),
+              }.jsify()
+              as JSObject;
+      _global.setProperty(
+        'fetch'.toJS,
+        ((JSString path, JSObject options) {
+          expect(
+            path.toDart,
+            '/api/v1/content/profile/9007199254740993/download',
+          );
+          expect(
+            options.getProperty<JSString>('credentials'.toJS).toDart,
+            'same-origin',
+          );
+          return Future<JSObject>.value(response).toJS;
+        }).toJS,
+      );
+      final transport = BrowserApiTransport();
+      addTearDown(transport.close);
+      final responseBytes = await transport.readAttachment(
+        const ApiRequest(
+          method: 'GET',
+          path: '/api/v1/content/profile/9007199254740993/download',
+        ),
+        maxBytes: 32 * 1024 * 1024,
+      );
+      expect(responseBytes.bytes, [0, 255, 128]);
+      expect(reads, 2);
+    },
+  );
+  test(
+    'api-client-contract read scheduler shares three active slots across six GET query attachment reads in FIFO order',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      final started = List.generate(6, (_) => Completer<void>());
+      final gates = List.generate(6, (_) => Completer<void>());
+      final order = <int>[];
+      var active = 0;
+      var maximum = 0;
+      Future<void> enter(ApiRequest request) async {
+        final id = int.parse(request.path.split('/').last);
+        order.add(id);
+        active++;
+        if (active > maximum) maximum = active;
+        started[id].complete();
+        await gates[id].future;
+        active--;
+      }
+
+      http.handler = (request) async {
+        await enter(request);
+        return http.ok({'answer': request.path});
+      };
+      http.attachmentHandler = (request) async {
+        await enter(request);
+        return ApiBinaryResponse(
+          200,
+          Uint8List(0),
+          headers: {'x-flclash-revision': '17'},
+        );
+      };
+      final reads = <Future<Object?>>[
+        client.read('/api/v1/refresh/0'),
+        client.query('/api/v1/refresh/1', {'expectedRevision': '17'}),
+        client.readAttachment('/api/v1/refresh/2'),
+        client.read('/api/v1/refresh/3'),
+        client.query('/api/v1/refresh/4', {'expectedRevision': '17'}),
+        client.readAttachment('/api/v1/refresh/5'),
+      ];
+      await Future.wait(started.take(3).map((gate) => gate.future));
+      expect(order, [0, 1, 2]);
+      gates[0].complete();
+      await started[3].future;
+      gates[1].complete();
+      await started[4].future;
+      gates[2].complete();
+      await started[5].future;
+      expect(order, [0, 1, 2, 3, 4, 5]);
+      for (final gate in gates.skip(3)) {
+        gate.complete();
+      }
+      await Future.wait(reads);
+      expect(maximum, 3);
+    },
+  );
+
+  test(
+    'api-client-contract read scheduler caps FIFO at 64 and cancels all queued epoch work without sending it',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      final gates = <Completer<ApiResponse>>[];
+      var cancelled = 0;
+      http.handler = (request) {
+        final gate = Completer<ApiResponse>();
+        gates.add(gate);
+        request.cancellation!.addListener(() {
+          cancelled++;
+        });
+        return gate.future;
+      };
+      final reads = [
+        for (var index = 0; index < 67; index++)
+          client
+              .read('/api/v1/queued/$index')
+              .then<Object?>(
+                (value) => value,
+                onError: (Object error) => error,
+              ),
+      ];
+      await expectLater(
+        client.read('/api/v1/queued/overflow'),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.code,
+            'code',
+            'client_read_queue_full',
+          ),
+        ),
+      );
+      expect(http.requests, hasLength(3));
+      client.endSession();
+      final results = await Future.wait(reads);
+      expect(
+        results.every((result) => result is WebApiSessionException),
+        isTrue,
+      );
+      expect(cancelled, 3);
+      expect(http.requests, hasLength(3));
+      client.beginSession();
+      client.bindStore('component-store');
+      for (final gate in gates) {
+        gate.complete(http.ok({'late': true}, revision: '999'));
+      }
+      await Future<void>.value();
+      expect(client.revision, isNull);
+      expect(http.requests, hasLength(3));
+    },
+  );
+
+  test(
+    'api-client-contract control meta and pending-owned recovery bypass saturated read slots',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      http.handler = (request) async {
+        throw StateError('lost command response');
+      };
+      await expectLater(
+        client.command('/api/v1/rules:create', {}, expectedRevision: '17'),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      expect(http.requests.single.cancellation, isNull);
+      final pending = client.pendingOperation!;
+      final gates = <Completer<ApiResponse>>[];
+      http.handler = (request) {
+        if (request.path == '/api/v1/meta') {
+          return Future.value(http.ok({'storeId': 'component-store'}));
+        }
+        if (request.path == '/api/v1/operations/${pending.operationId}') {
+          return Future.value(
+            http.ok({'committed': true}, id: pending.operationId),
+          );
+        }
+        final gate = Completer<ApiResponse>();
+        gates.add(gate);
+        return gate.future;
+      };
+      final reads = [
+        for (var index = 0; index < 3; index++)
+          client.read('/api/v1/gated/$index'),
+      ];
+      expect(gates, hasLength(3));
+      expect((await client.read('/api/v1/meta')).revision, '17');
+      final recovered = await client.recoverOperation(pending.operationId);
+      client.completeOperation(recovered);
+      expect(client.pendingOperation, isNull);
+      expect(gates.every((gate) => !gate.isCompleted), isTrue);
+      for (final gate in gates) {
+        gate.complete(http.ok([]));
+      }
+      await Future.wait(reads);
+    },
+  );
+
+  test(
+    'api-client-contract read retry requeues exact api_busy not_accepted behind existing FIFO requests',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      final first = Completer<ApiResponse>();
+      final started = List.generate(6, (_) => Completer<void>());
+      final gates = List.generate(6, (_) => Completer<ApiResponse>());
+      final order = <int>[];
+      var attempts = 0;
+      http.handler = (request) {
+        final id = int.parse(request.path.split('/').last);
+        order.add(id);
+        if (!started[id].isCompleted) started[id].complete();
+        if (id == 0) {
+          if (++attempts == 1) return first.future;
+          return Future.value(http.ok({'retried': true}));
+        }
+        return gates[id].future;
+      };
+      final reads = [
+        for (var id = 0; id < 6; id++) client.read('/api/v1/fair/$id'),
+      ];
+      first.complete(_busyResponse());
+      await started[3].future;
+      gates[1].complete(http.ok([]));
+      await started[4].future;
+      gates[2].complete(http.ok([]));
+      await started[5].future;
+      gates[3].complete(http.ok([]));
+      await reads.first;
+      expect(order, [0, 1, 2, 3, 4, 5, 0]);
+      gates[4].complete(http.ok([]));
+      gates[5].complete(http.ok([]));
+      await Future.wait(reads);
+    },
+  );
+
+  test(
+    'api-client-contract query retries at most three original byte attempts without busy revision or new proof authority',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      client.observeRevision('17');
+      var attempts = 0;
+      http.handler = (request) async =>
+          ++attempts < 3 ? _busyResponse() : http.ok({'prepared': true});
+      final payload = <String, Object?>{
+        'expectedRevision': '17',
+        'url': 'https://example.test/original',
+      };
+      final query = client.query('/api/v1/query:test', payload);
+      payload['expectedRevision'] = '999';
+      payload['url'] = 'https://example.test/changed';
+      final receipt = await query;
+      expect(attempts, 3);
+      expect(
+        http.requests.map((request) => request.body).toSet(),
+        hasLength(1),
+      );
+      expect(jsonDecode(http.requests.first.body!), {
+        'expectedRevision': '17',
+        'url': 'https://example.test/original',
+      });
+      expect(client.revision, '17');
+      expect(client.requestProof(receipt)!.expectedRevision, '17');
+      expect(
+        client.requestProof(receipt)!.fieldDigests['url'],
+        apiPayloadDigest('https://example.test/original'),
+      );
+      attempts = 0;
+      http.requests.clear();
+      http.handler = (_) async {
+        attempts++;
+        return _busyResponse();
+      };
+      await expectLater(
+        client.read('/api/v1/busy'),
+        throwsA(
+          isA<WebApiException>().having(
+            (error) => error.revision,
+            'revision',
+            isNull,
+          ),
+        ),
+      );
+      expect(attempts, 3);
+      expect(client.revision, '17');
+    },
+  );
+
+  test(
+    'api-client-contract attachment GET shares exact not_accepted bounded retry without accepting busy bytes',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      var attempts = 0;
+      http.attachmentHandler = (request) async {
+        if (++attempts < 3) {
+          return ApiBinaryResponse(
+            429,
+            Uint8List.fromList(utf8.encode(_busyResponse().body)),
+          );
+        }
+        return ApiBinaryResponse(
+          200,
+          Uint8List(0),
+          headers: {'x-flclash-revision': '17'},
+        );
+      };
+      final attachment = await client.readAttachment(
+        '/api/v1/content/profile/1/download',
+      );
+      expect(attempts, 3);
+      expect(attachment.revision, '17');
+      expect(client.ownsReceipt(attachment.readReceipt), isTrue);
+      expect(http.requests.map((request) => request.path).toSet(), {
+        '/api/v1/content/profile/1/download',
+      });
+    },
+  );
+
+  for (final specimen in <String, ApiResponse>{
+    'ordinary 429': _busyResponse(code: 'rate_limited'),
+    'accepted state': _busyResponse(state: 'accepted'),
+    'unknown state': _busyResponse(state: null),
+    '503 busy': _busyResponse(status: 503),
+    '401': _busyResponse(status: 401, code: 'unauthenticated'),
+    '403': _busyResponse(status: 403, code: 'source_session_expired'),
+    '409': _busyResponse(status: 409, code: 'revision_conflict'),
+    'malformed 429': const ApiResponse(429, 'not-json'),
+  }.entries) {
+    test(
+      'api-client-contract read scheduler does not retry ${specimen.key}',
+      () async {
+        final http = _HttpMock();
+        final client = _mockClient(http);
+        addTearDown(client.close);
+        http.handler = (_) async => specimen.value;
+        await expectLater(
+          client.query('/api/v1/query:negative', {'expectedRevision': '17'}),
+          throwsA(isA<WebApiException>()),
+        );
+        expect(http.requests, hasLength(1));
+      },
+    );
+  }
+
+  test(
+    'api-client-contract network error and mutation api_busy are never automatically retried or cancelled',
+    () async {
+      final http = _HttpMock();
+      final client = _mockClient(http);
+      addTearDown(client.close);
+      http.handler = (_) async {
+        throw StateError('network disconnected');
+      };
+      await expectLater(client.read('/api/v1/network'), throwsStateError);
+      expect(http.requests, hasLength(1));
+      http.requests.clear();
+      http.handler = (_) async => _busyResponse();
+      client.observeRevision('17');
+      await expectLater(
+        client.command(
+          '/api/v1/rules:create',
+          {},
+          expectedRevision: '17',
+          operationId: 'not-accepted-mutation',
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(http.requests, hasLength(1));
+      expect(http.requests.single.cancellation, isNull);
+      expect(client.pendingOperation, isNull);
+      expect(client.revision, '17');
+    },
+  );
+
+  test(
+    'api-client-contract read total timeout cancels its active RAM token without a new attempt',
+    () async {
+      final http = _HttpMock();
+      final client = WebApiClient(
+        transport: http,
+        journal: MemoryApiOperationJournal(),
+        timeout: const Duration(milliseconds: 30),
+      );
+      client.bindStore('component-store');
+      addTearDown(client.close);
+      final response = Completer<ApiResponse>();
+      var cancelled = 0;
+      http.handler = (request) {
+        request.cancellation!.addListener(() {
+          cancelled++;
+        });
+        return response.future;
+      };
+      await expectLater(
+        client.query('/api/v1/query:timeout', {}),
+        throwsA(isA<TimeoutException>()),
+      );
+      expect(cancelled, 1);
+      expect(http.requests, hasLength(1));
+      response.complete(http.ok({'late': true}, revision: '999'));
+      await Future<void>.value();
+      expect(client.revision, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract browser read epoch cancellation aborts its native signal without cancelling mutation transport',
+    () async {
+      final original = _global.getProperty<JSAny?>('fetch'.toJS);
+      addTearDown(() => _global.setProperty('fetch'.toJS, original));
+      final response = Completer<JSObject>();
+      JSObject? signal;
+      _global.setProperty(
+        'fetch'.toJS,
+        ((JSString path, JSObject options) {
+          signal = options.getProperty<JSObject>('signal'.toJS);
+          return response.future.toJS;
+        }).toJS,
+      );
+      final client = WebApiClient(
+        transport: BrowserApiTransport(),
+        journal: MemoryApiOperationJournal(),
+      );
+      client.bindStore('component-store');
+      addTearDown(client.close);
+      final read = client.read('/api/v1/abort-test');
+      expect(signal, isNotNull);
+      expect(signal!.getProperty<JSBoolean>('aborted'.toJS).toDart, isFalse);
+      client.endSession();
+      await expectLater(read, throwsA(isA<WebApiSessionException>()));
+      expect(signal!.getProperty<JSBoolean>('aborted'.toJS).toDart, isTrue);
+      response.complete(
+        <String, Object?>{
+              'status': 200,
+              'text': (() => Future<JSString>.value(
+                '{"revision":"999","data":{}}'.toJS,
+              ).toJS).toJS,
+            }.jsify()
+            as JSObject,
+      );
+      await Future<void>.value();
+      expect(client.revision, isNull);
+    },
+  );
+
+  test(
+    'api-client-contract custom import accepts only owned per-reference grant IDs and rejects null duplicates and same-reference tickets',
+    () async {
+      final profile = await repository.profiles().getSingle();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      const job = 'custom-dependency-job';
+      final reference = 'dependency-${'d' * 32}';
+      final expiry = DateTime.now()
+          .toUtc()
+          .add(const Duration(minutes: 4))
+          .toIso8601String();
+      final digest = 'd' * 64;
+      server.nextQuery = server._ok({
+        'preparedJobId': job,
+        'operationId': job,
+        'requestDigest': 'a' * 64,
+        'contentSha256': 'b' * 64,
+        'profileId': _largeProfile,
+        'expiresAt': expiry,
+        'dependencies': [
+          {'sourceReference': reference, 'urlDigest': digest},
+        ],
+      });
+      final receipt = await repository
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': version.revision,
+            'profileId': _largeProfile,
+            'url': 'https://example.test/custom.json',
+          });
+      repository.registerPreparedOperation(receipt, version);
+      final ids = <String>[];
+      for (var index = 0; index < 2; index++) {
+        final preparation = 'dependency-preparation-$index';
+        server.nextQuery = server._ok({
+          'preparationId': preparation,
+          'purpose': 'custom-profile-dependency',
+          'urlDigest': digest,
+          'expiresAt': expiry,
+          'key': {
+            'kind': 'custom-import-dependency',
+            'id': _largeProfile,
+            'name': reference,
+          },
+        });
+        await repository.queryExternal('/api/v1/sources:prepare', {
+          'expectedRevision': version.revision,
+          'purpose': 'custom-profile-dependency',
+          'importJobId': job,
+          'sourceReference': reference,
+        });
+        final id = 'dependency-ticket-$index';
+        ids.add(id);
+        server.sourceGrant = {
+          'authorizationId': id,
+          'expiresAt': expiry,
+          'importOperationId': job,
+        };
+        await repository.executeExternalCommand(
+          '/api/v1/sources:authorize',
+          {
+            'preparationId': preparation,
+            'urlDigest': digest,
+            'intent': 'authorize-server-private-source',
+          },
+          apiObject,
+          editVersion: version,
+        );
+      }
+      final payload = <String, Object?>{
+        'id': _largeProfile,
+        'preparedJobId': job,
+        'requestDigest': 'a' * 64,
+      };
+      for (final invalid in <Object?>[
+        null,
+        <String, String>{},
+        [1],
+        ['foreign-ticket'],
+        [ids.first, ids.first],
+        ids,
+      ]) {
+        await expectLater(
+          repository.executeExternalCommand(
+            '/api/v1/profiles:import-custom',
+            {...payload, 'authorizationIds': invalid},
+            apiObject,
+            editVersion: version,
+            operationId: job,
+          ),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      expect(
+        server.requests.where(
+          (request) => request.path == '/api/v1/profiles:import-custom',
+        ),
+        isEmpty,
+      );
+      expect(
+        await repository.executeExternalCommand(
+          '/api/v1/profiles:import-custom',
+          {
+            ...payload,
+            'authorizationIds': [ids.first],
+          },
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        {'committed': true},
+      );
+    },
+  );
+
+  test(
+    'api-client-contract custom import accepts an explicit empty per-reference grant list',
+    () async {
+      final profile = await repository.profiles().getSingle();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      final receipt = await repository
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': version.revision,
+            'profileId': _largeProfile,
+            'url': 'https://example.test/public-custom.json',
+          });
+      final job = repository.registerPreparedOperation(receipt, version);
+      expect(
+        await repository.executeExternalCommand(
+          '/api/v1/profiles:import-custom',
+          {
+            'id': _largeProfile,
+            'preparedJobId': job,
+            'requestDigest': apiObject(receipt.data)['requestDigest'],
+            'authorizationIds': <String>[],
+          },
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        {'committed': true},
+      );
+    },
+  );
+
+  test(
+    'api-client-contract custom dependency preparation rejects another purpose reference URL digest and profile key',
+    () async {
+      final profile = await repository.profiles().getSingle();
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        profile,
+      );
+      const job = 'custom-negative-dependency-job';
+      final reference = 'dependency-${'d' * 32}';
+      final expiry = DateTime.now()
+          .toUtc()
+          .add(const Duration(minutes: 4))
+          .toIso8601String();
+      final digest = 'd' * 64;
+      server.nextQuery = server._ok({
+        'preparedJobId': job,
+        'operationId': job,
+        'requestDigest': 'a' * 64,
+        'contentSha256': 'b' * 64,
+        'profileId': _largeProfile,
+        'expiresAt': expiry,
+        'dependencies': [
+          {'sourceReference': reference, 'urlDigest': digest},
+        ],
+      });
+      final receipt = await repository
+          .queryExternal('/api/v1/profiles:prepare-custom-import', {
+            'expectedRevision': version.revision,
+            'profileId': _largeProfile,
+            'url': 'https://example.test/custom.json',
+          });
+      repository.registerPreparedOperation(receipt, version);
+      final source = <String, Object?>{
+        'preparationId': 'negative-dependency-preparation',
+        'purpose': 'custom-profile-dependency',
+        'urlDigest': digest,
+        'expiresAt': expiry,
+        'key': {
+          'kind': 'custom-import-dependency',
+          'id': _largeProfile,
+          'name': reference,
+        },
+      };
+      final query = <String, Object?>{
+        'expectedRevision': version.revision,
+        'purpose': 'custom-profile-dependency',
+        'importJobId': job,
+        'sourceReference': reference,
+      };
+      for (final invalid in <Map<String, Object?>>[
+        {'purpose': 'generic-download'},
+        {'urlDigest': 'e' * 64},
+        {
+          'key': {
+            'kind': 'custom-import-dependency',
+            'id': '9223372036854775807',
+            'name': reference,
+          },
+        },
+      ]) {
+        server.nextQuery = server._ok({...source, ...invalid});
+        await expectLater(
+          repository.queryExternal('/api/v1/sources:prepare', query),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      for (final invalid in [
+        {'sourceReference': 'not-in-manifest'},
+        {'url': 'https://example.test/replaced'},
+      ]) {
+        server.nextQuery = server._ok(source);
+        await expectLater(
+          repository.queryExternal('/api/v1/sources:prepare', {
+            ...query,
+            ...invalid,
+          }),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+    },
+  );
+
+  for (final source in <Map<String, Object?>>[
+    {
+      'kind': 'file',
+      'bytes': base64Encode(utf8.encode('name: public fixture')),
+    },
+    {'kind': 'url', 'url': 'https://example.test/public-module.yaml'},
+  ]) {
+    test(
+      'api-client-contract fixed module import preparation supports new ${source['kind']} without unnecessary private grants',
+      () async {
+        await repository.initialize();
+        final version = repository.captureCreateVersion(ApiIdentity.mitmModule);
+        final metadata = <String, Object?>{'name': 'public module'};
+        final attachments = <Object?>[];
+        final receipt = await repository
+            .queryExternal('/api/v1/mitm-modules:prepare-import', {
+              'expectedRevision': version.revision,
+              'source': source,
+              'metadata': metadata,
+              'attachments': attachments,
+            });
+        final job = repository.registerPreparedOperation(receipt, version);
+        final payload = <String, Object?>{
+          'preparedJobId': job,
+          'requestDigest': apiObject(receipt.data)['requestDigest'],
+          'authorizationIds': <String>[],
+        };
+        for (final change in <Map<String, Object?>>[
+          {
+            'source': {'kind': 'url', 'url': 'https://example.test/replaced'},
+          },
+          {
+            'metadata': {'name': 'changed'},
+          },
+          {
+            'attachments': [
+              {'name': 'replaced'},
+            ],
+          },
+          {'id': _largeScript},
+          {'url': 'https://example.test/replaced'},
+          {'authorizationIds': null},
+        ]) {
+          await expectLater(
+            repository.executeExternalCommand(
+              '/api/v1/mitm-modules:import',
+              {...payload, ...change},
+              apiObject,
+              editVersion: version,
+              operationId: job,
+            ),
+            throwsA(isA<WebApiException>()),
+          );
+        }
+        expect(
+          await repository.executeExternalCommand(
+            '/api/v1/mitm-modules:import',
+            payload,
+            apiObject,
+            editVersion: version,
+            operationId: job,
+          ),
+          {'committed': true},
+        );
+        final body = apiObject(jsonDecode(server.requests.last.body!));
+        expect(body.containsKey('source'), isFalse);
+        expect(body['authorizationIds'], isEmpty);
+      },
+    );
+  }
+
+  test(
+    'api-client-contract existing module import preparation requires its original read identity not create or another row',
+    () async {
+      server.catalogs['mitm-modules'] = [
+        apiObject(_wrappedMutationData()['mitmModule']),
+      ];
+      final module =
+          (await repository.catalog(repository.modules).get()).single;
+      final version = repository.captureEditVersion(
+        ApiIdentity.mitmModule,
+        module,
+      );
+      final id = repository.codec.wireId(ApiIdentity.mitmModule, module.id);
+      final receipt = await repository.queryExternal(
+        '/api/v1/mitm-modules:prepare-import',
+        {
+          'expectedRevision': version.revision,
+          'id': id,
+          'source': {'kind': 'stored'},
+        },
+      );
+      expect(
+        () => repository.registerPreparedOperation(
+          receipt,
+          repository.captureCreateVersion(ApiIdentity.mitmModule),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      final job = repository.registerPreparedOperation(receipt, version);
+      final payload = <String, Object?>{
+        'id': id,
+        'preparedJobId': job,
+        'requestDigest': apiObject(receipt.data)['requestDigest'],
+      };
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/mitm-modules:import',
+          {...payload, 'id': _largeScript},
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        await repository.executeExternalCommand(
+          '/api/v1/mitm-modules:import',
+          payload,
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        {'committed': true},
+      );
+    },
+  );
+
+  test(
+    'api-client-contract registered attachment rotation preserves the original operation and rejects stale final attachments',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.mitmModule);
+      const job = 'attachment-rotation-job';
+      const reference = 'attachment-fixture-reference';
+      final expiry = DateTime.now()
+          .toUtc()
+          .add(const Duration(minutes: 4))
+          .toIso8601String();
+      final root = <String, Object?>{
+        'preparedJobId': job,
+        'operationId': job,
+        'requestDigest': 'a' * 64,
+        'contentSha256': 'b' * 64,
+        'expiresAt': expiry,
+        'attachmentReferences': [reference],
+        'dependencies': <Object?>[],
+      };
+      server.nextQuery = server._ok(root);
+      final initial = await repository.queryExternal(
+        '/api/v1/mitm-modules:prepare-import',
+        {
+          'expectedRevision': version.revision,
+          'source': {'kind': 'file', 'bytes': 'bmFtZTogZml4dHVyZQ=='},
+        },
+      );
+      expect(repository.registerPreparedOperation(initial, version), job);
+      server.nextQuery = server._ok({...root, 'requestDigest': 'c' * 64});
+      final chunk = await repository
+          .queryExternal('/api/v1/content-preparations/$job/attachments', {
+            'expectedRevision': version.revision,
+            'requestDigest': 'a' * 64,
+            'sourceReference': reference,
+            'bytes': 'YmxvYg==',
+          });
+      expect(repository.registerPreparedOperation(chunk, version), job);
+      expect(
+        () => repository.registerPreparedOperation(initial, version),
+        throwsA(isA<WebApiException>()),
+      );
+      final payload = <String, Object?>{
+        'preparedJobId': job,
+        'requestDigest': 'c' * 64,
+        'authorizationIds': <String>[],
+      };
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/mitm-modules:import',
+          {...payload, 'attachments': <Object?>[]},
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/mitm-modules:import',
+          {...payload, 'requestDigest': 'a' * 64},
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        await repository.executeExternalCommand(
+          '/api/v1/mitm-modules:import',
+          payload,
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        {'committed': true},
+      );
+      expect(
+        apiObject(
+          jsonDecode(server.requests.last.body!),
+        ).containsKey('attachments'),
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract attachment rotation rejects unregistered jobs wrong original token request digest ref bytes and changed root proof',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.mitmModule);
+      const job = 'negative-attachment-job';
+      const reference = 'declared-attachment';
+      final root = <String, Object?>{
+        'preparedJobId': job,
+        'operationId': job,
+        'requestDigest': 'a' * 64,
+        'contentSha256': 'b' * 64,
+        'expiresAt': DateTime.now()
+            .toUtc()
+            .add(const Duration(minutes: 4))
+            .toIso8601String(),
+        'attachmentReferences': [reference],
+        'dependencies': <Object?>[],
+      };
+      server.nextQuery = server._ok(root);
+      final initial = await repository.queryExternal(
+        '/api/v1/mitm-modules:prepare-import',
+        {
+          'expectedRevision': version.revision,
+          'source': {'kind': 'file', 'bytes': 'bmFtZTogZml4dHVyZQ=='},
+        },
+      );
+      repository.registerPreparedOperation(initial, version);
+      final request = <String, Object?>{
+        'expectedRevision': version.revision,
+        'requestDigest': 'a' * 64,
+        'sourceReference': reference,
+        'bytes': 'YmxvYg==',
+      };
+      for (final invalid in <Map<String, Object?>>[
+        {...request, 'requestDigest': 'e' * 64},
+        {...request, 'sourceReference': 'undeclared'},
+        {...request}..remove('bytes'),
+        {...request, 'expectedRevision': '16'},
+        {...request, 'headers': <String, String>{}},
+      ]) {
+        server.nextQuery = server._ok({...root, 'requestDigest': 'c' * 64});
+        final chunk = await repository.queryExternal(
+          '/api/v1/content-preparations/$job/attachments',
+          invalid,
+        );
+        expect(
+          () => repository.registerPreparedOperation(chunk, version),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      for (final invalid in <Map<String, Object?>>[
+        {'operationId': 'different-job'},
+        {'preparedJobId': 'different-job'},
+        {'contentSha256': 'd' * 64},
+        {'requestDigest': 'a' * 64},
+        {
+          'expiresAt': DateTime.now()
+              .toUtc()
+              .add(const Duration(minutes: 6))
+              .toIso8601String(),
+        },
+      ]) {
+        server.nextQuery = server._ok({
+          ...root,
+          'requestDigest': 'c' * 64,
+          ...invalid,
+        });
+        final chunk = await repository.queryExternal(
+          '/api/v1/content-preparations/$job/attachments',
+          request,
+        );
+        expect(
+          () => repository.registerPreparedOperation(chunk, version),
+          throwsA(isA<WebApiException>()),
+        );
+      }
+      server.nextQuery = server._ok({...root, 'requestDigest': 'c' * 64});
+      final chunk = await repository.queryExternal(
+        '/api/v1/content-preparations/$job/attachments',
+        request,
+      );
+      expect(
+        () => repository.registerPreparedOperation(
+          chunk,
+          repository.captureCreateVersion(ApiIdentity.mitmModule),
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        () => repository.registerPreparedOperation(
+          ApiReceipt(revision: chunk.revision, data: chunk.data),
+          version,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      server.nextQuery = server._ok({...root, 'requestDigest': 'c' * 64});
+      final unknown = await repository.queryExternal(
+        '/api/v1/content-preparations/unregistered-job/attachments',
+        request,
+      );
+      expect(
+        () => repository.registerPreparedOperation(unknown, version),
+        throwsA(isA<WebApiException>()),
+      );
+    },
+  );
+
+  test(
+    'api-client-contract attachment digest rotation invalidates every old private grant including other references',
+    () async {
+      await repository.initialize();
+      final version = repository.captureCreateVersion(ApiIdentity.mitmModule);
+      const job = 'attachment-grant-invalidation-job';
+      const reference = 'other-private-reference';
+      final expiry = DateTime.now()
+          .toUtc()
+          .add(const Duration(minutes: 4))
+          .toIso8601String();
+      final root = <String, Object?>{
+        'preparedJobId': job,
+        'operationId': job,
+        'requestDigest': 'a' * 64,
+        'contentSha256': 'b' * 64,
+        'expiresAt': expiry,
+        'attachmentReferences': ['uploaded-reference'],
+        'dependencies': [
+          {'sourceReference': reference, 'urlDigest': 'd' * 64},
+        ],
+      };
+      server.nextQuery = server._ok(root);
+      final initial = await repository.queryExternal(
+        '/api/v1/mitm-modules:prepare-import',
+        {
+          'expectedRevision': version.revision,
+          'source': {'kind': 'file', 'bytes': 'bmFtZTogZml4dHVyZQ=='},
+        },
+      );
+      repository.registerPreparedOperation(initial, version);
+      server.nextQuery = server._ok({
+        'preparationId': 'old-private-preparation',
+        'purpose': 'mitm-resource-import',
+        'urlDigest': 'd' * 64,
+        'expiresAt': expiry,
+      });
+      await repository.queryExternal('/api/v1/sources:prepare', {
+        'expectedRevision': version.revision,
+        'purpose': 'mitm-resource-import',
+        'importJobId': job,
+        'sourceReference': reference,
+      });
+      server.sourceGrant = {
+        'authorizationId': 'old-private-ticket',
+        'expiresAt': expiry,
+        'importOperationId': job,
+      };
+      await repository.executeExternalCommand(
+        '/api/v1/sources:authorize',
+        {
+          'preparationId': 'old-private-preparation',
+          'urlDigest': 'd' * 64,
+          'intent': 'authorize-server-private-source',
+        },
+        apiObject,
+        editVersion: version,
+      );
+      server.nextQuery = server._ok({...root, 'requestDigest': 'c' * 64});
+      final chunk = await repository
+          .queryExternal('/api/v1/content-preparations/$job/attachments', {
+            'expectedRevision': version.revision,
+            'requestDigest': 'a' * 64,
+            'sourceReference': 'uploaded-reference',
+            'bytes': 'YmxvYg==',
+          });
+      repository.registerPreparedOperation(chunk, version);
+      await expectLater(
+        repository.executeExternalCommand(
+          '/api/v1/mitm-modules:import',
+          {
+            'preparedJobId': job,
+            'requestDigest': 'c' * 64,
+            'authorizationIds': ['old-private-ticket'],
+          },
+          apiObject,
+          editVersion: version,
+          operationId: job,
+        ),
+        throwsA(isA<WebApiException>()),
+      );
+      expect(
+        server.requests.where(
+          (request) => request.path == '/api/v1/mitm-modules:import',
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'api-client-contract source authorization unknown-result recovery uses its isolated ledger after reload',
+    () async {
+      final http = _HttpMock();
+      final journal = MemoryApiOperationJournal();
+      final first = _mockClient(http, journal: journal);
+      addTearDown(first.close);
+      await first.read('/api/v1/meta');
+      http.handler = (_) async =>
+          throw StateError('source authorization receipt lost');
+      await expectLater(
+        first.command('/api/v1/sources:authorize', {
+          'preparationId': 'opaque-prepared-source',
+          'urlDigest': 'synthetic-digest',
+          'intent': 'authorize-server-private-source',
+        }, expectedRevision: '17'),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final operationId = first.pendingOperation!.operationId;
+      final restored = _mockClient(http, journal: journal);
+      addTearDown(restored.close);
+      http.handler = (request) async {
+        expect(request.path, '/api/v1/source-operations/$operationId');
+        return http.ok({
+          'authorizationToken': 'synthetic-source-token',
+        }, id: operationId);
+      };
+      final receipt = await restored.recoverOperation(operationId);
+      restored.completeOperation(receipt);
+      expect(restored.pendingOperation, isNull);
+      expect(
+        jsonEncode(journal.read()?.toJournal()),
+        isNot(contains('synthetic-source-token')),
+      );
+      http.handler = (_) async =>
+          throw StateError('second lost source request');
+      await expectLater(
+        restored.command('/api/v1/sources:authorize', {
+          'intent': 'authorize-server-private-source',
+        }, expectedRevision: '17'),
+        throwsA(isA<WebApiUnknownCommitException>()),
+      );
+      final missing = restored.pendingOperation!.operationId;
+      http.handler = (request) async {
+        expect(request.path, '/api/v1/source-operations/$missing:resolve');
+        expect(jsonDecode(request.body!), {'intent': 'resolve-unknown-result'});
+        return ApiResponse(
+          409,
+          jsonEncode({
+            'revision': '17',
+            'error': {
+              'code': 'operation_not_committed',
+              'message': 'tombstoned',
+              'details': {'state': 'not_committed'},
+            },
+          }),
+        );
+      };
+      await expectLater(
+        restored.resolveOperation(missing),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'operation_not_committed',
+          ),
+        ),
+      );
+      expect(restored.pendingOperation, isNull);
+    },
+  );
+}

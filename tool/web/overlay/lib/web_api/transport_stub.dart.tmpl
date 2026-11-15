@@ -1,0 +1,8 @@
+import 'transport_types.dart';
+
+ApiTransport createApiTransport() => throw UnsupportedError(
+  'The Web API repository requires a browser or an injected API transport',
+);
+
+String currentApiOrigin() => 'injected-test-origin';
+void notifyApiUnauthorized() {}
