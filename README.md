@@ -128,12 +128,19 @@ Run `dart setup.dart --help` for the remaining options, such as `--targets` to b
 ## Web panel
 
 The optional Web build is ported from [FlClash-web](https://github.com/libzonda/FlClash-web).
-It runs separately from the native app, with a Flutter Web interface and a Go server. Bootstrap credentials are
-required for the first start; the page, file APIs and Core WebSocket share the same login session. Manage the
-persistent username and password, or sign out, in **Tools → Settings → Web account**. These controls and their
-translations are included only in the isolated Web build, not in native desktop or mobile builds.
+It runs separately from the native app: an authenticated typed HTTP API (`/api/v1/*`, `/api/auth/*`) and an event
+WebSocket (`/ws/v1/events`) serve a Flutter Web interface, while business data lives in a private server-side
+bbolt store outside the managed resource directory. The browser runs no SQLite engine, there is no generic
+filesystem or HTTP-proxy endpoint, and native desktop/mobile builds keep Drift/SQLite unchanged. Bootstrap
+credentials are required for the first start. Manage the persistent username and password in
+**Tools → Settings → Web account**. Sign out from the Web main navigation: the sidebar on wide screens, and the
+utility area of the bottom navigation on narrow screens; the account page has no sign-out action. Those controls
+and their translations exist only in the isolated Web build.
+Old app data is not migrated or overwritten automatically: back it up with the original app first and verify a
+restore in a copy before touching a deployment.
 
-See [WEBPANEL.md](WEBPANEL.md) for the isolated build, credentials, HTTPS deployment and Web-specific limitations.
+See [WEBPANEL.md](WEBPANEL.md) for the isolated build, credentials, HTTPS deployment, backup scope and
+Web-specific limitations.
 
 ## Support
 

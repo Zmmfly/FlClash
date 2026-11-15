@@ -121,9 +121,13 @@ dart setup.dart android   # 或 windows、macos、linux
 ## Web 控制面板
 
 可选的 Web 构建移植自 [FlClash-web](https://github.com/libzonda/FlClash-web)，由 Flutter Web 界面与 Go 服务组成，
-独立于原生客户端运行。必须配置用户名、密码；页面、文件 API 与核心 WebSocket 共用登录会话。
+独立于原生客户端运行。服务端只提供鉴权后的 typed HTTP API（`/api/v1/*`、`/api/auth/*`）与事件 WebSocket
+（`/ws/v1/events`）；业务数据保存在托管资源目录之外的私有 bbolt 状态目录。浏览器不运行 SQLite，没有通用文件系统或
+HTTP 转发通道；原生桌面/手机继续使用 Drift/SQLite。必须配置用户名、密码；用户名与密码在 **工具 → 设置 → Web 账户**
+中管理，退出登录只在 Web 主导航（宽屏侧栏；窄屏在底部导航的 utility 区域），不在账户页。旧数据不会自动迁移或覆盖，
+先用原客户端合法备份，并在副本中验证后再操作部署。
 
-隔离构建、账号配置、HTTPS 部署和 Web 版限制见 [WEBPANEL.md](WEBPANEL.md)。
+隔离构建、账号配置、HTTPS 部署、备份范围与 Web 版限制见 [WEBPANEL.md](WEBPANEL.md)。
 
 ## 支持
 
