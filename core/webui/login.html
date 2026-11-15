@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>FlClash</title>
+  <style>
+    /* Default vivid scheme: lib/common/constant.dart and prism_ui/lib/color.dart. */
+    :root {
+      color-scheme: light dark;
+      --page: #efedf0; --card: #fcf8f9; --block: #efedf0;
+      --text: #181c23; --secondary: #414755; --primary: #007aff; --error: #ba1a1a;
+      --on-primary: #fff; --separator: rgb(24 28 35 / 14%);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #131315; --card: #252628; --block: #323235;
+        --text: #f5f6ff; --secondary: #c1c6d7; --primary: #2f83ff; --error: #ffb4ab;
+        --separator: rgb(245 246 255 / 14%);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; min-height: 100svh; padding: 32px 20px;
+      display: grid; place-items: center; background: var(--page); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 17px; line-height: 1.4; -webkit-font-smoothing: antialiased;
+    }
+    main {
+      width: min(100%, 440px); padding: 36px 32px 32px; background: var(--card);
+      border-radius: 34px; box-shadow: 0 12px 48px rgb(0 0 0 / 6%);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .brand svg { width: 48px; height: 48px; flex: none; color: var(--primary); }
+    .brand span { font-size: 22px; line-height: 28px; font-weight: 600; letter-spacing: -.4px; }
+    h1 { margin: 0 0 8px; font-size: 28px; line-height: 34px; font-weight: 700; letter-spacing: -.55px; }
+    .subtitle { margin: 0 0 28px; color: var(--secondary); }
+    .fields { background: var(--block); border-radius: 16px; }
+    .field { display: block; padding: 12px 16px; border-radius: 16px; }
+    .field + .field { position: relative; }
+    .field + .field::before { content: ''; position: absolute; top: 0; left: 16px; right: 16px; height: 1px; background: var(--separator); }
+    label { display: block; margin-bottom: 4px; font-size: 13px; line-height: 18px; color: var(--secondary); }
+    .input-line { display: flex; align-items: center; gap: 8px; }
+    input {
+      min-width: 0; width: 100%; padding: 0; min-height: 28px; border: 0; outline: 0;
+      background: transparent; color: var(--text); font: inherit; caret-color: var(--primary);
+    }
+    input:-webkit-autofill { transition: background-color 99999s; -webkit-text-fill-color: var(--text); }
+    .field:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+    button { font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    button:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+    .reveal { display: grid; place-items: center; flex: none; width: 36px; height: 32px; padding: 4px; border: 0; border-radius: 8px; background: transparent; color: var(--secondary); }
+    .reveal svg { width: 22px; height: 22px; }
+    .reveal[aria-pressed="true"] .slash { display: initial; }
+    .slash { display: none; }
+    .submit { width: 100%; min-height: 48px; margin-top: 24px; padding: 12px 20px; border: 0; border-radius: 1000px; background: var(--primary); color: var(--on-primary); font-weight: 600; }
+    button:disabled { cursor: default; opacity: .5; }
+    @media (hover: hover) { .reveal:hover { background: color-mix(in srgb, var(--text) 4%, transparent); } .submit:hover:not(:disabled) { filter: brightness(1.05); } }
+    .submit:active:not(:disabled) { opacity: .75; }
+    .message { margin: 16px 0 0; font-size: 15px; line-height: 20px; overflow-wrap: anywhere; }
+    #error { color: var(--error); }
+    #status { color: var(--secondary); }
+    [hidden] { display: none !important; }
+    @supports (corner-shape: squircle) { main, .fields, .field, button { corner-shape: squircle; } }
+    @media (max-width: 400px) { body { padding: 20px 16px; } main { padding: 28px 20px 24px; border-radius: 28px; } h1 { font-size: 26px; line-height: 32px; } }
+    @media (prefers-reduced-motion: no-preference) { button { transition: opacity 150ms, background-color 150ms; } }
+  </style>
+</head>
+<body>
+  <main aria-labelledby="title">
+    <div class="brand">
+      <!-- Geometry from assets_source/images/icon/glyph.svg; no public app assets are needed. -->
+      <svg viewBox="0 0 240 240" aria-hidden="true" focusable="false"><g stroke="currentColor" stroke-width="46.32" stroke-linecap="round"><line x1="59.68" y1="100.95" x2="180.02" y2="31.47"/><line x1="90.56" y1="154.43" x2="150.74" y2="119.69"/></g><circle cx="121.44" cy="207.92" r="23.16" fill="currentColor"/></svg>
+      <span>FlClash</span>
+    </div>
+    <h1 id="title" data-message="webLoginTitle"></h1>
+    <p class="subtitle" data-message="webLoginSubtitle"></p>
+    <form id="login" method="post" action="/api/auth/login">
+      <div class="fields">
+        <div class="field">
+          <label for="username" data-message="webUsername"></label>
+          <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required aria-describedby="error">
+        </div>
+        <div class="field">
+          <label for="password" data-message="webPassword"></label>
+          <div class="input-line">
+            <input id="password" name="password" type="password" autocomplete="current-password" required aria-describedby="error">
+            <button id="reveal" class="reveal" type="button" aria-pressed="false" aria-controls="password">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.01 11.32A10.08 10.08 0 0 1 20.99 11.32A1.5 1.5 0 0 1 20.99 12.68A10.08 10.08 0 0 1 3.01 12.68A1.5 1.5 0 0 1 3.01 11.32Z"/><circle cx="12" cy="12" r="2.8"/><path class="slash" d="M4 4L20 20"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <p id="error" class="message" role="alert" hidden></p>
+      <p id="status" class="message" role="status" hidden></p>
+      <button id="submit" class="submit" type="submit" data-message="webLoginAction"></button>
+    </form>
+  </main>
+  <script>
+    'use strict';
+    (() => {
+      const messages = __FLCLASH_LOGIN_MESSAGES__;
+      const requested = (navigator.language || 'en').replace('-', '_');
+      const language = requested.toLowerCase().startsWith('zh') ? 'zh_CN' : requested.split('_')[0].toLowerCase();
+      const locale = Object.hasOwn(messages, language) ? language : 'en';
+      const text = messages[locale];
+      document.documentElement.lang = locale.replace('_', '-');
+      document.title = text.webLoginTitle + ' · FlClash';
+      document.querySelectorAll('[data-message]').forEach(element => { element.textContent = text[element.dataset.message]; });
+      const form = document.getElementById('login');
+      const username = document.getElementById('username');
+      const password = document.getElementById('password');
+      const reveal = document.getElementById('reveal');
+      const submit = document.getElementById('submit');
+      const error = document.getElementById('error');
+      const status = document.getElementById('status');
+      let busy = false;
+      const revealLabel = () => {
+        const label = password.type === 'password' ? text.webShowPassword : text.webHidePassword;
+        reveal.setAttribute('aria-label', label);
+        reveal.title = label;
+      };
+      revealLabel();
+      reveal.onclick = () => {
+        password.type = password.type === 'password' ? 'text' : 'password';
+        reveal.setAttribute('aria-pressed', String(password.type === 'text'));
+        revealLabel();
+      };
+      const query = new URLSearchParams(location.search);
+      if (query.get('updated') === '1') {
+        const warning = query.get('warning') === 'durability_unconfirmed';
+        status.textContent = warning ? text.webDurabilityWarning : text.webCredentialsUpdated;
+        if (warning) status.setAttribute('role', 'alert');
+        status.hidden = false;
+      }
+      form.onsubmit = async event => {
+        event.preventDefault();
+        if (busy || !form.reportValidity()) return;
+        const name = username.value.trim();
+        if (/[\r\n]/.test(username.value) || Array.from(name).length < 1 || Array.from(name).length > 64) {
+          error.textContent = text.webInvalidUsername;
+          error.hidden = false;
+          username.setAttribute('aria-invalid', 'true');
+          username.focus();
+          return;
+        }
+        busy = true;
+        submit.disabled = true;
+        reveal.disabled = true;
+        username.readOnly = true;
+        password.readOnly = true;
+        form.setAttribute('aria-busy', 'true');
+        submit.textContent = text.webSigningIn;
+        error.hidden = true;
+        try {
+          const response = await fetch('/api/auth/login', {
+            method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username.value.trim(), password: password.value })
+          });
+          if (response.status !== 200 || (await response.json()).ok !== true) throw new Error('login_failed');
+          location.replace('/');
+        } catch (_) {
+          error.textContent = text.webLoginError;
+          error.hidden = false;
+          password.setAttribute('aria-invalid', 'true');
+          password.focus();
+        } finally {
+          password.value = '';
+          busy = false;
+          submit.disabled = false;
+          reveal.disabled = false;
+          username.readOnly = false;
+          password.readOnly = false;
+          form.setAttribute('aria-busy', 'false');
+          submit.textContent = text.webLoginAction;
+        }
+      };
+      password.oninput = () => { password.removeAttribute('aria-invalid'); error.hidden = true; };
+      username.oninput = () => { username.removeAttribute('aria-invalid'); error.hidden = true; };
+    })();
+  </script>
+</body>
+</html>

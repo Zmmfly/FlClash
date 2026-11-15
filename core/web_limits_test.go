@@ -80,7 +80,7 @@ func TestWebGeoAssetSeedingKeepsPersistentFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	assets := fstest.MapFS{"assets/assets/data/GEOSITE.dat": &fstest.MapFile{Data: []byte("embedded")}, "assets/data/GEOIP.dat": &fstest.MapFile{Data: []byte("replacement")}}
-	s, err := NewWebServer(WebServerOptions{DataDir: dataDir, Username: "admin", Password: "password", EmbeddedFS: assets})
+	s, err := NewWebServer(WebServerOptions{DataDir: dataDir, AuthFile: filepath.Join(t.TempDir(), "auth.json"), Username: "admin", Password: "password", EmbeddedFS: assets})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,7 +31,7 @@ func defaultDataDir(getenv func(string) string) string {
 }
 
 func parseOptions(args []string, getenv func(string) string, output io.Writer) (core.WebServerOptions, bool, error) {
-	opts := core.WebServerOptions{ListenAddr: "127.0.0.1:8080", DataDir: defaultDataDir(getenv), WebDir: getenv("FLCLASH_WEB_DIR"), Username: getenv("FLCLASH_WEB_USERNAME"), Password: getenv("FLCLASH_WEB_PASSWORD"), PasswordFile: getenv("FLCLASH_WEB_PASSWORD_FILE")}
+	opts := core.WebServerOptions{ListenAddr: "127.0.0.1:8080", DataDir: defaultDataDir(getenv), WebDir: getenv("FLCLASH_WEB_DIR"), Username: getenv("FLCLASH_WEB_USERNAME"), Password: getenv("FLCLASH_WEB_PASSWORD"), PasswordFile: getenv("FLCLASH_WEB_PASSWORD_FILE"), AuthFile: getenv("FLCLASH_WEB_AUTH_FILE")}
 	if value := getenv("FLCLASH_WEB_LISTEN"); value != "" {
 		opts.ListenAddr = value
 	}
@@ -47,8 +47,9 @@ func parseOptions(args []string, getenv func(string) string, output io.Writer) (
 	flags.StringVar(&opts.ListenAddr, "listen", opts.ListenAddr, "HTTP/WebSocket listen address (FLCLASH_WEB_LISTEN)")
 	flags.StringVar(&opts.DataDir, "data-dir", opts.DataDir, "Persistent data directory (FLCLASH_DATA_DIR)")
 	flags.StringVar(&opts.WebDir, "web-dir", opts.WebDir, "Optional Flutter Web asset directory (FLCLASH_WEB_DIR)")
-	flags.StringVar(&opts.Username, "username", opts.Username, "Required login username (FLCLASH_WEB_USERNAME)")
-	flags.StringVar(&opts.PasswordFile, "password-file", opts.PasswordFile, "Password file outside data/assets (FLCLASH_WEB_PASSWORD_FILE); exclusive with FLCLASH_WEB_PASSWORD")
+	flags.StringVar(&opts.Username, "username", opts.Username, "Bootstrap login username when the credential store does not exist (FLCLASH_WEB_USERNAME)")
+	flags.StringVar(&opts.PasswordFile, "password-file", opts.PasswordFile, "Bootstrap password file outside data/assets (FLCLASH_WEB_PASSWORD_FILE); exclusive with FLCLASH_WEB_PASSWORD during initialization")
+	flags.StringVar(&opts.AuthFile, "auth-file", opts.AuthFile, "Persistent credential file outside data/assets (FLCLASH_WEB_AUTH_FILE); default <absolute data-dir>.auth.json")
 	flags.BoolVar(&opts.SecureCookie, "secure-cookie", opts.SecureCookie, "Require HTTPS browser origin and Secure cookies behind a Host-preserving reverse proxy")
 	version := flags.Bool("version", false, "Print version and exit")
 	if err := flags.Parse(args); err != nil {
@@ -59,15 +60,6 @@ func parseOptions(args []string, getenv func(string) string, output io.Writer) (
 	}
 	if *version {
 		return opts, true, nil
-	}
-	if opts.Username == "" {
-		return opts, false, errors.New("web username is required")
-	}
-	if opts.Password != "" && opts.PasswordFile != "" {
-		return opts, false, errors.New("web password environment and password file are mutually exclusive")
-	}
-	if opts.Password == "" && opts.PasswordFile == "" {
-		return opts, false, errors.New("web password is required")
 	}
 	assets, err := fs.Sub(embeddedWebDist, "web_dist")
 	if err != nil {

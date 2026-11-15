@@ -29,7 +29,7 @@ import (
 
 func newWebTestServer(t *testing.T) *WebServer {
 	t.Helper()
-	s, err := NewWebServer(WebServerOptions{DataDir: t.TempDir(), Username: "admin", Password: "correct horse", EmbeddedFS: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("test panel")}, "app.js": &fstest.MapFile{Data: []byte("test script")}}})
+	s, err := NewWebServer(WebServerOptions{DataDir: filepath.Join(t.TempDir(), "data"), Username: "admin", Password: "correct horse", EmbeddedFS: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("test panel")}, "app.js": &fstest.MapFile{Data: []byte("test script")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func webLogin(t *testing.T, s *WebServer) *http.Cookie {
 
 func TestWebAuthenticationFullRouteMatrix(t *testing.T) {
 	s := newWebTestServer(t)
-	routes := []string{"/ws/core", "/ws/unknown", "/api/auth/session", "/api/auth/logout", "/api/fs/snapshot", "/api/fs/interfaces", "/api/fs/stat?path=/data", "/api/fs/read?path=/data/config.yaml", "/api/fs/write?path=/data/test", "/api/fs/mkdir?path=/data/dir", "/api/fs/delete?path=/data/dir", "/api/fs/rename", "/api/fs/copy", "/api/http-proxy", "/api/unknown"}
+	routes := []string{"/ws/core", "/ws/unknown", "/api/auth/session", "/api/auth/logout", "/api/auth/credentials", "/api/fs/snapshot", "/api/fs/interfaces", "/api/fs/stat?path=/data", "/api/fs/read?path=/data/config.yaml", "/api/fs/write?path=/data/test", "/api/fs/mkdir?path=/data/dir", "/api/fs/delete?path=/data/dir", "/api/fs/rename", "/api/fs/copy", "/api/http-proxy", "/api/unknown"}
 	for _, path := range routes {
 		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions} {
 			w := webRequest(s, method, path, "{}", nil)
