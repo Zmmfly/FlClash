@@ -127,32 +127,90 @@ test('VFS stat/read preserves bytes and distinguishes read failure from missing 
   assert.notEqual(failed.exists, false);
 });
 
-test('logout redirects only after server-confirmed 204 and reports network/server failures', async () => {
+test('logout redirects only after its successful response is handled by the account UI', async () => {
   const b = browser();
   b.fetchResponses.push({ status: 500 });
-  await assert.rejects(b.bridge.logout(), /Logout failed/);
+  assert.equal(JSON.parse(await b.bridge.accountMutation('/api/auth/logout', null)).status, 500);
   assert.deepEqual(b.redirects, []);
+  assert.throws(() => b.bridge.redirectAfterAuth(false), /successful account operation/);
   b.fetchResponses.push({ status: 204 });
-  assert.equal(await b.bridge.logout(), true);
+  assert.equal(JSON.parse(await b.bridge.accountMutation('/api/auth/logout', null)).status, 204);
+  assert.deepEqual(b.redirects, []);
+  b.bridge.redirectAfterAuth(false);
   assert.equal(b.requests[1].url, '/api/auth/logout');
   assert.equal(b.requests[1].options.method, 'POST');
   assert.deepEqual(b.redirects, ['/login']);
 });
 
-for (const [language, label] of [['en-US', 'Log out'], ['zh-CN', '退出登录']]) {
-  test(`shell offers accessible ${language} logout and shows failed logout`, async () => {
-    const b = browser(language);
-    b.bridge.mountShell();
-    const button = b.elements.get('flclash-logout');
-    assert.equal(button.textContent, label);
-    assert.equal(button['aria-label'], label);
-    b.fetchResponses.push({ status: 503 });
-    await button.onclick();
-    assert.ok(b.elements.get('flclash-auth-status').textContent);
-    assert.equal(button.disabled, false);
+for (const [status, error] of [[403, 'invalid_current_password'], [400, 'invalid_credentials'],
+                              [500, 'credentials_save_failed'], [429, 'rate_limited']]) {
+  test(`credentials failure ${status} preserves the session and permits a retry`, async () => {
+    const b = browser();
+    b.fetchResponses.push({ status, text: JSON.stringify({ error }) });
+    const response = JSON.parse(await b.bridge.accountMutation('/api/auth/credentials', '{}'));
+    assert.equal(response.status, status);
+    assert.equal(JSON.parse(response.text).error, error);
     assert.deepEqual(b.redirects, []);
+    b.fetchResponses.push({ status: 200, text: '{"ok":true}' });
+    assert.equal(JSON.parse(await b.bridge.accountMutation('/api/auth/credentials', '{}')).status, 200);
+    b.bridge.redirectAfterAuth(true);
+    assert.deepEqual(b.redirects, ['/login?updated=1']);
   });
 }
+
+test('credential success wins races with revoked WS sessions and unrelated 401 responses', async () => {
+  const b = browser();
+  let complete;
+  b.context.fetch = (url, options) => {
+    b.requests.push({ url, options });
+    return new Promise(resolve => { complete = resolve; });
+  };
+  const socket = new b.bridge.CoreWebSocket('wss://example.test/ws/core');
+  const update = b.bridge.accountMutation('/api/auth/credentials', '{"username":"new-name"}');
+  socket.emit('close');
+  assert.equal(await b.bridge.checkSession(), false);
+  assert.equal(b.requests.length, 1);
+  b.xhrResponses.push({ status: 401 });
+  assert.equal(JSON.parse(b.bridge.syncJsonRequest('GET', '/api/fs/stat', null)).status, 401);
+  assert.deepEqual(b.redirects, []);
+  assert.equal(JSON.parse(await b.bridge.accountMutation('/api/auth/logout', null)).status, 409);
+  complete({ status: 200, text: async () => '{"ok":true}' });
+  assert.equal(JSON.parse(await update).status, 200);
+  socket.emit('error');
+  b.xhrResponses.push({ status: 401 });
+  b.bridge.syncJsonRequest('GET', '/api/fs/stat', null);
+  assert.deepEqual(b.redirects, []);
+  b.bridge.redirectAfterAuth(true);
+  b.xhrResponses.push({ status: 401 });
+  b.bridge.syncJsonRequest('GET', '/api/fs/stat', null);
+  assert.deepEqual(b.redirects, ['/login?updated=1']);
+  assert.equal(b.requests.filter(request => request.options).length, 1);
+});
+
+test('committed credentials with unconfirmed durability redirect to the localized warning, not ordinary success', async () => {
+  const b = browser();
+  b.fetchResponses.push({ status: 200, text: '{"ok":true,"warning":"durability_unconfirmed"}' });
+  assert.equal(JSON.parse(await b.bridge.accountMutation('/api/auth/credentials', '{}')).status, 200);
+  b.xhrResponses.push({ status: 401 });
+  b.bridge.syncJsonRequest('GET', '/api/auth/session', null);
+  assert.deepEqual(b.redirects, []);
+  b.bridge.redirectAfterAuth(true);
+  assert.deepEqual(b.redirects, ['/login?updated=1&warning=durability_unconfirmed']);
+});
+
+test('an unauthenticated credential mutation still redirects to login and reports failure', async () => {
+  const b = browser();
+  b.fetchResponses.push({ status: 401 });
+  assert.equal(JSON.parse(await b.bridge.accountMutation('/api/auth/credentials', '{}')).status, 401);
+  assert.deepEqual(b.redirects, ['/login']);
+  assert.equal(JSON.parse(await b.bridge.accountMutation('https://foreign.test/api/auth/credentials', '{}')).ok, false);
+});
+
+test('HTML shell has no fixed logout control or account-status overlay', () => {
+  const html = readFileSync(new URL('../../web/index.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /flclash-logout|flclash-auth-status|mountShell/);
+  assert.doesNotMatch(script, /mountShell|退出登录|Log out/);
+});
 
 for (const event of ['close', 'error']) {
   test(`WebSocket ${event} checks session, but does not log out a healthy session`, async () => {

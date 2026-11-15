@@ -4,6 +4,7 @@ import vm from 'node:vm';
 
 if (process.argv.length !== 3) throw new Error('Usage: node tool/web/vfs_runtime_test.mjs <compiled vfs_test.js>');
 const redirects = [];
+let unauthorizedOperations = 0;
 globalThis.self = globalThis;
 globalThis.window = globalThis;
 globalThis.location = { href: 'https://example.test/', origin: 'https://example.test', replace(path) { redirects.push(path); } };
@@ -34,6 +35,7 @@ globalThis.XMLHttpRequest = class {
         this.responseText = '{"exists":false}';
       }
     } else if (__webTestMode === 'unauthorized') {
+      unauthorizedOperations++;
       this.status = 401;
       this.responseText = 'unauthorized';
     } else if (__webTestMode === 'failure') {
@@ -48,6 +50,7 @@ globalThis.XMLHttpRequest = class {
 };
 vm.runInThisContext(readFileSync(new URL('../../web/bridge.js', import.meta.url), 'utf8'), { filename: 'bridge.js' });
 vm.runInThisContext(readFileSync(process.argv[2], 'utf8'), { filename: 'vfs_test.js' });
-assert.ok(redirects.length >= 6, 'All unauthorized filesystem mutations must redirect');
+assert.ok(unauthorizedOperations >= 6, 'Every unauthorized filesystem mutation must be exercised');
+assert.equal(redirects.length, 1, 'Unauthorized operations coalesce into a single immediate login navigation');
 assert.ok(redirects.every(path => path === '/login'));
 console.log('Compiled Dart VFS mutation/cache/401 contracts passed');

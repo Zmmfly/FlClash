@@ -114,6 +114,15 @@ def adapt(root, overlay=OVERLAY):
                   'builder.pushClipRSuperellipse(corners.toRSuperellipse(rect));',
                   'builder.pushClipRSuperellipse(corners.toRSuperellipse(rect), clipBehavior: ui.Clip.antiAlias);')
 
+    replace_exact(root, 'lib/views/tools.dart',
+                  "import 'package:fl_clash/widgets/widgets.dart';",
+                  "import 'package:fl_clash/widgets/widgets.dart';\n"
+                  "import 'package:fl_clash/web_auth/account_view.dart';")
+    replace_exact(root, 'lib/views/tools.dart',
+                  '        const _GeneralItem(),',
+                  '        const _GeneralItem(),\n        if (webPanelBuild) const WebAccountItem(),')
+    merge_web_localizations(root)
+
     counts = {}
     for directory, rewrites in ((root / 'lib', LIB_IMPORT_REWRITES),
                                 (root / 'plugins/code_forge/lib', CODE_FORGE_IMPORT_REWRITES)):
@@ -133,6 +142,30 @@ def adapt(root, overlay=OVERLAY):
         if counts.get(pattern.pattern, 0) == 0:
             raise StageError(f'Import rewrite has no matching anchor: {pattern.pattern}')
     return counts
+
+
+def merge_web_localizations(root):
+    expected = None
+    for locale in ('en', 'zh_CN', 'ja', 'ru', 'fr', 'es', 'ko'):
+        source = root / 'core/webui' / f'intl_{locale}.arb'
+        if not source.is_file():
+            raise StageError(f'Missing Web account locale: {locale}')
+        messages = json.loads(source.read_text())
+        keys = set(messages)
+        if not keys or any(not key.startswith('web') or not isinstance(value, str) or not value
+                           for key, value in messages.items()):
+            raise StageError(f'Invalid Web account locale: {locale}')
+        if expected is not None and keys != expected:
+            raise StageError(f'Web account locale keys differ: {locale}')
+        expected = keys
+        destination = root / 'arb' / f'intl_{locale}.arb'
+        if not destination.is_file():
+            raise StageError(f'Missing native locale: {locale}')
+        original = json.loads(destination.read_text())
+        if keys & set(original):
+            raise StageError(f'Web account keys collide with native locale: {locale}')
+        original.update(messages)
+        destination.write_text(json.dumps(original, ensure_ascii=False, indent=2) + '\n')
 
 
 def validate_source(source):

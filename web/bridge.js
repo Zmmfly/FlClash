@@ -1,12 +1,25 @@
 'use strict';
 (() => {
+  let authMutation = false;
+  let pendingAuthRedirect = null;
+  let redirectedTo = null;
+  let unauthorizedDuringMutation = false;
+  function navigateTo(path) {
+    if (redirectedTo !== null) return;
+    redirectedTo = path;
+    window.location.replace(path);
+  }
   function sameOrigin(url) {
     if (new URL(url, window.location.href).origin !== window.location.origin) {
       throw new Error('Bridge requests must remain same-origin');
     }
   }
   function unauthorized() {
-    window.location.replace('/login');
+    if (authMutation || pendingAuthRedirect) {
+      unauthorizedDuringMutation = true;
+    } else {
+      navigateTo('/login');
+    }
     return JSON.stringify({ ok: false, status: 401, error: 'Authentication required' });
   }
   function failure(error) {
@@ -152,6 +165,7 @@
   const bridge = window.__flclashWeb;
   let sessionCheck;
   bridge.checkSession = function() {
+    if (authMutation || pendingAuthRedirect) return Promise.resolve(false);
     if (!sessionCheck) {
       sessionCheck = bridge.asyncJsonRequest('GET', '/api/auth/session', null)
         .then(raw => {
@@ -171,12 +185,42 @@
     socket.addEventListener('close', () => { void bridge.checkSession(); });
     return socket;
   };
-  bridge.logout = async function() {
-    const response = JSON.parse(await bridge.asyncJsonRequest('POST', '/api/auth/logout', null));
-    if (response.status === 401) return false;
-    if (response.status !== 204) throw new Error(response.error || 'Logout failed');
-    window.location.replace('/login');
-    return true;
+  bridge.accountMutation = async function(url, jsonBody) {
+    if (url !== '/api/auth/logout' && url !== '/api/auth/credentials') {
+      return failure(new Error('Unsupported account operation'));
+    }
+    if (authMutation || pendingAuthRedirect) {
+      return JSON.stringify({ ok: false, status: 409, error: 'operation_in_progress' });
+    }
+    authMutation = true;
+    unauthorizedDuringMutation = false;
+    try {
+      const raw = await bridge.asyncJsonRequest('POST', url, jsonBody);
+      const response = JSON.parse(raw);
+      const success = url === '/api/auth/logout' ? response.status === 204 :
+        response.status === 200 && JSON.parse(response.text || '{}').ok === true;
+      if (success) {
+        const warning = response.text && JSON.parse(response.text).warning === 'durability_unconfirmed';
+        pendingAuthRedirect = url === '/api/auth/credentials'
+          ? '/login?updated=1' + (warning ? '&warning=durability_unconfirmed' : '') : '/login';
+      } else if (response.status === 401 || unauthorizedDuringMutation) {
+        navigateTo('/login');
+      }
+      return raw;
+    } catch (error) {
+      if (unauthorizedDuringMutation) navigateTo('/login');
+      return failure(error);
+    } finally {
+      authMutation = false;
+    }
+  };
+  bridge.redirectAfterAuth = function(updated) {
+    const expected = updated ? '/login?updated=1' : '/login';
+    if (pendingAuthRedirect !== expected && !(updated &&
+        pendingAuthRedirect === '/login?updated=1&warning=durability_unconfirmed')) {
+      throw new Error('No matching successful account operation');
+    }
+    navigateTo(pendingAuthRedirect);
   };
   bridge.prepareSession = async function() {
     if (navigator.serviceWorker) {
@@ -193,22 +237,6 @@
       return false;
     }
     return bridge.checkSession();
-  };
-  bridge.mountShell = function() {
-    const chinese = (navigator.language || '').toLowerCase().startsWith('zh');
-    const button = document.getElementById('flclash-logout');
-    button.textContent = chinese ? '退出登录' : 'Log out';
-    button.setAttribute('aria-label', button.textContent);
-    button.onclick = async () => {
-      button.disabled = true;
-      try {
-        await bridge.logout();
-      } catch (error) {
-        document.getElementById('flclash-auth-status').textContent = chinese ? '退出失败，请重试' : 'Logout failed. Please retry.';
-      } finally {
-        button.disabled = false;
-      }
-    };
   };
   window.addEventListener('flutter-first-frame', () => {
     const loader = document.getElementById('flclash-loader');

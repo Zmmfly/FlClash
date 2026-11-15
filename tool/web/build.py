@@ -43,7 +43,7 @@ def scalar(text, name):
 
 
 def preflight():
-    for command in ('flutter', 'go'):
+    for command in ('flutter', 'dart', 'go'):
         if shutil.which(command) is None:
             raise StageError(f'Missing {command} on PATH; install the repository-pinned SDK/toolchain first')
     validate_source(ROOT)
@@ -93,8 +93,10 @@ def build(safe_mode=False):
     stage(ROOT, work)
     print(f'Isolated Web sources: {work}', flush=True)
     run(['flutter', 'pub', 'get'], cwd=work)
+    run(['dart', 'run', 'intl_utils:generate'], cwd=work)
     flutter_arguments = ['flutter', 'build', 'web', '--release', '--no-tree-shake-icons',
-                         '--dart-define=APP_ENV=stable', f'--build-name={version}']
+                         '--dart-define=APP_ENV=stable', '--dart-define=WEB_PANEL=true',
+                         f'--build-name={version}']
     if safe_mode:
         flutter_arguments.append('--dart-define=SAFE_MODE=true')
     run(flutter_arguments, cwd=work)

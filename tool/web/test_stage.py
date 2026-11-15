@@ -19,12 +19,13 @@ class WebStagingTests(unittest.TestCase):
         cls.base = Path(cls.temporary.name)
         cls.source = cls.base / 'checkout'
         cls.source.mkdir()
-        for directory in ('lib', 'plugins', 'web'):
+        for directory in ('lib', 'plugins', 'web', 'arb'):
             shutil.copytree(stage.ROOT / directory, cls.source / directory, ignore=stage.copy_ignore)
-        for directory in ('assets', 'arb', 'core/Clash.Meta', 'core/cmd/flclash-web/web_dist'):
+        for directory in ('assets', 'core/Clash.Meta', 'core/cmd/flclash-web/web_dist'):
             (cls.source / directory).mkdir(parents=True, exist_ok=True)
         for relative in stage.COPY_FILES:
             shutil.copyfile(stage.ROOT / relative, cls.source / relative)
+        shutil.copytree(stage.ROOT / 'core/webui', cls.source / 'core/webui')
         (cls.source / 'core/go.mod').write_text('module core\ngo 1.27.0\n')
         (cls.source / 'core/Clash.Meta/go.mod').write_text('module mihomo\ngo 1.27.0\n')
         (cls.source / 'core/cmd/flclash-web/main.go').write_text('package main\n')
@@ -59,6 +60,18 @@ class WebStagingTests(unittest.TestCase):
                 self.assertEqual(file.read_bytes(), (output / file.relative_to(self.source)).read_bytes())
         self.assertFalse((output / 'core/cmd/flclash-web/web_dist').exists())
         self.assertFalse((output / 'tool').exists())
+        self.assertFalse((self.source / 'lib/web_auth').exists())
+        self.assertNotIn('WebAccountItem', (self.source / 'lib/views/tools.dart').read_text())
+        self.assertIn('if (webPanelBuild) const WebAccountItem()', (output / 'lib/views/tools.dart').read_text())
+        self.assertIn("kIsWeb && bool.fromEnvironment('WEB_PANEL')",
+                      (output / 'lib/web_auth/build_flag.dart').read_text())
+        for locale in ('en', 'zh_CN', 'ja', 'ru', 'fr', 'es', 'ko'):
+            native = json.loads((self.source / 'arb' / f'intl_{locale}.arb').read_text())
+            staged = json.loads((output / 'arb' / f'intl_{locale}.arb').read_text())
+            web = json.loads((self.source / 'core/webui' / f'intl_{locale}.arb').read_text())
+            self.assertFalse(set(native) & set(web))
+            self.assertEqual(native, {key: staged[key] for key in native})
+            self.assertEqual(web, {key: staged[key] for key in web})
         self.assertTrue(json.loads((output / '.webpanel-stage.json').read_text())['import_rewrites'])
 
     def test_missing_anchor_fails_without_partial_output_or_source_mutation(self):
@@ -125,6 +138,8 @@ class WebStagingTests(unittest.TestCase):
         flutter = [call[0] for call in calls if call[0][:3] == ['flutter', 'build', 'web']]
         self.assertNotIn('--dart-define=SAFE_MODE=true', flutter[0])
         self.assertIn('--dart-define=SAFE_MODE=true', flutter[1])
+        self.assertTrue(all('--dart-define=WEB_PANEL=true' in arguments for arguments in flutter))
+        self.assertEqual(2, sum(arguments == ['dart', 'run', 'intl_utils:generate'] for arguments, _, _ in calls))
         for arguments, cwd, env in go:
             self.assertEqual('webpanel,with_gvisor', arguments[arguments.index('-tags') + 1])
             self.assertEqual('0', env['CGO_ENABLED'])

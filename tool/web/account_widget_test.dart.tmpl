@@ -1,0 +1,466 @@
+import 'dart:async';
+import 'dart:ui' show SemanticsFlag;
+
+import 'package:flutter/semantics.dart';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/features/form/form.dart';
+import 'package:fl_clash/ui/icons/icons.dart';
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/state.dart';
+import 'package:fl_clash/ui/ui.dart';
+import 'package:fl_clash/web_auth/account_view.dart';
+import 'package:fl_clash/web_auth/auth_client.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart' as runner;
+
+// WEBPANEL.md: Web-only account rows reuse PrismUI forms, feedback and lifecycle ownership.
+class FakeAuth implements WebAuthClient {
+  int updates = 0;
+  int logouts = 0;
+  int sessions = 0;
+  Object? updateError;
+  Object? logoutError;
+  Object? sessionError;
+  Completer<void>? updateWait;
+  Completer<void>? logoutWait;
+  Completer<String>? sessionWait;
+  String? sentCurrent;
+  String? sentUsername;
+  String? sentPassword;
+  final redirects = <bool>[];
+
+  @override
+  Future<String> username() async {
+    sessions++;
+    if (sessionWait != null) return sessionWait!.future;
+    if (sessionError != null) throw sessionError!;
+    return 'admin';
+  }
+
+  @override
+  Future<void> updateCredentials({
+    required String currentPassword,
+    required String username,
+    required String newPassword,
+  }) async {
+    updates++;
+    sentCurrent = currentPassword;
+    sentUsername = username;
+    sentPassword = newPassword;
+    if (updateWait != null) await updateWait!.future;
+    if (updateError != null) throw updateError!;
+  }
+
+  @override
+  Future<void> logout() async {
+    logouts++;
+    if (logoutWait != null) await logoutWait!.future;
+    if (logoutError != null) throw logoutError!;
+  }
+
+  @override
+  void redirectAfterAuth({required bool updated}) => redirects.add(updated);
+}
+
+Widget host(
+  Widget child, {
+  Brightness brightness = Brightness.light,
+  Locale locale = const Locale('en'),
+}) {
+  return PrismApp(
+    locale: locale,
+    theme: ThemeData(
+      colorScheme: seededColorScheme(
+        seedColor: const Color(0xff007aff),
+        brightness: brightness,
+      ),
+    ),
+    localizationsDelegates: const [
+      AppLocalizations.delegate,
+      AppUiLocalizations.delegate,
+      GlobalWidgetsLocalizations.delegate,
+    ],
+    supportedLocales: AppLocalizations.delegate.supportedLocales,
+    builder: (context, child) {
+      globalState.measure = MeasureScope.of(context);
+      final size = MediaQuery.sizeOf(context);
+      return ViewScope(size: size, isMobile: size.width < 600, child: child!);
+    },
+    home: child,
+  );
+}
+
+Future<void> size(WidgetTester tester, Size value) async {
+  tester.view.physicalSize = value;
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+}
+
+Future<void> openForm(WidgetTester tester, FakeAuth client) async {
+  await size(tester, const Size(1000, 900));
+  await tester.pumpWidget(host(WebAccountView(client: client)));
+  await tester.pumpAndSettle();
+  await tester.tap(find.byKey(const ValueKey('web-edit-account')));
+  await tester.pumpAndSettle();
+  expect(find.byType(WebCredentialsForm), findsOneWidget);
+  expect(find.byType(FormRow), findsNWidgets(4));
+}
+
+Finder field(String key) => find.descendant(
+  of: find.byKey(ValueKey(key)),
+  matching: find.byType(EditableText),
+);
+
+Future<void> enter(WidgetTester tester, String key, String value) async {
+  await tester.enterText(field(key), value);
+  await tester.pump();
+}
+
+Future<void> save(WidgetTester tester) async {
+  final button = find.widgetWithText(TextButton, 'Save');
+  await tester.tap(button);
+  await tester.pump();
+}
+
+class _ChromeBinding extends AutomatedTestWidgetsFlutterBinding {
+  @override
+  void reportExceptionNoticed(FlutterErrorDetails details) {
+    runner.registerException(
+      details.exception,
+      details.stack ?? StackTrace.current,
+    );
+  }
+}
+
+void main() {
+  _ChromeBinding();
+  testWidgets('Web account is a native-like glyph/list navigation entry', (
+    tester,
+  ) async {
+    expect(webPanelBuild, isTrue);
+    final client = FakeAuth();
+    await tester.pumpWidget(
+      host(
+        Scaffold(
+          title: 'Tools',
+          body: ListView(
+            children: [
+              generateSection(items: [WebAccountItem(client: client)]),
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(ListItem, 'Web account'), findsOneWidget);
+    expect(find.byType(GlyphIcon), findsWidgets);
+    await tester.tap(find.text('Web account'));
+    await tester.pumpAndSettle();
+    expect(find.byType(WebAccountView), findsOneWidget);
+    expect(find.text('admin'), findsOneWidget);
+    expect(client.sessions, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final brightness in Brightness.values) {
+    for (final width in [320.0, 1200.0]) {
+      testWidgets(
+        'account renders at $width in $brightness without overlays or overflow',
+        (tester) async {
+          await size(tester, Size(width, 900));
+          await tester.pumpWidget(
+            host(
+              WebAccountView(client: FakeAuth()),
+              brightness: brightness,
+              locale: const Locale('zh', 'CN'),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.text('Web账户'), findsOneWidget);
+          expect(find.byKey(const ValueKey('web-log-out')), findsOneWidget);
+          expect(
+            find.byKey(const ValueKey('web-edit-account')),
+            findsOneWidget,
+          );
+          expect(find.byType(ListItem), findsNWidgets(3));
+          expect(tester.takeException(), isNull);
+        },
+      );
+    }
+  }
+
+  for (final brightness in Brightness.values) {
+    for (final width in [320.0, 1200.0]) {
+      testWidgets(
+        'credential form fits $width in $brightness with localized fields',
+        (tester) async {
+          await size(tester, Size(width, 900));
+          await tester.pumpWidget(
+            host(
+              WebCredentialsForm(username: 'admin', client: FakeAuth()),
+              brightness: brightness,
+              locale: const Locale('ru'),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.byType(FormRow), findsNWidgets(4));
+          expect(find.byType(FormRowSecretTextField), findsNWidgets(3));
+          expect(tester.takeException(), isNull);
+        },
+      );
+    }
+  }
+
+  testWidgets(
+    'form textbox and reveal semantics never inherit a disabled row',
+    (tester) async {
+      final semantics = tester.ensureSemantics();
+      try {
+        await openForm(tester, FakeAuth());
+        void expectEnabledAncestors(Finder finder) {
+          SemanticsNode? node = tester.getSemantics(finder);
+          while (node != null) {
+            final data = node.getSemanticsData();
+            expect(
+              !data.hasFlag(SemanticsFlag.hasEnabledState) ||
+                  data.hasFlag(SemanticsFlag.isEnabled),
+              isTrue,
+              reason: 'Account form control inherited disabled semantics',
+            );
+            node = node.parent;
+          }
+        }
+
+        for (final entry in {
+          'web-current-password': 'Current password',
+          'web-username': 'Username',
+          'web-new-password': 'New password',
+          'web-confirm-password': 'Confirm new password',
+        }.entries) {
+          expectEnabledAncestors(field(entry.key));
+          expect(
+            tester.getSemantics(field(entry.key)).getSemanticsData().label,
+            entry.value,
+          );
+        }
+        final revealButtons = find.byType(IconButton).evaluate().where((
+          element,
+        ) {
+          final button = element.widget as IconButton;
+          return button.tooltip == 'Show password';
+        }).toList();
+        expect(revealButtons, hasLength(3));
+        for (final button in revealButtons) {
+          expectEnabledAncestors(find.byWidget(button.widget));
+        }
+        await tester.tap(find.text('Username').last);
+        await tester.pumpAndSettle();
+        expect(
+          tester.widget<EditableText>(field('web-username')).focusNode.hasFocus,
+          isTrue,
+        );
+      } finally {
+        semantics.dispose();
+      }
+    },
+  );
+
+  testWidgets(
+    'session loading and failure can retry without exposing account actions',
+    (tester) async {
+      final client = FakeAuth()..sessionWait = Completer<String>();
+      await tester.pumpWidget(host(WebAccountView(client: client)));
+      await tester.pump();
+      expect(find.byKey(const ValueKey('web-log-out')), findsNothing);
+      client.sessionWait!.completeError(
+        const WebAuthException('session_failed'),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Unable to load your account. Please retry.'),
+        findsOneWidget,
+      );
+      client.sessionWait = null;
+      await tester.tap(find.text('Retry'));
+      await tester.pumpAndSettle();
+      expect(find.text('admin'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'form validates current password, Unicode username, password length and confirmation',
+    (tester) async {
+      final client = FakeAuth();
+      await openForm(tester, client);
+      await save(tester);
+      await tester.pumpAndSettle();
+      expect(find.text('Enter your current password.'), findsOneWidget);
+      await enter(tester, 'web-current-password', '  current value  ');
+      await enter(tester, 'web-username', '😀' * 65);
+      await save(tester);
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Enter a username of 1–64 characters without line breaks.'),
+        findsOneWidget,
+      );
+      for (final username in ['\nadmin', 'admin\r']) {
+        tester.widget<EditableText>(field('web-username')).controller.text =
+            username;
+        await save(tester);
+        await tester.pumpAndSettle();
+        expect(
+          find.text('Enter a username of 1–64 characters without line breaks.'),
+          findsOneWidget,
+        );
+        expect(client.updates, 0);
+      }
+      await enter(tester, 'web-username', 'new-name');
+      await enter(tester, 'web-new-password', 'short');
+      await save(tester);
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Use 8–256 characters without line breaks, not only spaces.'),
+        findsOneWidget,
+      );
+      for (final password in [' ' * 8, 'p' * 257, 'long\npassword']) {
+        tester.widget<EditableText>(field('web-new-password')).controller.text =
+            password;
+        await save(tester);
+        await tester.pumpAndSettle();
+        expect(
+          find.text(
+            'Use 8–256 characters without line breaks, not only spaces.',
+          ),
+          findsOneWidget,
+        );
+        expect(client.updates, 0);
+      }
+      await enter(tester, 'web-new-password', '  valid password  ');
+      await enter(tester, 'web-confirm-password', 'different');
+      await save(tester);
+      await tester.pumpAndSettle();
+      expect(find.text('The new passwords do not match.'), findsOneWidget);
+      expect(client.updates, 0);
+      for (final count in [40, 64]) {
+        await enter(tester, 'web-username', '😀' * count);
+        await enter(tester, 'web-new-password', '');
+        await enter(tester, 'web-confirm-password', '');
+        await save(tester);
+        await tester.pumpAndSettle();
+        expect(client.sentUsername!.runes.length, count);
+      }
+      expect(client.sentCurrent, '  current value  ');
+      expect(client.sentPassword, '');
+      expect(client.redirects, [true, true]);
+    },
+  );
+
+  for (final error in [
+    ('invalid_current_password', 'The current password is incorrect.'),
+    (
+      'credentials_save_failed',
+      'Unable to save your account. Your current credentials still work.',
+    ),
+    ('rate_limited', 'Too many attempts. Please wait a minute and retry.'),
+  ]) {
+    testWidgets(
+      '${error.$1} preserves fields and permits retry without logout',
+      (tester) async {
+        final client = FakeAuth()..updateError = WebAuthException(error.$1);
+        await openForm(tester, client);
+        await enter(tester, 'web-current-password', 'current-password');
+        await save(tester);
+        await tester.pumpAndSettle();
+        expect(find.text(error.$2), findsOneWidget);
+        expect(
+          tester
+              .widget<EditableText>(field('web-current-password'))
+              .controller
+              .text,
+          'current-password',
+        );
+        expect(client.redirects, isEmpty);
+        expect(client.logouts, 0);
+        client.updateError = null;
+        await save(tester);
+        await tester.pumpAndSettle();
+        expect(client.updates, 2);
+        expect(client.redirects, [true]);
+      },
+    );
+  }
+
+  testWidgets(
+    'busy save rejects duplicate submit and safely completes after form disposal',
+    (tester) async {
+      final client = FakeAuth()..updateWait = Completer<void>();
+      await openForm(tester, client);
+      await enter(tester, 'web-current-password', 'current-password');
+      final formPage = tester.widget<FormPage>(find.byType(FormPage));
+      formPage.onSave();
+      formPage.onSave();
+      await tester.pump();
+      expect(client.updates, 1);
+      expect(tester.widget<FormPage>(find.byType(FormPage)).saving, isTrue);
+      final edits = tester
+          .widgetList<EditableText>(find.byType(EditableText))
+          .toList();
+      final before = edits.map((field) => field.controller.text).toList();
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      tester
+          .widget<FormRowSecretTextField>(
+            find.byKey(const ValueKey('web-confirm-password')),
+          )
+          .onFieldSubmitted
+          ?.call('');
+      await tester.pump();
+      expect(edits.every((field) => !field.focusNode.hasFocus), isTrue);
+      expect(edits.map((field) => field.controller.text).toList(), before);
+      expect(client.updates, 1);
+      await tester.pumpWidget(const SizedBox.shrink());
+      for (final field in edits) {
+        expect(() => field.controller.addListener(() {}), throwsFlutterError);
+      }
+      client.updateWait!.complete();
+      await tester.pump();
+      expect(client.redirects, [true]);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'logout requires confirmation, cleans busy state on failure and redirects only on success',
+    (tester) async {
+      final client = FakeAuth()
+        ..logoutError = const WebAuthException('request_failed');
+      await tester.pumpWidget(host(WebAccountView(client: client)));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('web-log-out')));
+      await tester.pumpAndSettle();
+      expect(client.logouts, 0);
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pumpAndSettle();
+      expect(client.logouts, 0);
+      await tester.tap(find.byKey(const ValueKey('web-log-out')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Log out'));
+      await tester.pumpAndSettle();
+      expect(find.text('The request failed. Please retry.'), findsOneWidget);
+      expect(client.redirects, isEmpty);
+      client.logoutError = null;
+      await tester.tap(find.byKey(const ValueKey('web-log-out')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Log out'));
+      await tester.pumpAndSettle();
+      expect(client.logouts, 2);
+      expect(client.redirects, [false]);
+    },
+  );
+}

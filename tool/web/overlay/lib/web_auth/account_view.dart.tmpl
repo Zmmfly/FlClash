@@ -1,0 +1,408 @@
+import 'dart:async';
+
+import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/features/form/form.dart';
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/ui/icons/icons.dart';
+import 'package:fl_clash/widgets/widgets.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+
+import 'auth_client.dart';
+import 'build_flag.dart';
+
+export 'build_flag.dart';
+
+class WebAccountItem extends StatelessWidget {
+  const WebAccountItem({super.key, this.client = const BridgeWebAuthClient()});
+
+  final WebAuthClient client;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!webPanelBuild) return const SizedBox.shrink();
+    return ListItem.open(
+      leading: const GlyphIcon(AppGlyphs.account),
+      title: Text(context.appLocalizations.webAccount),
+      widget: WebAccountView(client: client),
+    );
+  }
+}
+
+class WebAccountView extends StatefulWidget {
+  const WebAccountView({super.key, this.client = const BridgeWebAuthClient()});
+
+  final WebAuthClient client;
+
+  @override
+  State<WebAccountView> createState() => _WebAccountViewState();
+}
+
+class _WebAccountViewState extends State<WebAccountView> {
+  String? _username;
+  String? _error;
+  bool _loading = true;
+  bool _busy = false;
+  bool _modalOpen = false;
+
+  bool get _locked => _busy || _modalOpen;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final username = await widget.client.username();
+      if (mounted) setState(() => _username = username);
+    } catch (_) {
+      if (mounted) {
+        setState(() => _error = context.appLocalizations.webSessionError);
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _edit() async {
+    if (_locked || _username == null) return;
+    setState(() => _modalOpen = true);
+    try {
+      await showFormSheet<void>(
+        context: context,
+        builder: (_) =>
+            WebCredentialsForm(username: _username!, client: widget.client),
+      );
+    } finally {
+      if (mounted) setState(() => _modalOpen = false);
+    }
+  }
+
+  Future<void> _logout() async {
+    if (_locked) return;
+    setState(() {
+      _modalOpen = true;
+      _error = null;
+    });
+    try {
+      final l = context.appLocalizations;
+      final confirmed = await dialogs.showMessage(
+        context: context,
+        title: l.webLogout,
+        message: TextSpan(text: l.webLogoutConfirm),
+        confirmText: l.webLogout,
+        cancelText: l.webCancel,
+        destructive: true,
+      );
+      if (confirmed != true || !mounted) return;
+      setState(() => _busy = true);
+      await widget.client.logout();
+      widget.client.redirectAfterAuth(updated: false);
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = webAuthErrorMessage(context.appLocalizations, error),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _modalOpen = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = context.appLocalizations;
+    return Scaffold(
+      title: l.webAccount,
+      isLoading: _busy,
+      body: NullStatusSwitcher(
+        isLoading: _loading,
+        child: ListView(
+          padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(
+            top: context.sectionsTopPadding,
+            bottom: 20 + context.bottomInset,
+          ),
+          children: [
+            ErrorBanner(message: _error),
+            if (_username == null)
+              generateSection(
+                items: [
+                  ListItem(
+                    title: Text(l.webRetry),
+                    leading: const GlyphIcon(AppGlyphs.refresh),
+                    onTap: _loading ? null : _load,
+                  ),
+                ],
+              )
+            else ...[
+              generateSection(
+                footer: l.webAccountDescription,
+                items: [
+                  ListItem(
+                    leading: const GlyphIcon(AppGlyphs.account),
+                    title: Text(l.webUsername),
+                    subtitle: Text(
+                      _username!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  ListItem(
+                    key: const ValueKey('web-edit-account'),
+                    leading: const GlyphIcon(AppGlyphs.key),
+                    title: Text(l.webChangeCredentials),
+                    onTap: _locked ? null : _edit,
+                  ),
+                ],
+              ),
+              generateSection(
+                items: [
+                  ListItem(
+                    key: const ValueKey('web-log-out'),
+                    leading: const GlyphIcon(AppGlyphs.lockOpen),
+                    title: Text(
+                      l.webLogout,
+                      style: TextStyle(color: context.colorScheme.destructive),
+                    ),
+                    onTap: _locked ? null : _logout,
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+enum _CredentialField { current, username, password, confirmation }
+
+class WebCredentialsForm extends StatefulWidget {
+  const WebCredentialsForm({
+    super.key,
+    required this.username,
+    required this.client,
+  });
+
+  final String username;
+  final WebAuthClient client;
+
+  @override
+  State<WebCredentialsForm> createState() => _WebCredentialsFormState();
+}
+
+class _WebCredentialsFormState extends State<WebCredentialsForm> {
+  final _current = TextEditingController();
+  final _password = TextEditingController();
+  final _confirmation = TextEditingController();
+  final _currentFocus = FocusNode();
+  final _usernameFocus = FocusNode();
+  final _passwordFocus = FocusNode();
+  final _confirmationFocus = FocusNode();
+  late final TextEditingController _username;
+  bool _attempted = false;
+  bool _saving = false;
+  Object? _serverError;
+
+  @override
+  void initState() {
+    super.initState();
+    _username = TextEditingController(text: widget.username);
+  }
+
+  @override
+  void dispose() {
+    _current.dispose();
+    _username.dispose();
+    _password.dispose();
+    _confirmation.dispose();
+    _currentFocus.dispose();
+    _usernameFocus.dispose();
+    _passwordFocus.dispose();
+    _confirmationFocus.dispose();
+    super.dispose();
+  }
+
+  ({_CredentialField field, String message})? _issue(AppLocalizations l) {
+    if (_current.text.isEmpty) {
+      return (
+        field: _CredentialField.current,
+        message: l.webCurrentPasswordRequired,
+      );
+    }
+    final username = _username.text.trim();
+    if (username.isEmpty ||
+        username.runes.length > 64 ||
+        _username.text.contains(RegExp(r'[\r\n]'))) {
+      return (field: _CredentialField.username, message: l.webInvalidUsername);
+    }
+    final password = _password.text;
+    if (password.isNotEmpty &&
+        (password.trim().isEmpty ||
+            password.contains(RegExp(r'[\r\n]')) ||
+            password.runes.length < 8 ||
+            password.runes.length > 256)) {
+      return (
+        field: _CredentialField.password,
+        message: l.webInvalidNewPassword,
+      );
+    }
+    if (password != _confirmation.text) {
+      return (
+        field: _CredentialField.confirmation,
+        message: l.webPasswordMismatch,
+      );
+    }
+    return null;
+  }
+
+  void _changed(String _) {
+    if (_attempted || _serverError != null) setState(() => _serverError = null);
+  }
+
+  Future<void> _save() async {
+    if (_saving) return;
+    if (_issue(context.appLocalizations) != null) {
+      setState(() => _attempted = true);
+      return;
+    }
+    final currentPassword = _current.text;
+    final username = _username.text.trim();
+    final password = _password.text;
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _saving = true;
+      _serverError = null;
+    });
+    try {
+      await widget.client.updateCredentials(
+        currentPassword: currentPassword,
+        username: username,
+        newPassword: password,
+      );
+      widget.client.redirectAfterAuth(updated: true);
+    } catch (error) {
+      if (mounted) setState(() => _serverError = error);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = context.appLocalizations;
+    final issue = _attempted ? _issue(l) : null;
+    final serverError = _serverError;
+    return PopScope(
+      canPop: !_saving,
+      child: FormPage(
+        title: l.webChangeCredentials,
+        saveLabel: l.webSave,
+        saving: _saving,
+        onSave: () => unawaited(_save()),
+        error:
+            issue?.message ??
+            (serverError == null ? null : webAuthErrorMessage(l, serverError)),
+        children: [
+          FocusScope(
+            canRequestFocus: !_saving,
+            child: IgnorePointer(
+              ignoring: _saving,
+              child: generateSection(
+                footer: l.webKeepPassword,
+                items: [
+                  FormRow(
+                    title: l.webCurrentPassword,
+                    onPressed: _saving ? null : _currentFocus.requestFocus,
+                    invalid:
+                        issue?.field == _CredentialField.current ||
+                        serverError is WebAuthException &&
+                            serverError.code == 'invalid_current_password',
+                    trailing: Semantics(
+                      label: l.webCurrentPassword,
+                      child: FormRowSecretTextField(
+                        key: const ValueKey('web-current-password'),
+                        focusNode: _currentFocus,
+                        controller: _current,
+                        textInputAction: TextInputAction.next,
+                        onChanged: _changed,
+                      ),
+                    ),
+                  ),
+                  FormRow(
+                    title: l.webUsername,
+                    onPressed: _saving ? null : _usernameFocus.requestFocus,
+                    invalid: issue?.field == _CredentialField.username,
+                    trailing: Semantics(
+                      label: l.webUsername,
+                      child: FormRowTextField(
+                        key: const ValueKey('web-username'),
+                        focusNode: _usernameFocus,
+                        controller: _username,
+                        autocorrect: false,
+                        textInputAction: TextInputAction.next,
+                        onChanged: _changed,
+                      ),
+                    ),
+                  ),
+                  FormRow(
+                    title: l.webNewPassword,
+                    onPressed: _saving ? null : _passwordFocus.requestFocus,
+                    invalid: issue?.field == _CredentialField.password,
+                    trailing: Semantics(
+                      label: l.webNewPassword,
+                      child: FormRowSecretTextField(
+                        key: const ValueKey('web-new-password'),
+                        focusNode: _passwordFocus,
+                        controller: _password,
+                        textInputAction: TextInputAction.next,
+                        onChanged: _changed,
+                      ),
+                    ),
+                  ),
+                  FormRow(
+                    title: l.webConfirmPassword,
+                    onPressed: _saving ? null : _confirmationFocus.requestFocus,
+                    invalid: issue?.field == _CredentialField.confirmation,
+                    trailing: Semantics(
+                      label: l.webConfirmPassword,
+                      child: FormRowSecretTextField(
+                        key: const ValueKey('web-confirm-password'),
+                        focusNode: _confirmationFocus,
+                        controller: _confirmation,
+                        textInputAction: TextInputAction.done,
+                        onChanged: _changed,
+                        onFieldSubmitted: (_) => unawaited(_save()),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Text(
+              l.webCredentialsHelp,
+              style: AppTextStyle.footnote
+                  .of(context)
+                  .copyWith(color: context.colorScheme.onSurfaceVariant),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

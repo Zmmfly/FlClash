@@ -1,0 +1,104 @@
+import 'dart:convert';
+import 'dart:js_interop';
+
+import 'package:fl_clash/l10n/l10n.dart';
+import 'package:fl_clash/web_shim/js_bridge.dart';
+
+@JS('window.__flclashWeb.accountMutation')
+external JSPromise<JSString> _accountMutation(JSString url, JSString? body);
+
+@JS('window.__flclashWeb.redirectAfterAuth')
+external void _redirectAfterAuth(JSBoolean updated);
+
+class WebAuthException implements Exception {
+  const WebAuthException(this.code);
+
+  final String code;
+
+  @override
+  String toString() => 'WebAuthException($code)';
+}
+
+abstract interface class WebAuthClient {
+  Future<String> username();
+  Future<void> logout();
+  Future<void> updateCredentials({
+    required String currentPassword,
+    required String username,
+    required String newPassword,
+  });
+  void redirectAfterAuth({required bool updated});
+}
+
+class BridgeWebAuthClient implements WebAuthClient {
+  const BridgeWebAuthClient();
+
+  @override
+  Future<String> username() async {
+    final response = await JsBridge.asyncJsonRequest(
+      'GET',
+      '/api/auth/session',
+    );
+    if (response['ok'] != true || response['username'] is! String) {
+      throw const WebAuthException('session_failed');
+    }
+    return response['username'] as String;
+  }
+
+  Future<void> _mutate(
+    String path,
+    Map<String, String>? body,
+    int expected,
+  ) async {
+    final raw = (await _accountMutation(
+      path.toJS,
+      body == null ? null : jsonEncode(body).toJS,
+    ).toDart).toDart;
+    final response = jsonDecode(raw) as Map<String, dynamic>;
+    final text = response['text'] as String? ?? '';
+    final data = text.isEmpty ? <String, dynamic>{} : _decodeBody(text);
+    if (response['status'] != expected ||
+        (expected == 200 && data['ok'] != true)) {
+      throw WebAuthException(data['error']?.toString() ?? 'request_failed');
+    }
+  }
+
+  Map<String, dynamic> _decodeBody(String text) {
+    try {
+      return jsonDecode(text) as Map<String, dynamic>;
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  @override
+  Future<void> logout() => _mutate('/api/auth/logout', null, 204);
+
+  @override
+  Future<void> updateCredentials({
+    required String currentPassword,
+    required String username,
+    required String newPassword,
+  }) => _mutate('/api/auth/credentials', {
+    'currentPassword': currentPassword,
+    'username': username,
+    'newPassword': newPassword,
+  }, 200);
+
+  @override
+  void redirectAfterAuth({required bool updated}) {
+    _redirectAfterAuth(updated.toJS);
+  }
+}
+
+String webAuthErrorMessage(AppLocalizations l, Object error) {
+  if (error is! WebAuthException) return l.webRequestFailed;
+  return switch (error.code) {
+    'invalid_current_password' => l.webInvalidCurrentPassword,
+    'invalid_credentials' => l.webInvalidCredentials,
+    'credentials_save_failed' => l.webCredentialsSaveFailed,
+    'rate_limited' => l.webRateLimited,
+    'session_failed' => l.webSessionError,
+    _ => l.webRequestFailed,
+  };
+}
