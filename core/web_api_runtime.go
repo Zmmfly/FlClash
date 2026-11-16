@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,19 @@ type WebAPIRuntime struct {
 type webRuntimeHTTPRoute struct {
 	method string
 	serve  http.HandlerFunc
+}
+
+// Kept in step with ipInfoSources in lib/common/service_probe.dart, which owns
+// the parsers; anything else would turn the probe into an HTTP relay.
+var webRuntimeOutboundIPSources = []string{
+	"https://www.cloudflare.com/cdn-cgi/trace",
+	"https://api.ip.sb/geoip",
+	"https://ipinfo.io/json",
+	"https://ipwho.is",
+	"https://get.geojs.io/v1/ip/geo.json",
+	"https://api.country.is",
+	"https://api.ipquery.io/?format=json",
+	"https://ident.me/json",
 }
 
 func NewWebAPIRuntime(store *WebAPIStore, backend WebAPIRuntimeBackend) (*WebAPIRuntime, error) {
@@ -509,13 +523,11 @@ func (rt *WebAPIRuntime) registerRoutes() {
 		if err := webRuntimeTimeout(p.TimeoutMillis, 10000); err != nil {
 			return nil, err
 		}
-		if len(p.URLs) < 1 || len(p.URLs) > 4 {
-			return nil, webAPIError(400, "invalid_sources", "one to four known IP sources are required")
+		if len(p.URLs) < 1 || len(p.URLs) > len(webRuntimeOutboundIPSources) {
+			return nil, webAPIError(400, "invalid_sources", "between one and every known IP source is required")
 		}
 		for _, u := range p.URLs {
-			switch u {
-			case "https://www.cloudflare.com/cdn-cgi/trace", "https://api.ip.sb/geoip", "https://ipinfo.io/json", "https://ipwho.is":
-			default:
+			if !slices.Contains(webRuntimeOutboundIPSources, u) {
 				return nil, webAPIError(400, "invalid_sources", "unknown outbound IP source")
 			}
 		}
