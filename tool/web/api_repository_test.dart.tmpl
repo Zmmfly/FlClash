@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:fl_clash/common/common.dart' hide snowflake, uniqueId, uuidV4;
 import 'package:fl_clash/features/form/form.dart' show RuleForm;
+import 'package:fl_clash/features/form/rule_preset.dart' show RulePreset;
 import 'package:fl_clash/l10n/l10n.dart';
 import 'package:fl_clash/manager/theme_manager.dart';
 import 'package:fl_clash/state.dart';
@@ -1661,6 +1662,31 @@ void main() {
       expect(server.profiles.single['currentGroupName'], 'GLOBAL');
       expect(page.read()!.currentGroupName, 'GLOBAL');
       expect(page.read()!.unfoldSet, {'Proxy'});
+    },
+  );
+
+  test(
+    'api-client-contract rule quick actions add presets without an editor version',
+    () async {
+      final previous = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() => db.database = previous);
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      container.listen(providers.globalRulesProvider, (_, _) {});
+      final before = await container.read(
+        providers.globalRulesProvider.future,
+      );
+      await container
+          .read(providers.globalRulesProvider.notifier)
+          .putAll(RulePreset.blockDot.rules);
+      final replace = server.requests.singleWhere(
+        (r) => r.path == '/api/v1/rules:replace',
+      );
+      expect(
+        jsonDecode(replace.body!)['rules'] as List,
+        hasLength(before.length + 1),
+      );
     },
   );
 

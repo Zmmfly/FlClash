@@ -420,7 +420,9 @@ mixin _RuleListMixin on _Committed<List<Rule>> {
       submit(() => persistRule(rule, editVersion: editVersion));
 
   Future<void> putAll(List<Rule> rules, {ApiEditVersion? editVersion}) {
-    final version = _needVersion(editVersion);
+    final version =
+        editVersion ??
+        database.repository.captureEditVersion(ApiIdentity.rule, value);
     final next = [...rules, ...value];
     return submit(() async {
       await database.repository.replaceRules(
