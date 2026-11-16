@@ -208,7 +208,7 @@ func webRuntimeNativeExternalProviders(ctx context.Context) ([]WebAPIRuntimeExte
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if native.VehicleType() == cp.Compatible {
+		if native.VehicleType() == cp.Compatible || native.VehicleType() == cp.Inline {
 			return nil
 		}
 		provider, err := toExternalProvider(native)
