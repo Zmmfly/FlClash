@@ -226,16 +226,12 @@ class WebSettingsController {
   Future<Config> _fetch() async {
     final epoch = _epoch;
     for (var attempt = 0; attempt < 3; attempt++) {
-      final pending = repository.pendingOperation;
-      if (pending != null) {
-        throw WebApiPendingOperationException(pending.operationId);
-      }
+      // The read waits for commands already in flight and fails only on an
+      // operation still unresolved after them.
       final receipt = await repository.readExternal('/api/v1/settings');
       if (_closed || epoch != _epoch) throw const WebApiSessionException();
-      if (repository.pendingOperation case final pending?) {
-        throw WebApiPendingOperationException(pending.operationId);
-      }
-      if (compareApiRevisions(receipt.revision, repository.revision!) < 0) {
+      if (repository.pendingOperation != null ||
+          compareApiRevisions(receipt.revision, repository.revision!) < 0) {
         continue;
       }
       final data = _decode(receipt.data);

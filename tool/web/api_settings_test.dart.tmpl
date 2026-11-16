@@ -332,6 +332,40 @@ void main() {
   );
 
   test(
+    'api-settings-contract: a refresh waits for an in-flight command instead of failing with operation_pending',
+    () async {
+      final backend = _SettingsBackend();
+      final (repository, settings, transport, _, failures) = await _fixture(
+        backend,
+      );
+      final started = Completer<void>();
+      final gate = Completer<void>();
+      transport.postStarted = started;
+      transport.replyGate = gate;
+      final saved = settings.update<PatchClashConfig>(
+        WebSettingsSection.patch,
+        (value) => value.copyWith(mode: Mode.global),
+      );
+      await started.future;
+      expect(repository.pendingOperation, isNotNull);
+      var settled = false;
+      final refreshed = settings.load(refresh: true);
+      unawaited(
+        refreshed.then(
+          (_) => settled = true,
+          onError: (Object _) => settled = true,
+        ),
+      );
+      await pumpEventQueue();
+      expect(settled, isFalse);
+      gate.complete();
+      await saved;
+      expect((await refreshed).patchClashConfig.mode, Mode.global);
+      expect(failures, isEmpty);
+    },
+  );
+
+  test(
     'api-settings-contract: two sessions use original CAS and refetch on a rejected edit',
     () async {
       final backend = _SettingsBackend();
