@@ -377,7 +377,9 @@ func (tx *WebAPIWriteTx) UpdateProfile(id WebAPIID, input WebAPIProfileInput) (W
 		return profile, webAPIError(409, "immutable_profile_type", "profile type is immutable")
 	}
 	if profile.Label != input.Label {
-		return profile, webAPIError(409, "rename_required", "use the atomic profile rename command")
+		if profile, err = tx.RenameProfile(id, input.Label); err != nil {
+			return profile, err
+		}
 	}
 	if err = webAPIValidateSelectionNames(input); err != nil {
 		return profile, err
