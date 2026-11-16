@@ -681,7 +681,9 @@ func (rt *WebAPIRuntime) bindResources(root map[string]any, snapshot webRuntimeS
 				if err = doc.Decode(&payload); err != nil {
 					return err
 				}
-				if err = webRuntimePathPolicy(payload, ""); err != nil {
+				// Only the proxies reach the core; a subscription's own
+				// controller or file settings are dropped, not enforced.
+				if err = webRuntimePathPolicy(payload["proxies"], ""); err != nil {
 					return err
 				}
 				data, err := webRuntimeMarshalYAML(map[string]any{"proxies": payload["proxies"]})
