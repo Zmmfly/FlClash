@@ -599,6 +599,34 @@ func webRuntimePathPolicy(value any, context string) error {
 	return nil
 }
 
+// Bound profiles never refresh, so inlining lets dialer checks see through them.
+func webRuntimeInlineProfileProviders(root map[string]any, snapshot webRuntimeSnapshot) error {
+	declared, _ := root["proxy-providers"].(map[string]any)
+	for name, raw := range declared {
+		mapping, _ := raw.(map[string]any)
+		source, bound := snapshot.Profiles[name]
+		if mapping == nil || !bound || mapping["type"] == "inline" {
+			continue
+		}
+		doc, err := webRuntimeDocument(source.Plain)
+		if err != nil {
+			return err
+		}
+		var payload map[string]any
+		if err = doc.Decode(&payload); err != nil {
+			return err
+		}
+		proxies, _ := payload["proxies"].([]any)
+		if proxies == nil {
+			proxies = []any{}
+		}
+		mapping["type"], mapping["payload"] = "inline", proxies
+		delete(mapping, "path")
+		delete(mapping, "interval")
+	}
+	return nil
+}
+
 func (rt *WebAPIRuntime) bindResources(root map[string]any, snapshot webRuntimeSnapshot, materialize bool) error {
 	for _, category := range []string{"proxy-providers", "rule-providers"} {
 		declared, ok := root[category].(map[string]any)
@@ -681,8 +709,6 @@ func (rt *WebAPIRuntime) bindResources(root map[string]any, snapshot webRuntimeS
 				if err = doc.Decode(&payload); err != nil {
 					return err
 				}
-				// Only the proxies reach the core; a subscription's own
-				// controller or file settings are dropped, not enforced.
 				if err = webRuntimePathPolicy(payload["proxies"], ""); err != nil {
 					return err
 				}
@@ -790,6 +816,9 @@ func (rt *WebAPIRuntime) prepareApply(ctx context.Context, p WebAPIRuntimeApplyR
 	}
 	providers := webRuntimeProviderWitnesses(root, snapshot)
 	external := webRuntimeExternalProvenanceFor(root, snapshot)
+	if err = webRuntimeInlineProfileProviders(root, snapshot); err != nil {
+		return prepared, result, err
+	}
 	bound, err := webRuntimeMarshalYAML(root)
 	if err != nil {
 		return prepared, result, err
