@@ -149,8 +149,9 @@ class ApiModelCodec {
       ..remove('id')
       ..remove('profileId')
       ..remove('order')
-      ..remove('memberLayout');
-    return {'definition': definition, 'memberLayout': value.memberLayout};
+      ..remove('memberLayout')
+      ..removeWhere((_, value) => value == null);
+    return {'definition': definition, 'memberLayout': ?value.memberLayout};
   }
 
   CustomProxy customProxy(Object? value) {

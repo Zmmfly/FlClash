@@ -1431,6 +1431,10 @@ void main() {
         (repository.codec.proxyGroupInput(group)['definition'] as Map)['use'],
         ['9223372036854775807'],
       );
+      // The server's strict decoder rejects null for any non-pointer field.
+      final input = repository.codec.proxyGroupInput(group);
+      expect(input.containsKey('memberLayout'), isFalse);
+      expect((input['definition'] as Map).values, isNot(contains(null)));
     },
   );
 
