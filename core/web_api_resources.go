@@ -249,7 +249,39 @@ func (tx *WebAPIReadTx) validateProfileFields(p WebAPIProfileInput) error {
 	if p.OverridesRawDocument != nil && p.Overrides != nil {
 		return webAPIError(400, "invalid_overrides", "unreadable overrides cannot also contain a decoded object")
 	}
+	return webAPIValidateSelectionNames(p)
+}
+
+func webAPIValidateSelectionNames(p WebAPIProfileInput) error {
+	if p.CurrentGroupName != nil && *p.CurrentGroupName != "" && !webAPICatalogName(*p.CurrentGroupName) {
+		return webAPIError(400, "invalid_selection", "current group name is invalid")
+	}
+	for group, target := range p.SelectedMap {
+		if !webAPICatalogName(group) || target != "" && !webAPICatalogName(target) {
+			return webAPIError(400, "invalid_selection", "remembered selection has an invalid name")
+		}
+	}
 	return nil
+}
+
+// A refresh may rename what a profile remembers; as in the native client, only a written selection is checked.
+func webAPIChangedSelections(stored, input WebAPIProfileInput) WebAPIProfileInput {
+	changed := map[string]string{}
+	for group, target := range input.SelectedMap {
+		if previous, exists := stored.SelectedMap[group]; !exists || previous != target {
+			changed[group] = target
+		}
+	}
+	input.SelectedMap = changed
+	if input.CurrentGroupName != nil && stored.CurrentGroupName != nil && *input.CurrentGroupName == *stored.CurrentGroupName {
+		input.CurrentGroupName = nil
+	}
+	return input
+}
+
+func webAPIWithoutSelections(input WebAPIProfileInput) WebAPIProfileInput {
+	input.CurrentGroupName, input.SelectedMap = nil, nil
+	return input
 }
 
 func (tx *WebAPIReadTx) validateProfile(p WebAPIProfileInput, id WebAPIID) error {
@@ -274,20 +306,8 @@ func (tx *WebAPIReadTx) validateProfile(p WebAPIProfileInput, id WebAPIID) error
 		}
 	}
 	if p.CurrentGroupName != nil && *p.CurrentGroupName != "" || len(p.SelectedMap) > 0 {
-		catalog, err := tx.ProfileCatalog(id)
-		if err != nil {
+		if _, err := tx.ProfileCatalog(id); err != nil {
 			return webAPIError(409, "catalog_unavailable", "profile selection requires a group catalog")
-		}
-		if p.CurrentGroupName != nil && *p.CurrentGroupName != "" {
-			if _, exists := catalog.GroupMembers[*p.CurrentGroupName]; !exists {
-				return webAPIError(409, "invalid_reference", "current group is absent from the profile catalog")
-			}
-		}
-		for group, target := range p.SelectedMap {
-			members, exists := catalog.GroupMembers[group]
-			if !exists || !webAPIContains(members, target) {
-				return webAPIError(409, "invalid_reference", "selected target is not a member of the named group")
-			}
 		}
 	}
 	seen := map[string]bool{}
@@ -359,7 +379,10 @@ func (tx *WebAPIWriteTx) UpdateProfile(id WebAPIID, input WebAPIProfileInput) (W
 	if profile.Label != input.Label {
 		return profile, webAPIError(409, "rename_required", "use the atomic profile rename command")
 	}
-	if err = tx.validateProfile(input, id); err != nil {
+	if err = webAPIValidateSelectionNames(input); err != nil {
+		return profile, err
+	}
+	if err = tx.validateProfile(webAPIChangedSelections(profile.WebAPIProfileInput, input), id); err != nil {
 		return profile, err
 	}
 	profile.WebAPIProfileInput = input

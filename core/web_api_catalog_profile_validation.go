@@ -351,8 +351,11 @@ func webAPIReadProfileCandidate(tx *WebAPIReadTx, id WebAPIID, input WebAPIProfi
 }
 
 func ValidateWebAPIProfileInput(tx *WebAPIReadTx, id WebAPIID, input WebAPIProfileInput) error {
-	_, err := webAPIReadProfileCandidate(tx, id, input, NewWebAPICatalogReadBudget(webAPICatalogScopedReadBytes))
-	return err
+	candidate, err := webAPIReadProfileCandidate(tx, id, input, NewWebAPICatalogReadBudget(webAPICatalogScopedReadBytes))
+	if err != nil || candidate.graph == nil {
+		return err
+	}
+	return webAPIValidateWrittenSelections(input, candidate.graph)
 }
 
 func webAPICatalogPolicyError(err error, id WebAPIID) error {

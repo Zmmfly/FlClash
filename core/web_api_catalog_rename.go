@@ -221,6 +221,22 @@ func webAPIRenameCatalogReferences(tx *WebAPIWriteTx, kind string, ownerID WebAP
 	return nil
 }
 
+// An undeclared GLOBAL selects among every group of the profile and every proxy those groups list.
+func webAPIRenameSelects(members map[string][]string, group, value string) bool {
+	if explicit, declared := members[group]; declared || group != "GLOBAL" {
+		return webAPIContains(explicit, value)
+	}
+	if _, isGroup := members[value]; isGroup {
+		return true
+	}
+	for _, proxies := range members {
+		if webAPIContains(proxies, value) {
+			return true
+		}
+	}
+	return false
+}
+
 func webAPIRenameProfileCatalogReferences(profile *WebAPIProfile, kind string, names map[string]string, members map[string][]string) error {
 	if webAPIUnreadable(profile.WebAPIProfileInput) {
 		return webAPIError(409, "unreadable_overrides", "cannot safely rewrite references through unreadable profile overrides")
@@ -228,7 +244,7 @@ func webAPIRenameProfileCatalogReferences(profile *WebAPIProfile, kind string, n
 	if kind == "group" || kind == "custom-proxy" {
 		picks := make(map[string]string, len(profile.SelectedMap))
 		for group, value := range profile.SelectedMap {
-			if webAPIContains(members[group], value) {
+			if webAPIRenameSelects(members, group, value) {
 				if next, exists := names[value]; exists {
 					value = next
 				}

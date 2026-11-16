@@ -202,19 +202,27 @@ func settingsTestProfiles(t *testing.T, fixture *settingsHTTPFixture) (WebAPIID,
 	t.Helper()
 	var first, second WebAPIProfile
 	receipt, err := fixture.store.Transaction(context.Background(), WebAPIMutation{ExpectedRevision: "0", OperationID: "seedprofiles"}, "test:profiles", struct{}{}, func(tx *WebAPIWriteTx) (any, error) {
+		// Selector membership is read from each profile's own source, as a real import stores it.
+		seed := func(label, member string) (WebAPIProfile, error) {
+			profile, err := tx.CreateProfile(WebAPIProfileInput{Type: "file", Label: label})
+			if err != nil {
+				return profile, err
+			}
+			source := []byte("proxies:\n  - {name: " + member + ", type: socks5, server: 192.0.2.1, port: 1080}\nproxy-groups:\n  - {name: G, type: select, proxies: [" + member + "]}\nrules: [\"MATCH,G\"]\n")
+			_, catalog, err := webContentProfile(source, "")
+			if err != nil {
+				return profile, err
+			}
+			if err = tx.PutContent(WebAPIContent{Key: WebAPIContentKey{Kind: WebAPIContentProfile, ID: profile.ID}, MediaType: "application/yaml", Bytes: source}); err != nil {
+				return profile, err
+			}
+			return profile, tx.SetProfileCatalog(profile.ID, catalog)
+		}
 		var err error
-		first, err = tx.CreateProfile(WebAPIProfileInput{Type: "custom", Label: "one"})
-		if err != nil {
+		if first, err = seed("one", "A"); err != nil {
 			return nil, err
 		}
-		second, err = tx.CreateProfile(WebAPIProfileInput{Type: "custom", Label: "two"})
-		if err != nil {
-			return nil, err
-		}
-		if err = tx.SetProfileCatalog(first.ID, WebAPIProfileCatalog{OutboundNames: []string{"G", "A", "DIRECT"}, GroupMembers: map[string][]string{"G": {"A", "DIRECT"}}}); err != nil {
-			return nil, err
-		}
-		if err = tx.SetProfileCatalog(second.ID, WebAPIProfileCatalog{OutboundNames: []string{"G", "B"}, GroupMembers: map[string][]string{"G": {"B"}}}); err != nil {
+		if second, err = seed("two", "B"); err != nil {
 			return nil, err
 		}
 		return []WebAPIProfile{first, second}, nil
@@ -281,6 +289,20 @@ func TestWebAPISettingsHTTPCurrentProfileFKAndCrossProfileSelection(t *testing.T
 	if status != 200 {
 		t.Fatal("explicit clear rejected")
 	}
+	status, _, _ = fixture.request(t, client, "POST", "/api/v1/settings:selected-map", fmt.Sprintf(`{"expectedRevision":"5","operationId":"globalone001","profileId":%q,"groupName":"GLOBAL","proxyName":"G"}`, first), "one")
+	if status != 200 {
+		t.Fatal("implicit GLOBAL selector rejected")
+	}
+	status, body, _ = fixture.request(t, client, "POST", "/api/v1/settings:selected-map", fmt.Sprintf(`{"expectedRevision":"6","operationId":"globalbad001","profileId":%q,"groupName":"GLOBAL","proxyName":"B"}`, first), "one")
+	if status != 409 {
+		t.Fatal("GLOBAL accepted another profile's member")
+	}
+	settingsTestError(t, body, "invalid_selection")
+	status, body, _ = fixture.request(t, client, "POST", "/api/v1/settings:selected-map", fmt.Sprintf(`{"expectedRevision":"6","operationId":"missinggrp01","profileId":%q,"groupName":"Absent","proxyName":"A"}`, first), "one")
+	if status != 409 {
+		t.Fatal("undeclared group accepted")
+	}
+	settingsTestError(t, body, "invalid_group")
 }
 
 type settingsLostResponse struct {

@@ -326,7 +326,7 @@ func (s *WebAPIContentService) ImportCustom(ctx context.Context, request WebAPIC
 		if err = RefreshWebAPICatalog(tx); err != nil {
 			return nil, err
 		}
-		if err = tx.validateProfile(profile.WebAPIProfileInput, profile.ID); err != nil {
+		if err = tx.validateProfile(webAPIWithoutSelections(profile.WebAPIProfileInput), profile.ID); err != nil {
 			return nil, err
 		}
 		rules, err := tx.OwnedRules(&request.ID)

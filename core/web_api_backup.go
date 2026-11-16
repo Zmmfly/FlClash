@@ -409,7 +409,10 @@ func webBackupValidateStoredCandidate(tx *WebAPIWriteTx) error {
 		return err
 	}
 	for _, p := range profiles {
-		if err = tx.validateProfile(p.WebAPIProfileInput, p.ID); err != nil {
+		if err = webAPIValidateSelectionNames(p.WebAPIProfileInput); err != nil {
+			return err
+		}
+		if err = tx.validateProfile(webAPIWithoutSelections(p.WebAPIProfileInput), p.ID); err != nil {
 			return err
 		}
 	}

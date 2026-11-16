@@ -556,6 +556,31 @@ func webAPIValidateCatalogProfileReferences(profile WebAPIProfile, raw *config.R
 	return webAPIValidateCatalogProfileReferencesMode(profile, raw, catalog, graph, false)
 }
 
+func webAPIValidateWrittenSelections(input WebAPIProfileInput, graph *dependencyGraph) error {
+	if input.CurrentGroupName != nil && *input.CurrentGroupName != "" {
+		node, exists := graph.roots[*input.CurrentGroupName]
+		if !exists || graph.nodes[node].ref.Kind != "group" {
+			return webAPIError(409, "invalid_reference", "profile current group is absent from the candidate")
+		}
+	}
+	for group, target := range input.SelectedMap {
+		if target == "" {
+			continue
+		}
+		members, ready, err := webAPICatalogGroupMembers(graph, group)
+		if err != nil {
+			return err
+		}
+		if !webAPIContains(members, target) {
+			if !ready {
+				return webAPIError(409, "catalog_unavailable", "provider members are not prepared; saved selection cannot be validated")
+			}
+			return webAPIError(409, "invalid_reference", "profile selection is absent from the group's selectable members")
+		}
+	}
+	return nil
+}
+
 func webAPIValidateCatalogProfileReferencesMode(profile WebAPIProfile, raw *config.RawConfig, catalog WebAPIProfileCatalog, graph *dependencyGraph, allowUnknown bool) error {
 	if err := webAPIValidateGroupProviderNamespace(raw, graph); err != nil {
 		return err
@@ -583,30 +608,6 @@ func webAPIValidateCatalogProfileReferencesMode(profile WebAPIProfile, raw *conf
 	}
 	if profile.MatchTarget != nil && *profile.MatchTarget != "" && !validTarget(*profile.MatchTarget) {
 		return webAPIError(409, "invalid_reference", "profile MATCH target is absent from the candidate")
-	}
-	if profile.CurrentGroupName != nil && *profile.CurrentGroupName != "" {
-		node, exists := graph.roots[*profile.CurrentGroupName]
-		if !exists || graph.nodes[node].ref.Kind != "group" {
-			return webAPIError(409, "invalid_reference", "profile current group is absent from the candidate")
-		}
-	}
-	for group, target := range profile.SelectedMap {
-		if target == "" {
-			continue
-		}
-		members, ready, err := webAPICatalogGroupMembers(graph, group)
-		if err != nil {
-			return err
-		}
-		if !webAPIContains(members, target) {
-			if !ready {
-				if allowUnknown {
-					continue
-				}
-				return webAPIError(409, "catalog_unavailable", "provider members are not prepared; saved selection cannot be validated")
-			}
-			return webAPIError(409, "invalid_reference", "profile selection is absent from the group's selectable members")
-		}
 	}
 	if profile.Overrides == nil {
 		return nil

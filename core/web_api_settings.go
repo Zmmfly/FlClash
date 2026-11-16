@@ -410,16 +410,23 @@ func ApplyWebAPISettingsSelectedMap(tx *WebAPIWriteTx, command WebAPISettingsSel
 	if err != nil {
 		return result, webAPIError(409, "invalid_reference", "selected profile does not exist")
 	}
-	catalog, err := tx.ProfileCatalog(command.ProfileID)
-	if err != nil || catalog.GroupMembers == nil {
+	if _, err = tx.ProfileCatalog(command.ProfileID); err != nil {
 		return result, webAPIError(409, "catalog_unavailable", "profile selector membership is not ready")
 	}
-	members, exists := catalog.GroupMembers[command.GroupName]
-	if !exists {
-		return result, webAPIError(409, "invalid_group", "selector group does not exist in this profile")
+	// Members come from the profile source graph, the authority the runtime selection also uses.
+	members, ready, err := WebAPICatalogGroupMemberNames(tx.WebAPIReadTx, command.ProfileID, command.GroupName)
+	if err != nil {
+		var problem *WebAPIError
+		if errors.As(err, &problem) && problem.Status == 404 {
+			return result, webAPIError(409, "invalid_group", "selector group does not exist in this profile")
+		}
+		return result, webAPIError(409, "catalog_unavailable", "profile selector membership is not ready")
 	}
 	if command.ProxyName != nil {
-		if !webAPIName(*command.ProxyName) || !webAPISettingsEnum(*command.ProxyName, members...) {
+		if !webAPIName(*command.ProxyName) || !webAPIContains(members, *command.ProxyName) {
+			if !ready && webAPIName(*command.ProxyName) {
+				return result, webAPIError(409, "catalog_unavailable", "provider members are not prepared")
+			}
 			return result, webAPIError(409, "invalid_selection", "proxy is not a member of the selected profile group")
 		}
 		if profile.SelectedMap == nil {
