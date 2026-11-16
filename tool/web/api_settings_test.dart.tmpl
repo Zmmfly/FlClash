@@ -369,6 +369,94 @@ void main() {
   );
 
   test(
+    'api-settings-contract: a draftless change queued behind another commit patches what is stored then',
+    () async {
+      final backend = _SettingsBackend();
+      final (repository, settings, transport, _, failures) = await _fixture(
+        backend,
+      );
+      final ahead = repository.executeExternalCommand(
+        '/api/v1/settings:current-profile',
+        {'currentProfileId': null},
+        (value) => value,
+        editVersion: repository.captureReadVersion(
+          await repository.readExternal('/api/v1/settings'),
+        ),
+      );
+      final updated = settings.update<PatchClashConfig>(
+        WebSettingsSection.patch,
+        (value) => value.copyWith(mode: Mode.global),
+      );
+      final assigned = settings.set(
+        WebSettingsSection.network,
+        settings.config.networkProps.copyWith(systemProxy: false),
+      );
+      await (ahead, updated, assigned).wait;
+      expect(failures, isEmpty);
+      expect(settings.config.currentProfileId, isNull);
+      expect(settings.config.patchClashConfig.mode, Mode.global);
+      expect(settings.config.networkProps.systemProxy, isFalse);
+      expect(
+        transport.requests.where((request) => request.method == 'POST'),
+        hasLength(3),
+      );
+    },
+  );
+
+  test(
+    'api-settings-contract: a builder queued behind a change to the same list builds on what is stored then',
+    () async {
+      final backend = _SettingsBackend();
+      final (repository, settings, transport, _, failures) = await _fixture(
+        backend,
+      );
+      Object? stored() => apiObject(backend.data['network'])['excludeSSIDs'];
+      Iterable<ApiRequest> posts() =>
+          transport.requests.where((request) => request.method == 'POST');
+      Future<void> behind(
+        List<String> ahead,
+        List<String> Function(List<String> value) builder,
+      ) async {
+        final version = repository.captureReadVersion(
+          await repository.readExternal('/api/v1/settings'),
+        );
+        await (
+          repository.executeExternalCommand(
+            '/api/v1/settings:network',
+            {
+              'patch': {'excludeSSIDs': ahead},
+            },
+            (value) => value,
+            editVersion: version,
+          ),
+          settings.update<List<String>>(
+            WebSettingsSection.excludeSSIDs,
+            builder,
+          ),
+        ).wait;
+      }
+
+      await behind(['office'], (value) => [...value, 'home']);
+      expect(stored(), ['office', 'home']);
+      await behind(
+        ['office', 'home', 'cafe'],
+        (value) => [...value]..remove('office'),
+      );
+      expect(stored(), ['home', 'cafe']);
+      expect(posts(), hasLength(4));
+      await behind(['cafe'], (value) => [...value]..remove('home'));
+      expect(posts(), hasLength(5));
+      expect(stored(), ['cafe']);
+      expect(settings.config.excludeSSIDs, ['cafe']);
+      await behind(['cafe', 'office'], (value) => [...value]..remove('office'));
+      expect(posts(), hasLength(7));
+      expect(stored(), ['cafe']);
+      expect(settings.config.excludeSSIDs, ['cafe']);
+      expect(failures, isEmpty);
+    },
+  );
+
+  test(
     'api-settings-contract: lost response blocks authority and reload recovers receipt without payload journal',
     () async {
       final backend = _SettingsBackend();

@@ -4,6 +4,7 @@ import 'package:collection/collection.dart';
 import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/database/database.dart';
 import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/state.dart';
 import 'package:fl_clash/web_api/index.dart' hide snowflake, uniqueId, uuidV4;
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
@@ -261,9 +262,12 @@ class Profiles extends _$Profiles {
         database.repository.captureEditVersion(ApiIdentity.profile, previous);
     final next = builder(previous);
     if (next == previous) return Future.value();
-    return _write(() async {
+    final saved = _write(() async {
       await database.repository.saveProfile(next, editVersion: version);
     });
+    // The shared views fire this without a draft and never await it, so a
+    // rejection would otherwise vanish; a draft's owner handles its own.
+    return editVersion == null ? globalState.safeRun(() => saved) : saved;
   }
 
   Future<void> reorder(List<Profile> profiles, {ApiEditVersion? editVersion}) {

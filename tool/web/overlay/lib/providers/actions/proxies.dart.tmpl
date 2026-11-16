@@ -142,35 +142,34 @@ class ProxiesAction extends _$ProxiesAction {
   }
 
   void updateCurrentGroupName(String groupName) {
-    final profile = ref.read(currentProfileProvider);
-    if (profile == null || profile.currentGroupName == groupName) return;
-    final version = database.repository.captureEditVersion(
-      ApiIdentity.profile,
-      profile,
-    );
+    final id = ref.read(currentProfileProvider)?.id;
+    if (id == null) return;
+    final repository = database.repository;
     unawaited(
       globalState.safeRun(
-        () => database.repository.saveProfile(
-          profile.copyWith(currentGroupName: groupName),
-          editVersion: version,
-        ),
+        // Tabs are clicked faster than a commit lands, so the page's own row
+        // is already behind the one this has to edit.
+        () => repository.runIntent(() async {
+          final profile = await repository.profiles(id: id).getSingleOrNull();
+          if (profile == null || profile.currentGroupName == groupName) return;
+          await repository.saveProfile(
+            profile.copyWith(currentGroupName: groupName),
+            editVersion: repository.captureEditVersion(
+              ApiIdentity.profile,
+              profile,
+            ),
+          );
+        }),
       ),
     );
   }
 
   void updateCurrentUnfoldSet(Set<String> value) {
-    final currentProfile = ref.read(currentProfileProvider);
-    if (currentProfile == null) return;
-    final version = database.repository.captureEditVersion(
-      ApiIdentity.profile,
-      currentProfile,
-    );
+    final id = ref.read(currentProfileProvider)?.id;
+    if (id == null) return;
     unawaited(
       globalState.safeRun(
-        () => database.repository.saveProfile(
-          currentProfile.copyWith(unfoldSet: value),
-          editVersion: version,
-        ),
+        () => database.repository.setProfileUnfoldSet(id, value),
       ),
     );
   }

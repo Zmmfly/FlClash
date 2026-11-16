@@ -14,7 +14,10 @@ import 'package:fl_clash/widgets/widgets.dart';
 import 'package:fl_clash/database/database.dart' as db;
 import 'package:fl_clash/enum/enum.dart';
 import 'package:fl_clash/models/models.dart';
+import 'package:fl_clash/providers/action.dart' as actions;
+import 'package:fl_clash/providers/config.dart' as config;
 import 'package:fl_clash/providers/database.dart' as providers;
+import 'package:fl_clash/providers/state.dart' as state;
 import 'package:fl_clash/web_api/index.dart';
 import 'package:fl_clash/web_api/transport_browser.dart'
     show BrowserApiTransport;
@@ -1432,6 +1435,232 @@ void main() {
       expect(server.profiles.single['label'], 'Profile');
       expect(repository.pendingOperation, isNull);
       expect(server.requests.where((r) => r.method == 'POST'), hasLength(1));
+    },
+  );
+
+  test(
+    'api-client-contract a row kept by value-equal provider state edits at its latest identical read',
+    () async {
+      final previous = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() {
+        db.database = previous;
+      });
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      container.listen(providers.profilesProvider, (_, _) {});
+      await container.read(providers.profilesStreamProvider.future);
+      final shown = container.listen(
+        providers.profilesProvider.select((rows) => rows.firstOrNull),
+        (_, _) {},
+      );
+      final loaded = shown.read()!;
+      server.rules.single['content'] = 'other-tab.test';
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      await pumpEventQueue();
+      expect(identical(shown.read(), loaded), isTrue);
+      final version = repository.captureEditVersion(
+        ApiIdentity.profile,
+        loaded,
+      );
+      expect(version.revision, server.revision);
+      await repository.saveProfile(
+        loaded.copyWith(label: 'renamed'),
+        editVersion: version,
+      );
+      expect(server.profiles.single['label'], 'renamed');
+
+      await pumpEventQueue();
+      final renamed = shown.read()!;
+      server.profiles.single['label'] = 'other tab';
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      await pumpEventQueue();
+      expect(shown.read()!.label, 'other tab');
+      final outdated = repository.captureEditVersion(
+        ApiIdentity.profile,
+        renamed,
+      );
+      expect(outdated.revision, isNot(server.revision));
+      await expectLater(
+        repository.saveProfile(
+          renamed.copyWith(label: 'lost update'),
+          editVersion: outdated,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      expect(server.profiles.single['label'], 'other tab');
+    },
+  );
+
+  test(
+    'api-client-contract an edit captured before our own unrelated commit still applies',
+    () async {
+      Future<void> commitRule(String content) async {
+        final rule = (await repository.rules().get()).first;
+        await repository.saveRule(
+          rule.copyWith(content: content),
+          editVersion: repository.captureEditVersion(ApiIdentity.rule, rule),
+        );
+      }
+
+      final conflict = throwsA(
+        isA<WebApiException>().having(
+          (e) => e.code,
+          'code',
+          'revision_conflict',
+        ),
+      );
+      final profile = (await repository.profiles().get()).single;
+      final form = repository.captureEditVersion(ApiIdentity.profile, profile);
+      final blank = repository.captureCreateVersion(ApiIdentity.rule);
+      await commitRule('own-first.test');
+      await repository.saveProfile(
+        profile.copyWith(label: 'kept draft'),
+        editVersion: form,
+      );
+      expect(server.profiles.single['label'], 'kept draft');
+      await repository.saveRule(
+        Rule(id: allocateWebDraftId(), content: 'kept-new.test'),
+        editVersion: blank,
+      );
+      expect(server.rules, hasLength(2));
+
+      final current = (await repository.profiles().get()).single;
+      final reused = repository.captureEditVersion(
+        ApiIdentity.profile,
+        current,
+      );
+      await repository.saveProfile(
+        current.copyWith(label: 'first'),
+        editVersion: reused,
+      );
+      await expectLater(
+        repository.saveProfile(
+          current.copyWith(label: 'second'),
+          editVersion: reused,
+        ),
+        conflict,
+      );
+      expect(server.profiles.single['label'], 'first');
+
+      final latest = (await repository.profiles().get()).single;
+      final overtaken = repository.captureEditVersion(
+        ApiIdentity.profile,
+        latest,
+      );
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      await commitRule('own-second.test');
+      await expectLater(
+        repository.saveProfile(
+          latest.copyWith(label: 'after another tab'),
+          editVersion: overtaken,
+        ),
+        conflict,
+      );
+      expect(server.profiles.single['label'], 'first');
+    },
+  );
+
+  test(
+    'api-client-contract a commit by someone else seen while re-reading after our own still conflicts',
+    () async {
+      final profile = (await repository.profiles().get()).single;
+      final form = repository.captureEditVersion(ApiIdentity.profile, profile);
+      final rule = (await repository.rules().get()).single;
+      await repository.saveRule(
+        rule.copyWith(content: 'own.test'),
+        editVersion: repository.captureEditVersion(ApiIdentity.rule, rule),
+      );
+      final started = server.getStarted = Completer<void>();
+      final gate = server.getGate = Completer<void>();
+      final saved = expectLater(
+        repository.saveProfile(
+          profile.copyWith(label: 'stale draft'),
+          editVersion: form,
+        ),
+        throwsA(
+          isA<WebApiException>().having(
+            (e) => e.code,
+            'code',
+            'revision_conflict',
+          ),
+        ),
+      );
+      await started.future;
+      expect(server.requests.last.path, '/api/v1/profiles');
+      server.rules.single['content'] = 'other-tab.test';
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      gate.complete();
+      await saved;
+      expect(
+        [
+          for (final request in server.requests)
+            if (request.path == '/api/v1/profiles:update')
+              apiObject(jsonDecode(request.body!))['expectedRevision'],
+        ],
+        [form.revision],
+      );
+      expect(server.profiles.single['label'], isNot('stale draft'));
+    },
+  );
+
+  test(
+    'api-client-contract proxy page group and unfold actions never carry the page row revision',
+    () async {
+      final previous = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() {
+        db.database = previous;
+      });
+      final id = (await repository.profiles().get()).single.id;
+      final container = ProviderContainer(
+        overrides: [
+          config.currentProfileIdProvider.overrideWithBuild((_, _) => id),
+        ],
+      );
+      addTearDown(container.dispose);
+      container.listen(providers.profilesProvider, (_, _) {});
+      await container.read(providers.profilesStreamProvider.future);
+      final page = container.listen(state.currentProfileProvider, (_, _) {});
+      final loaded = page.read()!;
+      server.advance();
+      await repository.handleCommitEvent({'revision': server.revision});
+      await pumpEventQueue();
+      expect(identical(page.read(), loaded), isTrue);
+      final action = container.read(actions.proxiesActionProvider.notifier);
+      Iterable<Map<String, Object?>> updates() => [
+        for (final request in server.requests)
+          if (request.path == '/api/v1/profiles:update')
+            apiObject(apiObject(jsonDecode(request.body!))['profile']),
+      ];
+
+      action.updateCurrentUnfoldSet({'Proxy'});
+      await pumpEventQueue();
+      expect(server.requests.where((r) => r.method == 'POST'), isEmpty);
+      expect(page.read()!.unfoldSet, {'Proxy'});
+
+      action.updateCurrentGroupName('Proxy');
+      action.updateCurrentGroupName('Proxy');
+      action.updateCurrentGroupName('GLOBAL');
+      await repository.drainIntents();
+      await pumpEventQueue();
+      expect(updates().map((profile) => profile['currentGroupName']), [
+        'Proxy',
+        'GLOBAL',
+      ]);
+      expect(server.profiles.single['currentGroupName'], 'GLOBAL');
+      expect(page.read()!.currentGroupName, 'GLOBAL');
+      expect(page.read()!.unfoldSet, {'Proxy'});
     },
   );
 

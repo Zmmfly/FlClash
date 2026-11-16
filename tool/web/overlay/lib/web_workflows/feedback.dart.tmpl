@@ -69,7 +69,24 @@ String webWorkflowFailureMessage(WebApiException error, AppLocalizations l) {
     return l.webApiUnknownResultTip;
   if (error is WebApiSessionException) return l.webSessionError;
   if (error.code == 'source_authorization_cancelled') return l.cancel;
-  return l.webRequestFailed;
+  return _policyMessage(error, l) ?? l.webRequestFailed;
+}
+
+// Names here are the profile's own outbounds, which the page already lists.
+String? _policyMessage(WebApiException error, AppLocalizations l) {
+  final details = error.details;
+  if (error.code != 'outbound_policy_invalid' || details is! Map) return null;
+  final path = details['path'];
+  if (details['reason'] == 'cycle' && path is List) {
+    return l.customIssueGroupLoop(
+      [
+        for (final node in path)
+          if (node is Map && node['name'] is String) node['name'],
+      ].join(' → '),
+    );
+  }
+  final target = details['target'];
+  return target is String && target.isNotEmpty ? l.invalidPolicy(target) : null;
 }
 
 bool _conflict(WebApiException error) => const {
@@ -314,7 +331,7 @@ class _WebWorkflowFailureDialogState extends State<WebWorkflowFailureDialog> {
         ? l.webApiCommittedRefreshTip
         : _conflict(_error) || _resolved
         ? l.webApiConflictTip
-        : l.webRequestFailed;
+        : _policyMessage(_error, l) ?? l.webRequestFailed;
     return PopGuard(
       onPop: (_) => !_busy,
       child: AlertDialog(

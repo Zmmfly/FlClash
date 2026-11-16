@@ -37,6 +37,27 @@ class WebSettingsCommittedRefreshException extends WebApiException {
       );
 }
 
+const _serverSections = {
+  WebSettingsSection.vpn,
+  WebSettingsSection.network,
+  WebSettingsSection.currentProfile,
+  WebSettingsSection.dav,
+  WebSettingsSection.patch,
+  WebSettingsSection.excludeSSIDs,
+};
+
+class _SettingsPlan {
+  const _SettingsPlan({
+    this.route,
+    this.payload = const {},
+    this.local = const {},
+  });
+  final String? route;
+  final Map<String, Object?> payload;
+  final Map<String, Object?> local;
+  bool get isEmpty => route == null && local.isEmpty;
+}
+
 class WebSettingsData {
   const WebSettingsData(this.config);
   final Config config;
@@ -307,7 +328,6 @@ class WebSettingsController {
     ApiEditVersion? editVersion,
   }) {
     final baseline = editVersion == null ? _config : _baselines[editVersion];
-    final version = editVersion ?? _version;
     return _enqueue(() async {
       if (baseline == null) {
         throw const WebApiProtocolException(
@@ -316,9 +336,8 @@ class WebSettingsController {
       }
       await _commit(
         section,
-        _encode(section, _section(baseline, section)),
-        _encode(section, value),
-        version,
+        (_) => (_section(baseline, section), value),
+        editVersion,
       );
     });
   }
@@ -326,23 +345,74 @@ class WebSettingsController {
   Future<void> update<T>(
     WebSettingsSection section,
     T Function(T value) builder,
-  ) => _enqueue(() async {
-    final value = _section(_config, section) as T;
-    await _commit(
-      section,
-      _encode(section, value),
-      _encode(section, builder(value)),
-      _version,
-    );
-  });
+  ) => _enqueue(
+    () => _commit(section, (stored) {
+      final value = _section(stored, section) as T;
+      return (value, builder(value));
+    }, null, relative: true),
+  );
 
   Future<void> _commit(
     WebSettingsSection section,
-    Object? before,
-    Object? next,
-    ApiEditVersion? version,
-  ) async {
-    if (const DeepCollectionEquality().equals(before, next)) return;
+    (Object?, Object?) Function(Config stored) change,
+    ApiEditVersion? version, {
+    bool relative = false,
+  }) async {
+    var plan = _plan(section, change(_config));
+    // What is shown can lag the store, so whether a builder changes it is
+    // only known at its turn among the repository's intents. The app section
+    // also holds browser state that must not queue there: it trusts what is
+    // shown to tell whether the store is involved.
+    final turn =
+        plan.route != null ||
+        relative && _loaded && _serverSections.contains(section);
+    if (!turn && plan.isEmpty) return;
+    Config value = _config;
+    var committed = false;
+    if (turn) {
+      await repository.runIntent(() async {
+        // Without a draft the change is made to whatever is stored once the
+        // commits queued ahead of it have landed, not to what was shown.
+        if (version == null && _version?.revision != repository.revision) {
+          value = await _fetch();
+          plan = _plan(section, change(value));
+        }
+        final route = plan.route;
+        if (route == null) return;
+        final current = version ?? _version;
+        if (current == null) {
+          throw const WebApiProtocolException('Read settings before editing');
+        }
+        await repository.executeExternalCommand(
+          '/api/v1/settings:$route',
+          plan.payload,
+          _decode,
+          editVersion: current,
+        );
+        committed = true;
+      });
+    }
+    if (committed) {
+      try {
+        value = await _fetch();
+        _reloadRequested = false;
+      } catch (_) {
+        throw const WebSettingsCommittedRefreshException();
+      }
+    }
+    if (plan.local.isNotEmpty) {
+      value = _local(value, section, plan.local);
+      presentation.save(value);
+    }
+    if (!identical(value, _config)) _publish(value);
+  }
+
+  _SettingsPlan _plan(WebSettingsSection section, (Object?, Object?) change) {
+    final before = _encode(section, change.$1);
+    final next = _encode(section, change.$2);
+    if (const DeepCollectionEquality().equals(before, next)) {
+      return const _SettingsPlan();
+    }
     if (!_loaded) {
       throw const WebApiProtocolException(
         'Load authoritative settings before editing',
@@ -428,29 +498,7 @@ class WebSettingsController {
             ? {'hotKeyActions': next}
             : _diff(apiObject(before), apiObject(next));
     }
-    Config value = _config;
-    if (route != null) {
-      if (version == null) {
-        throw const WebApiProtocolException('Read settings before editing');
-      }
-      await repository.executeExternalCommand(
-        '/api/v1/settings:$route',
-        payload,
-        _decode,
-        editVersion: version,
-      );
-      try {
-        value = await _fetch();
-        _reloadRequested = false;
-      } catch (_) {
-        throw const WebSettingsCommittedRefreshException();
-      }
-    }
-    if (local != null && local.isNotEmpty) {
-      value = _local(value, section, local);
-      presentation.save(value);
-    }
-    _publish(value);
+    return _SettingsPlan(route: route, payload: payload, local: local ?? {});
   }
 
   Future<void> selectMap({

@@ -3,9 +3,14 @@ import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:typed_data';
 
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rust_api/rust_api.dart';
 
+import 'package:fl_clash/common/task.dart';
+import 'package:fl_clash/core/controller.dart';
+import 'package:fl_clash/database/database.dart' as db;
+import 'package:fl_clash/providers/app.dart';
 import 'package:fl_clash/web_api/index.dart';
 import 'package:fl_clash/web_shim/web_core_bridge.dart';
 import 'package:fl_clash/web_runtime/facade.dart';
@@ -254,6 +259,178 @@ void main() {
         (request) => request.path == '/api/v1/runtime/state',
       );
       expect(freshStatusRequests, isEmpty);
+    },
+  );
+
+  test(
+    'runtime contract target pickers read a profile outbounds resource, never a Core path',
+    () async {
+      const wire = '9007199254740993';
+      final transport = _RuntimeTransport();
+      transport.respond = (request) => switch (request.path) {
+        '/api/v1/meta' => _answer('0', _meta('0')),
+        '/api/v1/profiles/$wire/outbounds' => _answer('0', {
+          'proxies': [
+            {'name': 'node', 'type': 'socks5'},
+          ],
+          'proxy-groups': [
+            {
+              'name': 'Pick',
+              'type': 'select',
+              'proxies': ['node'],
+            },
+          ],
+        }),
+        _ => throw StateError(request.path),
+      };
+      final (repo, _) = await _binding(transport);
+      addTearDown(repo.close);
+      final config = await clashConfigTask(
+        await coreController.getProfileOutbounds(
+          repo.identities.decode(ApiIdentity.profile, wire),
+        ),
+      );
+      expect(config.proxyGroups.single.name, 'Pick');
+      expect(config.proxyGroups.single.proxies, ['node']);
+      expect(config.proxies.single.name, 'node');
+      expect(transport.requests.every((r) => r.method == 'GET'), isTrue);
+    },
+  );
+
+  test(
+    'runtime contract a server start with nothing installed lists no providers instead of failing the page',
+    () async {
+      var code = 'applied_state_unavailable';
+      final transport = _RuntimeTransport();
+      transport.respond = (request) => switch (request.path) {
+        '/api/v1/meta' => _answer('0', _meta('0')),
+        '/api/v1/runtime/external-providers' => ApiResponse(
+          409,
+          jsonEncode({
+            'revision': '0',
+            'error': {'code': code, 'message': code},
+          }),
+        ),
+        _ => throw StateError(request.path),
+      };
+      final (repo, _) = await _binding(transport);
+      addTearDown(repo.close);
+      final previous = db.database;
+      db.database = db.Database(repository: repo);
+      addTearDown(() => db.database = previous);
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final providers = container.read(providersProvider.notifier);
+      await providers.syncProviders();
+      expect(container.read(providersProvider), isEmpty);
+      code = 'applied_state_unknown';
+      await expectLater(
+        providers.syncProviders(),
+        throwsA(
+          isA<WebApiException>().having((e) => e.code, 'code', code),
+        ),
+      );
+    },
+  );
+
+  test(
+    'runtime contract selects from the shown generation after commits that leave the runtime alone',
+    () async {
+      var revision = '1';
+      var generation = '7';
+      final desired = <String, String>{};
+      final selections = <Map<String, Object?>>[];
+      final transport = _RuntimeTransport();
+      transport.respond = (request) {
+        if (request.path == '/api/v1/meta')
+          return _answer(revision, _meta(revision));
+        if (request.path == '/api/v1/runtime/proxies')
+          return _answer(revision, {
+            'proxies': {},
+            'all': [],
+            'runtimeGeneration': generation,
+            'profileId': null,
+          });
+        if (request.path == '/api/v1/runtime/proxies:select') {
+          final body = apiObject(jsonDecode(request.body!));
+          selections.add(body);
+          final stale = body['expectedRevision'] != revision;
+          if (stale || body['runtimeGeneration'] != generation) {
+            return ApiResponse(
+              409,
+              jsonEncode({
+                'error': {
+                  'code': stale
+                      ? 'revision_conflict'
+                      : 'runtime_generation_conflict',
+                  'message': 'changed',
+                },
+                'revision': revision,
+              }),
+            );
+          }
+          final id = body['operationId'] as String;
+          revision = '${int.parse(revision) + 1}';
+          desired[id] = revision;
+          return _answer(revision, {
+            'operationId': id,
+            'action': 'proxy-selection',
+            'desiredRevision': revision,
+            'phase': 'pending',
+          }, operationId: id);
+        }
+        if (request.path.startsWith('/api/v1/runtime/operations/')) {
+          final id = request.path.split('/').last;
+          return _answer(revision, {
+            'operationId': id,
+            'action': 'proxy-selection',
+            'desiredRevision': desired[id],
+            'phase': 'applied',
+            'result': {'changed': true},
+          });
+        }
+        throw StateError(request.path);
+      };
+      final (repo, binding) = await _binding(transport);
+      addTearDown(repo.close);
+      Future<void> commitElsewhere() async {
+        revision = '${int.parse(revision) + 1}';
+        await binding.receiveEvent({
+          'type': 'commit',
+          'storeId': 'runtime-test-store',
+          'revision': revision,
+          'operationId': 'other-session-operation',
+        });
+      }
+
+      await binding.read('proxies');
+      await commitElsewhere();
+      expect(await binding.selectProxy('Proxy', 'node-a'), {'changed': true});
+      expect(selections.single['expectedRevision'], '2');
+      expect(selections.single['runtimeGeneration'], '7');
+
+      generation = '8';
+      await commitElsewhere();
+      final superseded = throwsA(
+        isA<WebApiException>().having(
+          (e) => e.code,
+          'code',
+          'runtime_generation_conflict',
+        ),
+      );
+      await Future.wait([
+        expectLater(binding.selectProxy('Proxy', 'node-b'), superseded),
+        expectLater(binding.selectProxy('Proxy', 'node-c'), superseded),
+      ]);
+      expect(selections.skip(1).map((body) => body['proxyName']), [
+        'node-b',
+        'node-c',
+      ]);
+      expect(selections.skip(1).map((body) => body['runtimeGeneration']), [
+        '7',
+        '7',
+      ]);
+      expect(selections.last['expectedRevision'], revision);
     },
   );
 

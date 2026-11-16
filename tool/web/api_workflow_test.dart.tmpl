@@ -1178,6 +1178,93 @@ void main() {
     },
   );
 
+  testWidgets(
+    'a profile change fired by a shared view without awaiting reports its rejection',
+    (tester) async {
+      final transport = _Transport()..revision = '1';
+      final repository = WebApiRepository(
+        transport: transport,
+        journal: MemoryApiOperationJournal(),
+      );
+      addTearDown(repository.close);
+      transport.stored.add(
+        _profile(
+          repository.codec.profileInput(Profile.normal(label: 'Chained')),
+          '9223372036854775807',
+        ),
+      );
+      await repository.initialize();
+      final original = (await repository.profiles().get()).single;
+      final previousDatabase = db.database;
+      db.database = db.Database(repository: repository);
+      addTearDown(() => db.database = previousDatabase);
+      final container = ProviderContainer(
+        overrides: [profilesProvider.overrideWithBuild((_, _) => [original])],
+      );
+      addTearDown(container.dispose);
+      globalState.container = container;
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _host(const SizedBox()),
+        ),
+      );
+      unawaited(
+        container
+            .read(profilesProvider.notifier)
+            .updateProfile(
+              original.id,
+              (profile) => profile.copyWith(matchTarget: 'Relay'),
+            ),
+      );
+      await tester.pump();
+      expect(transport.sent.isCompleted, isTrue);
+      transport.response.complete(
+        ApiResponse(
+          409,
+          jsonEncode({
+            'revision': '1',
+            'error': {
+              'code': 'outbound_policy_invalid',
+              'message': 'candidate outbound graph is invalid',
+              'details': {
+                'reason': 'cycle',
+                'path': [
+                  {'kind': 'proxy', 'name': 'Node'},
+                  {'kind': 'group', 'name': 'Relay'},
+                  {'kind': 'proxy', 'name': 'Node'},
+                ],
+              },
+            },
+          }),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Node → Relay → Node'), findsOneWidget);
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
+      final l = AppLocalizations.current;
+      expect(
+        webWorkflowFailureMessage(
+          const WebApiException(
+            'outbound_policy_invalid',
+            'candidate outbound graph is invalid',
+            details: {'reason': 'missing_target', 'target': 'Gone'},
+          ),
+          l,
+        ),
+        l.invalidPolicy('Gone'),
+      );
+      expect(
+        webWorkflowFailureMessage(
+          const WebApiException('outbound_policy_invalid', 'unexplained'),
+          l,
+        ),
+        l.webRequestFailed,
+      );
+    },
+  );
+
   test(
     'backup preview is read-only and confirmation binds the exact plan without a browser database parser',
     () async {

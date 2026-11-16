@@ -163,6 +163,9 @@ class WebApiRepository {
       _preparedOperations.clear();
       _dependencyPreparations.clear();
       _dependencyGrants.clear();
+      _readers.clear();
+      _latestReads.clear();
+      _ownCommits.clear();
       if (_client.pendingOperation == null) _pendingRecoveryError = null;
       _queue = Future<void>.value();
       final barrier = _writeBarrier;
@@ -185,6 +188,10 @@ class WebApiRepository {
   final _externalDecoders = <String, Object? Function(Object?)>{};
   final _profileUnfolds = <(String, String), Set<String>>{};
   final _sources = Expando<ApiEditVersion>();
+  final _readers = <(ApiIdentity, String), Future<void> Function()>{};
+  final _latestReads =
+      <(ApiIdentity, String), (ApiEditVersion, Map<String, ApiEditVersion>)>{};
+  final _ownCommits = <String, String>{};
   final _tokenIssuer = Object();
   final _authorizedOperations = <String, (String, int, String)>{};
   final _preparedOperations = <String, _PreparedOperation>{};
@@ -499,7 +506,10 @@ class WebApiRepository {
     return receipt;
   }
 
-  ApiEditVersion captureEditVersion(ApiIdentity kind, Object original) {
+  ApiEditVersion captureEditVersion(ApiIdentity kind, Object original) =>
+      _latestRead(_readVersion(kind, original));
+
+  ApiEditVersion _readVersion(ApiIdentity kind, Object original) {
     final token = _sources[original];
     if (token != null) _validateVersion(token);
     if (token == null ||
@@ -514,6 +524,24 @@ class WebApiRepository {
     return token;
   }
 
+  // Value-equal provider state keeps handing out the object of an older read
+  // after a newer one returned the same content, which it still describes.
+  ApiEditVersion _latestRead(ApiEditVersion token) {
+    final read = _latestReads[(token.kind, token._readPath)];
+    final latest = switch (token._subject) {
+      _EditSubject.row => read?.$2[token._wireId],
+      _EditSubject.collection => read?.$1,
+      _ => null,
+    };
+    return latest != null &&
+            latest._epoch == token._epoch &&
+            latest.storeId == token.storeId &&
+            latest._fingerprint == token._fingerprint &&
+            compareApiRevisions(latest.revision, token.revision) > 0
+        ? latest
+        : token;
+  }
+
   ApiEditVersion captureCollectionVersion(
     ApiIdentity kind,
     List<Object?> rows,
@@ -526,10 +554,15 @@ class WebApiRepository {
         'Keep the original empty collection version',
       );
     }
-    final tokens = [
+    final originals = [
       for (final row in rows)
-        if (row is Object) captureEditVersion(kind, row),
+        if (row is Object) _readVersion(kind, row),
     ];
+    final latest = [for (final token in originals) _latestRead(token)];
+    final tokens =
+        latest.any((token) => token.revision != latest.first.revision)
+        ? originals
+        : latest;
     final first = tokens.first;
     if (tokens.length != rows.length ||
         first._readPath == null ||
@@ -1311,34 +1344,20 @@ class WebApiRepository {
     );
   }
 
-  ApiQuery<int> disabledRuleIds(int profileId) => queryProjection(() async {
-    final receipt = await _readReceipt(
-      '/api/v1/disabled-rules?profileId=${_wire(ApiIdentity.profile, profileId)}',
-      ApiRevisionScope.configuration,
-    );
-    return _tagCollection(
-      _disabled(receipt.data, profileId),
-      ApiIdentity.rule,
-      receipt.revision,
-      '/api/v1/disabled-rules?profileId=${_wire(ApiIdentity.profile, profileId)}',
-    );
-  });
+  ApiQuery<int> disabledRuleIds(int profileId) => _collection(
+    ApiIdentity.rule,
+    '/api/v1/disabled-rules?profileId=${_wire(ApiIdentity.profile, profileId)}',
+    (data) => _disabled(data, profileId),
+  );
 
   ApiQuery<T> catalog<T>(ApiCatalog<T> spec, {int? profileId}) =>
       _query(_catalogPath(spec, profileId: profileId), spec.decode);
 
-  ApiQuery<ProxyDialer> dialers(int profileId) => queryProjection(() async {
-    final receipt = await _readReceipt(
-      '/api/v1/proxy-dialers?profileId=${_wire(ApiIdentity.profile, profileId)}',
-      ApiRevisionScope.configuration,
-    );
-    return _tagCollection(
-      _dialers(receipt.data, profileId),
-      ApiIdentity.profile,
-      receipt.revision,
-      '/api/v1/proxy-dialers?profileId=${_wire(ApiIdentity.profile, profileId)}',
-    );
-  });
+  ApiQuery<ProxyDialer> dialers(int profileId) => _collection(
+    ApiIdentity.profile,
+    '/api/v1/proxy-dialers?profileId=${_wire(ApiIdentity.profile, profileId)}',
+    (data) => _dialers(data, profileId),
+  );
 
   Future<Profile> saveProfile(
     Profile profile, {
@@ -1767,6 +1786,7 @@ class WebApiRepository {
           : _client.recoverOperation(operationId));
       _accept(operation, receipt);
       _client.completeOperation(receipt);
+      _recordOwnCommit(operation, receipt);
       _pendingRecoveryError = null;
       _invalidate(operation.scope, notify: false);
       _remember(receipt);
@@ -1785,19 +1805,25 @@ class WebApiRepository {
     }
   });
 
-  ApiQuery<T> _query<T>(String path, T Function(Object?) decode) =>
-      queryProjection(() async {
-        final receipt = await _readReceipt(
-          path,
-          ApiRevisionScope.configuration,
-        );
-        return _tagCollection(
-          _decodeList(receipt.data, decode),
-          _resourceIdentity(path),
-          receipt.revision,
-          path,
-        );
-      });
+  ApiQuery<T> _query<T>(String path, T Function(Object?) decode) => _collection(
+    _resourceIdentity(path),
+    path,
+    (data) => _decodeList(data, decode),
+  );
+
+  ApiQuery<T> _collection<T>(
+    ApiIdentity kind,
+    String path,
+    List<T> Function(Object? data) decode,
+  ) {
+    Future<List<T>> read() async {
+      final receipt = await _readReceipt(path, ApiRevisionScope.configuration);
+      return _tagCollection(decode(receipt.data), kind, receipt.revision, path);
+    }
+
+    _readers[(kind, path)] = read;
+    return queryProjection(read);
+  }
 
   Future<ApiReceipt> _readReceipt(
     String path,
@@ -1871,6 +1897,77 @@ class WebApiRepository {
     ApiRevisionScope scope = ApiRevisionScope.configuration,
     ApiEditVersion? editVersion,
     String? operationId,
+  }) => runIntent(
+    () async => _send(
+      path,
+      payload,
+      drafts: drafts,
+      refresh: refresh,
+      scope: scope,
+      editVersion: editVersion == null || operationId != null
+          ? editVersion
+          : await _afterOwnCommits(editVersion),
+      operationId: operationId,
+    ),
+  );
+
+  // The revision is store-wide, so our own unrelated commit would reject an
+  // edit captured just before it. Only someone else's change is a conflict.
+  Future<ApiEditVersion> _afterOwnCommits(ApiEditVersion token) async {
+    final current = _client.revision;
+    if (current == null ||
+        token.revision == current ||
+        !identical(token._issuer, _tokenIssuer) ||
+        token.scope != ApiRevisionScope.configuration ||
+        !_onlyOwnCommits(token.revision, current)) {
+      return token;
+    }
+    if (token._subject == _EditSubject.create) {
+      return ApiEditVersion._(
+        issuer: _tokenIssuer,
+        storeId: token.storeId,
+        revision: current,
+        kind: token.kind,
+        localId: null,
+        epoch: token._epoch,
+        subject: _EditSubject.create,
+        fingerprint: '',
+      );
+    }
+    final read = _readers[(token.kind, token._readPath)];
+    if (read == null) return token;
+    await read();
+    final latest = _latestRead(token);
+    // The read itself can be the first to see someone else's commit.
+    return _onlyOwnCommits(token.revision, latest.revision) ? latest : token;
+  }
+
+  bool _onlyOwnCommits(String from, String to) {
+    String? revision = from;
+    while (revision != null && revision != to) {
+      revision = _ownCommits[revision];
+    }
+    return revision != null;
+  }
+
+  void _recordOwnCommit(ApiPendingOperation operation, ApiReceipt receipt) {
+    if (operation.scope != ApiRevisionScope.configuration ||
+        compareApiRevisions(receipt.revision, operation.expectedRevision) <=
+            0) {
+      return;
+    }
+    _ownCommits[operation.expectedRevision] = receipt.revision;
+    if (_ownCommits.length > 64) _ownCommits.remove(_ownCommits.keys.first);
+  }
+
+  Future<ApiReceipt> _send(
+    String path,
+    Map<String, Object?> payload, {
+    required List<ApiDraftBinding> drafts,
+    required List<String> refresh,
+    required ApiRevisionScope scope,
+    required ApiEditVersion? editVersion,
+    required String? operationId,
   }) => _serialize(() async {
     if (scope == ApiRevisionScope.configuration) {
       if (editVersion == null) {
@@ -1926,6 +2023,7 @@ class WebApiRepository {
         throw WebApiUnknownCommitException(operation.operationId);
       }
       _client.completeOperation(receipt);
+      _recordOwnCommit(operation, receipt);
       _invalidate(scope, notify: false);
       _remember(receipt);
       try {
@@ -2397,6 +2495,7 @@ class WebApiRepository {
     String path,
   ) {
     final ids = <int>{};
+    final latest = <String, ApiEditVersion>{};
     for (final row in rows) {
       if (row is Profile ||
           row is Rule ||
@@ -2413,9 +2512,10 @@ class WebApiRepository {
           );
         }
         _tagRow(row, kind, revision, readPath: path);
+        latest[_wire(kind, id)] = _sources[row]!;
       }
     }
-    _sources[rows] = ApiEditVersion._(
+    final collection = _sources[rows] = ApiEditVersion._(
       issuer: _tokenIssuer,
       storeId: _storeId!,
       revision: revision,
@@ -2426,6 +2526,7 @@ class WebApiRepository {
       fingerprint: _fingerprint(rows),
       readPath: path,
     );
+    _latestReads[(kind, path)] = (collection, latest);
     return rows;
   }
 
@@ -2566,6 +2667,8 @@ class WebApiRepository {
     _dependencyPreparations.clear();
     _dependencyGrants.clear();
     _profileUnfolds.clear();
+    _readers.clear();
+    _latestReads.clear();
     await _changes.close();
   }
 }

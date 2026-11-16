@@ -322,23 +322,30 @@ class WebRuntimeBinding {
     }
   }
 
-  Future<Object?> selectProxy(String group, String proxy) async {
-    var snapshot = _proxySnapshot;
-    if (snapshot == null) {
+  Future<Object?> selectProxy(String group, String proxy) {
+    // Commits that leave the runtime alone still move the store revision; the
+    // generation shown when the user chose keeps guarding the runtime, however
+    // many earlier intents refresh the snapshot before this one runs.
+    final shown = _proxySnapshot;
+    return repository.runIntent(() async {
+      var snapshot = _proxySnapshot;
+      if (snapshot == null ||
+          snapshot.version.revision != repository.revision) {
+        await read('proxies');
+        snapshot = _proxySnapshot;
+      }
+      if (snapshot == null)
+        throw const WebApiProtocolException(
+          'Read a versioned proxy snapshot before selecting',
+        );
+      final result = await command('proxies:select', {
+        'groupName': group,
+        'proxyName': proxy,
+        'runtimeGeneration': (shown ?? snapshot).generation,
+      }, editVersion: snapshot.version);
       await read('proxies');
-      snapshot = _proxySnapshot;
-    }
-    if (snapshot == null)
-      throw const WebApiProtocolException(
-        'Read a versioned proxy snapshot before selecting',
-      );
-    final result = await command('proxies:select', {
-      'groupName': group,
-      'proxyName': proxy,
-      'runtimeGeneration': snapshot.generation,
-    }, editVersion: snapshot.version);
-    await read('proxies');
-    return result;
+      return result;
+    });
   }
 
   void setTopic(String topic, bool enabled) {
@@ -413,6 +420,13 @@ class WebRuntimeBinding {
       base: apiObject(receipt.data),
       handle: webRuntimeSources.versionedProfileHandle(local, version),
       editVersion: version,
+    );
+  }
+
+  Future<Map<String, dynamic>> profileOutbounds(int profileId) async {
+    final wire = repository.identities.encode(ApiIdentity.profile, profileId);
+    return apiObject(
+      await read('/api/v1/profiles/${Uri.encodeComponent(wire)}/outbounds'),
     );
   }
 
